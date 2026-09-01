@@ -35,6 +35,12 @@ CREATE TABLE IF NOT EXISTS pn_authorization.transactions (
     -- llega cuando el aggregate ya fue releído desde esta tabla.
     card_token          CHAR(64)
 );
+-- El CREATE TABLE de arriba se saltea si transactions ya existe, en cuyo caso
+-- puede venir de una base anterior a card_token. Sin este ALTER el índice de
+-- abajo falla con "column card_token does not exist" al re-ejecutar el init.
+ALTER TABLE pn_authorization.transactions
+    ADD COLUMN IF NOT EXISTS card_token CHAR(64);
+
 CREATE INDEX IF NOT EXISTS idx_auth_txn_card_token
     ON pn_authorization.transactions(card_token)
     WHERE card_token IS NOT NULL;
