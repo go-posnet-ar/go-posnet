@@ -1,9 +1,9 @@
 # Settlement — Documentación técnica
 
 > Revisado contra el commit `8acbfdf` (2026-11-05). Este documento describe lo que el código hace
-> hoy. Si algo difiere del [README del contexto](../../context/settlement/README.md), del
-> [runbook de cierre de lote](../runbooks/batch-close-failure.md) o de los comentarios del código, vale
-> lo que está acá.
+> hoy. Si algo difiere del [README del contexto](../../context/settlement/README.md) o de los
+> comentarios del código, vale lo que está acá. Para operar un incidente, ver el
+> [runbook de cierre de lote](../runbooks/batch-close-failure.md).
 
 ## 1. Resumen
 
@@ -375,7 +375,7 @@ hace nada, `migrations/settlement/` está vacío y
 Diferencia entre ambos archivos: `st_schema.sql` define tres índices
 (`idx_settlement_batches_merchant_date`, `idx_settlement_batches_state` e `idx_batch_transactions_batch`)
 que `01-init.sql` no crea. **`loadTransactions` recorre `batch_transactions` por `batch_id` en cada
-aprobación, sin índice**, y el runbook de cierre menciona un índice que tampoco existe en ese caso.
+aprobación, sin índice.**
 
 ### Costo por aprobación
 
@@ -548,17 +548,3 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | `/readyz` no verifica NATS | Una instancia sin NATS sigue figurando como lista | `st_http_handler.go` |
 | Errores de estado como `500` | `force-close` sobre un lote cerrado o un ID inválido devuelven `500` en lugar de `400` | `st_http_handler.go` |
 | Código sin uso | `port.BatchService` y `port.AdminService` no se implementan; tampoco se usan `mdrPercent`, `BatchTxOffline` ni los eventos de dominio internos | `st_port_inbound.go`, `st_batch_handler.go`, `st_settlement_batch.go` |
-
-### Diferencias con el runbook
-
-El [runbook de cierre de lote](../runbooks/batch-close-failure.md) necesita correcciones, porque algunas
-de sus instrucciones no funcionan hoy:
-
-| El runbook dice | Lo que ocurre |
-|---|---|
-| Escenario A: resolver un `DISPUTED` con `force-close` | `force-close` exige `OPEN`, y sobre `DISPUTED` responde `500` |
-| Escenario C: un fallo del procesador devuelve un error y `Nak` | Hoy no hay procesador: el servicio se cae por un panic |
-| `resubmit` resuelve el escenario C | Siempre responde `500` mientras el procesador sea `nil` |
-| `force-close` acepta `OPEN` o `PENDING_CLOSE` y queda en auditoría | Solo acepta `OPEN`, y `operator_id` no se registra |
-| `GET /batches/{id}` devuelve `state` | El campo es `State` |
-| La consulta de lotes pendientes usa un índice existente | `01-init.sql` no crea ese índice |

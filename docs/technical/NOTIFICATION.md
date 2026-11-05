@@ -347,9 +347,8 @@ Son durables con queue group del mismo nombre, hasta 3 entregas, política `Deli
 | `notify-auth-rejected` | `posnet.auth.rejected.v1` | `POSNET_AUTH` | `NotifyRejection` |
 | `notify-batch-closed` | `posnet.settlement.batch-closed.v1` | `POSNET_SETTLEMENT` | `NotifyBatchClosed` |
 
-`pkg/natsutil/consumers.go` y el runbook [incident-response](../runbooks/incident-response.md) mencionan
-`notify-auth-consumer` y `notify-settlement-consumer`, que **no existen**: al diagnosticar, usar los
-nombres de esta tabla.
+`pkg/natsutil/consumers.go` menciona `notify-auth-consumer` y `notify-settlement-consumer`, que **no
+existen**: al diagnosticar, usar los nombres de esta tabla.
 
 No se consumen `auth.reversal-completed` ni `settlement.completed`. Del evento de rechazo se ignoran
 `capture_card`, `source` e `is_retryable`.
@@ -570,7 +569,7 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | `dispatched` se publica antes de guardar | Puede anunciar una entrega no registrada | `dispatch` |
 | Notificaciones huérfanas en reentregas | Un fallo parcial al guardar una aprobación puede dejar filas en `PENDING` y crear otras nuevas | `NotifyApproval` |
 | Trazas cortadas en el envío | Las goroutines usan `context.Background()`, por lo que el envío queda fuera de la traza del evento | `NotifyApproval`, `NotifyRejection`, `NotifyBatchClosed` |
-| Nombres de consumidores desactualizados | `consumers.go` y el runbook de incidentes mencionan durables que no existen | `pkg/natsutil/consumers.go`, `incident-response.md` |
+| Nombres de consumidores desactualizados | `consumers.go` menciona durables que no existen | `pkg/natsutil/consumers.go` |
 | Métrica mal nombrada | `posnet_grpc_request_duration` también mide webhooks | `metrics.go` |
 | Sin migraciones reales | Los cambios de schema no se aplican a bases existentes, y `01-init.sql` y `nt_schema.sql` difieren | `pkg/pgutil/migrate.go` |
 | gRPC placeholder y sin apagado ordenado | Abre un puerto que no ofrece nada, y `notification.proto` no se usa | `nt_grpc_server.go`, `nt_wire.go` |

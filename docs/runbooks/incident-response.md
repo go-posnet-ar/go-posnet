@@ -1,29 +1,28 @@
 # Runbook: Respuesta ante incidentes
 
-## Antes de empezar — qué observabilidad existe hoy realmente
+## Antes de empezar — qué existe hoy
 
-Este runbook asume el estado **actual** del sistema, no el aspiracional. Para no perder tiempo
-buscando algo que no existe todavía:
+Este runbook describe el estado **actual** del sistema, no el previsto. Revisado contra el código el
+2026-11-05.
 
-- **No hay dashboards de Prometheus con datos reales.** Cada BC expone `/metrics` (el exporter de
-  `pkg/observability.InitMeter` está montado en el router de los 5 BCs), pero ningún BC instancia
-  todavía los contadores/histogramas documentados como convención de nombres en
-  `pkg/observability/meter.go` (`posnet_transactions_total`, `posnet_nats_consumer_lag`, etc.). Hoy
-  ese endpoint solo expone las métricas por defecto del runtime de Go/OTel — **no** los datos de
-  negocio del README. No busques un dashboard de Grafana con esas queries: todavía no hay nada que
-  las alimente.
-- **El collector de OpenTelemetry exporta a `debug` (consola), no a Jaeger/Prometheus reales**
-  (`deployments/docker/otel-collector-config.yml`). Las trazas y métricas hoy se ven en el log del
-  propio collector, no en una UI.
-- **No hay integración de alerting** (Alertmanager, PagerDuty, Slack) en el repo. Si te llegó una
-  alerta, vino de una herramienta externa a este repositorio — este runbook no sabe cómo se
-  disparó, solo qué hacer una vez que estás mirando el sistema.
-- Lo que sí existe y funciona hoy: **health checks HTTP**, **logs estructurados con `slog`**
-  correlacionados por `TransactionID`/`EventID`, **trazas OTel** propagadas entre BCs vía headers de
-  NATS, y el **CLI de `nats`** para inspeccionar streams y consumers directamente.
+| Herramienta | Dónde (Docker Compose) | Estado |
+|---|---|---|
+| Health checks | `/healthz` y `/readyz` de cada servicio | Funcionan; `readyz` solo verifica Postgres |
+| Logs JSON | `docker logs posnet-<servicio>` | Funcionan; primera herramienta para un caso puntual |
+| Métricas | Prometheus en `localhost:9099`, `/metrics` de cada servicio | Funcionan |
+| Dashboards | Grafana en `localhost:3000` | Saga, detalle por servicio, SLO, runtime e infraestructura |
+| Trazas | Jaeger en `localhost:16686` | Funcionan, con un corte conocido (ver [sección 2](#2-logs-y-trazas)) |
+| Alertas | Alertmanager en `localhost:9097` | **Se evalúan, pero no avisan a nadie**: se envían a `webhook-mock` |
+| NATS | CLI `nats`, puerto `4222`; monitoreo en `localhost:8222` | Funcionan |
+| Postgres | `docker exec -it posnet-postgres psql -U posnet -d posnet` | Funciona |
 
-Si te toca ser el primer respondedor, tu herramienta principal hoy son los logs (`journalctl`/`docker
-logs`/lo que agregue tu plataforma) y consultas directas a Postgres/NATS — no un dashboard.
+**Que una alerta no haya llegado no significa que no se haya disparado:** revisá Alertmanager o
+Prometheus directamente. Además, varias fallas no generan ninguna alerta (ver
+[sección 5](#5-lo-que-ninguna-alerta-detecta)).
+
+**Piezas simuladas o incompletas:** el adquirente aprueba todo, no hay procesador de liquidación y no
+hay WebSocket. Por eso, un comprobante en `SENT` no prueba que un terminal lo haya recibido. El detalle
+de cada servicio está en [`docs/technical/`](../technical/).
 
 ---
 
@@ -31,72 +30,119 @@ logs`/lo que agregue tu plataforma) y consultas directas a Postgres/NATS — no 
 
 ### 1.1 ¿Qué servicio está afectado?
 
-Cada BC expone los mismos dos endpoints en su router HTTP
-(`context/{bc}/infrastructure/http/*_router.go`):
+| Servicio | Contenedor | HTTP | gRPC |
+|---|---|---|---|
+| Authorization | `posnet-authorization` | 8080 | 9090 |
+| Terminal Gateway | `posnet-terminal-gateway` | 8081 | 9091 |
+| Fraud Detection | `posnet-fraud-detection` | 8083 | 9092 |
+| Settlement | `posnet-settlement` | 8084 | 9093 |
+| Notification | `posnet-notification` | 8085 | 9094 |
+
+Son los puertos de Docker Compose. Fuera de Docker, los defaults del código son distintos: Fraud
+Detection 8082, Settlement 8083 y Notification 8084.
 
 ```bash
-curl -s http://<host>:<port>/healthz   # liveness — siempre 200 si el proceso está vivo
-curl -s http://<host>:<port>/readyz    # readiness — hace ping real a Postgres (pgutil.HealthCheck)
+curl -s http://localhost:<port>/healthz   # 200 si el proceso está vivo
+curl -s http://localhost:<port>/readyz    # hace ping a Postgres
+curl -s http://localhost:8222/healthz     # estado del servidor NATS
+
+docker ps --filter name=posnet- --format '{{.Names}}\t{{.Status}}'
+docker inspect -f '{{.RestartCount}}' posnet-settlement
 ```
 
-`readyz` en `503` con `{"reason": "database unavailable"}` es la señal más común de "el proceso está
-vivo pero no puede servir tráfico" — andá directo a la sección de Postgres.
+`readyz` en `503` con `{"reason": "database unavailable"}` indica que el proceso está vivo pero no
+alcanza Postgres: andá a la [sección 4](#4-postgres).
 
-Puertos por BC: cada uno corre en el puerto configurado por su `config/{bc}_config.go`
-(variable de entorno, ver `.env`/`docker-compose.yml`) — no hay un puerto fijo común entre BCs.
+**`readyz` no verifica NATS.** Un servicio puede responder `200` sin poder consumir ni publicar eventos,
+por eso conviene verificar NATS por separado.
+
+**Un reinicio de `posnet-settlement` cerca de un cierre de lote** suele ser el panic conocido: ver el
+[Escenario C](batch-close-failure.md#escenario-c--caída-del-servicio-al-cerrar-un-lote-correcto).
 
 ### 1.2 ¿Qué tan grave es?
 
 | Severidad | Ejemplo | Acción |
 |---|---|---|
-| **Crítico** | Un BC no levanta / `readyz` en 503 sostenido / la saga de autorización no avanza para ningún terminal | Página al equipo de guardia, seguí este runbook de punta a punta |
-| **Alto** | Un subconjunto de transacciones se queda en un estado no terminal (`PROCESSING`, `FRAUD_CHECKING`) por más de lo esperado | Sección 2 (logs) + sección 3 (NATS) antes de escalar |
-| **Medio** | Batches en `DISPUTED` acumulándose, notificaciones en `RETRYING`/`DEAD` | Ver el runbook específico ([batch-close-failure.md](batch-close-failure.md)) o revisar `notification.notifications` por estado |
-| **Bajo** | Un solo evento quedó sin procesar (visible en logs como error puntual) | Sección 4 (reprocesamiento) cuando corresponda |
+| **Crítico** | Un servicio no levanta, `readyz` en `503` sostenido, o la Saga no avanza para ningún terminal | Avisá al equipo de guardia y seguí este runbook completo |
+| **Alto** | Transacciones trabadas en `FRAUD_CHECKING` o `INDETERMINATE`, o aprobaciones fuera de todo lote | [Sección 5](#5-lo-que-ninguna-alerta-detecta), y después logs y NATS |
+| **Medio** | Lotes en `DISPUTED` o `CLOSED`, notificaciones en `DEAD` o `PENDING` | [batch-close-failure.md](batch-close-failure.md) o la [sección 5](#5-lo-que-ninguna-alerta-detecta) |
+| **Bajo** | Un evento sin procesar, visible como error puntual | [nats-dlq-reprocess.md](nats-dlq-reprocess.md) |
+
+### 1.3 Si llegaste por una alerta
+
+| Alerta | Primer paso |
+|---|---|
+| `SagaCompletaDetenida` | Health de Authorization y Fraud Detection, y [transacciones trabadas](#5-lo-que-ninguna-alerta-detecta) |
+| `SesionesBloqueadasProcessing` | Lo mismo. Las sesiones vencidas se borran, así que el valor puede bajar sin que nada se haya resuelto |
+| `ErrorRateAlta` | `posnet_transactions_rejected_total` por `rejection_code` y `source`. Incluye rechazos de negocio válidos |
+| `LatenciaSagaAlta`, `SagaLatencySLO*` | Duración de `posnet_fraud_engine_duration_seconds` y Postgres |
+| `TxSuccessSLO*` | `posnet_acquirer_errors_total` y `posnet_nats_messages_failed_total`. Republicar eventos también aumenta esta última |
+| `EvalTimeoutsFraud` | Postgres. **Hay transacciones que se están evaluando sin historial** (ver [sección 5](#5-lo-que-ninguna-alerta-detecta)) |
+| `CacheRulesLow` | Volumen de tráfico: con poco tráfico puede activarse sin que haya un problema |
+| `PoolPostgresAgotado`, `PostgresDeadlock` | [Sección 4](#4-postgres) |
+| `DuplicadosNATSAltos` | Reinicios en bucle o `AckWait` insuficiente |
+| `GoroutineLeakSospechoso`, `HeapCreciente` | Dashboard de runtime. En Notification, revisar envíos a Terminal Gateway, que no tienen timeout |
 
 ---
 
-## 2. Logs — correlación por transacción
+## 2. Logs y trazas
 
-Todos los logs son JSON estructurado (`slog`). El campo más útil para seguir un caso puntual es el
-que cada handler agrega al logger antes de escribir (`observability.FromContext(ctx).With(...)`)
-— normalmente `transaction_id`, `event_id`, o `terminal_id` según el BC. Si tenés un
-`TransactionID` de un reclamo, buscalo en los logs de **todos** los BCs que participan en la saga
-(Terminal Gateway → Authorization → Fraud Detection → Settlement/Notification, ver
-[docs/architecture/README.md](../architecture/README.md)) — la traza completa de una transacción
-cruza los 5 procesos.
+Todos los logs son JSON. Para seguir un caso, buscá su `transaction_id` en **todos** los servicios de la
+Saga:
 
-Patrones de log a buscar según lo que sospechás:
-
-```
-"failed to unmarshal envelope"          → payload de NATS corrupto/inesperado — revisar productor
-"permanent error — terminating message" → ValidationError/ConflictError — Term(), no se reintenta
-"transient error — nacking for retry"   → error transitorio — JetStream va a reintentar solo
-"unmet pgxmock expectations"            → esto es de tests, no debería aparecer en logs de prod
-"database unavailable"                  → readyz fallando — ver sección Postgres
+```bash
+for s in terminal-gateway authorization fraud-detection settlement notification; do
+  echo "== $s"; docker logs "posnet-$s" 2>&1 | grep '<transaction_id>'
+done
 ```
 
-Si el mismo `event_id` aparece repetidas veces con "transient error — nacking for retry", el
-consumer está reintentando sin éxito — pasá a la sección 3 para ver cuántos intentos le quedan
-antes de que JetStream deje de redeliverlo.
+No todos los logs incluyen `transaction_id`: según el flujo, también sirven `event_id`, `terminal_id` o
+`batch_id`.
+
+En Jaeger, **la traza se corta entre Terminal Gateway y Authorization**, porque el outbox no propaga el
+contexto. El envío de notificaciones también queda fuera de la traza del evento. Una traza que empieza
+en Authorization es normal.
+
+### Patrones de log
+
+| Mensaje | Significado |
+|---|---|
+| `failed to unmarshal envelope`, `failed to unwrap` | Mensaje inválido: se descartó con `Term`. Revisá al productor |
+| `permanent error — terminating` | `ValidationError` o `ConflictError`: no se reintenta. Termina en `message` solo en algunos servicios |
+| `transient error — nacking for retry` | Se reintenta de inmediato, sin backoff, hasta `MaxDeliver` |
+| `fraud score event already processed — skipping` | **Si viene después de un error, la Saga se perdió:** la reentrega se descartó (ver [Reprocesamiento](nats-dlq-reprocess.md#3-confirmar-la-causa-y-entender-processed_events)) |
+| `reversal event already processed — skipping` | Lo mismo, para una reversa |
+| `failed to publish` | **Evento perdido.** Se registró el error y se confirmó el mensaje: nadie lo reintenta |
+| `acquirer error — marking transaction as indeterminate` | La transacción queda en `INDETERMINATE`, sin evento |
+| `acquirer reversal failed` | La reversa no se hizo y el mensaje se confirmó: requiere intervención manual |
+| `rule engine failed — using neutral score` | La transacción pasó como `REVIEW`, sin caso de fraude guardado |
+| `issuer ordered card capture` | Orden de retener la tarjeta; hoy no llega a ningún terminal |
+| `reload after conflict` | Aprobación rechazada porque el lote del día ya cerró ([Escenario D](batch-close-failure.md#escenario-d--aprobaciones-fuera-de-todo-lote)) |
+| `no open batch found for terminal` | Cierre sin efecto ([Escenario B](batch-close-failure.md#escenario-b--cierre-sin-lote-abierto)) |
+| `notification delivery failed`, `failed to save notification` | Fallo de envío o de guardado de una notificación |
+| `panic: runtime error` | Salida del proceso, no JSON. Revisá `docker logs` y el contador de reinicios |
+
+Si el mismo `event_id` aparece varias veces con `transient error`, el consumidor está agotando sus
+entregas: pasá a la [sección 3](#3-nats-jetstream).
 
 ---
 
 ## 3. NATS JetStream
 
-### 3.1 Estado de un consumer
+Los comandos usan el CLI `nats` y se probaron con la versión `v0.4.0`. Desde el host, el servidor por
+defecto (`localhost:4222`) coincide con el de Compose.
+
+### 3.1 Estado de un consumidor
 
 ```bash
-nats consumer info <STREAM> <DURABLE>
+nats consumer info <STREAM> <DURABLE> --json \
+  | jq '{num_pending, num_redelivered, num_ack_pending, max_deliver: .config.max_deliver}'
 ```
 
-Streams y consumers reales del sistema (catálogo completo en `pkg/natsutil/consumers.go` —
-aunque `EnsureConsumers` no se invoca hoy desde ningún `cmd/*/wire.go`; cada subscriber crea su
-propio consumer al llamar `QueueSubscribe` con las mismas opciones que documenta ese catálogo, así
-que **la fuente de verdad real es el `Durable(...)`/`MaxDeliver(...)` que ves en
-`context/{bc}/infrastructure/nats/*_subscriber.go`, no el catálogo**, que hoy es solo referencia):
+**La fuente de verdad son los `*_subscriber.go` de cada servicio.** `pkg/natsutil/consumers.go` tiene
+nombres desactualizados y `EnsureConsumers` no se invoca.
 
-| Durable | Stream | Subject | MaxDeliver |
+| Durable | Stream | Subject | Entregas máx. |
 |---|---|---|---|
 | `auth-txn-receiver` | `POSNET_TRANSACTIONS` | `posnet.transaction.received.v1` | 5 |
 | `auth-fraud-score-consumer` | `POSNET_FRAUD` | `posnet.fraud.score-calculated.v1` | 5 |
@@ -106,62 +152,144 @@ que **la fuente de verdad real es el `Durable(...)`/`MaxDeliver(...)` que ves en
 | `settlement-auth-consumer` | `POSNET_AUTH` | `posnet.auth.approved.v1` | 5 |
 | `settlement-reversal-consumer` | `POSNET_AUTH` | `posnet.auth.reversal-completed.v1` | 5 |
 | `settlement-batch-consumer` | `POSNET_TRANSACTIONS` | `posnet.transaction.batch-close.v1` | 5 |
-| `notify-auth-consumer` | `POSNET_AUTH` | `posnet.auth.>` | 3 |
-| `notify-settlement-consumer` | `POSNET_SETTLEMENT` | `posnet.settlement.>` | 3 |
+| `notify-auth-approved` | `POSNET_AUTH` | `posnet.auth.approved.v1` | 3 |
+| `notify-auth-rejected` | `POSNET_AUTH` | `posnet.auth.rejected.v1` | 3 |
+| `notify-batch-closed` | `POSNET_SETTLEMENT` | `posnet.settlement.batch-closed.v1` | 3 |
 
-En la salida de `nats consumer info`, lo que importa:
+Cómo leer los valores:
 
-- `Num Pending` alto y creciendo → el consumer no está llegando a procesar al ritmo que se publica
-  (proceso caído, o lento). Revisá `readyz` del BC dueño de ese consumer.
-- `Num Redelivered` cerca de `Max Deliver` → mensajes a punto de agotar reintentos. Andá a
-  [nats-dlq-reprocess.md](nats-dlq-reprocess.md) antes de que se agoten — después de eso, el
-  mensaje deja de redeliverse (los streams son `Retention: LimitsPolicy`, así que el mensaje
-  original sigue en el stream, pero nadie lo va a volver a entregar solo).
+| Campo | Significado |
+|---|---|
+| `num_pending` alto y creciendo | El consumidor no da abasto o su proceso está caído |
+| `num_ack_pending` | Mensajes entregados y sin confirmar, que todavía pueden reintentarse |
+| `num_redelivered` | Cuántos **mensajes** se reentregaron. No es un contador de intentos, así que no sirve compararlo con `max_deliver` |
+
+Un mensaje que agota sus entregas sale de `num_ack_pending`, y `num_redelivered` no vuelve a cero.
+Nadie lo reintenta solo, pero sigue en el stream: ver [nats-dlq-reprocess.md](nats-dlq-reprocess.md).
 
 ### 3.2 Estado de un stream
 
 ```bash
-nats stream info <STREAM>
+nats stream info <STREAM> --json | jq '.state | {messages, first_seq, last_seq, consumer_count}'
 ```
 
-Streams del sistema: `POSNET_TRANSACTIONS`, `POSNET_FRAUD`, `POSNET_AUTH`, `POSNET_SETTLEMENT`,
-`POSNET_NOTIFICATION`, `POSNET_DLQ`. Hoy todos corren con `Replicas: 1` (sin tolerancia a la caída
-del nodo NATS — ver [ADR 002](../adr/002-nats-jetstream.md)) y `MaxAge: 0` (retención sin límite de
-tiempo), así que un stream lleno indica volumen real, no vencimiento de mensajes.
+Streams: `POSNET_TRANSACTIONS`, `POSNET_FRAUD`, `POSNET_AUTH`, `POSNET_SETTLEMENT`,
+`POSNET_NOTIFICATION` y `POSNET_DLQ`. Todos usan `Replicas: 1`, sin tolerancia a la caída del nodo (ver
+[ADR 002](../adr/002-nats-jetstream.md)), y `MaxAge: 0`, de modo que los mensajes no vencen por tiempo.
+`POSNET_DLQ` existe, pero nada publica en él.
 
 ---
 
 ## 4. Postgres
 
-Cada BC tiene su propio schema (`{bc}` en minúsculas con guiones bajos:
-`terminal_gateway`, `pn_authorization`, `fraud_detection`, `settlement`, `notification`). Todas las
-tablas de auditoría de idempotencia se llaman `processed_events` dentro de su schema.
+Schemas: `terminal_gateway`, `pn_authorization`, `fraud_detection`, `settlement` y `notification`. Cada
+uno tiene su tabla `processed_events`.
 
 ```sql
--- ¿Se procesó ya este evento? (reemplazá el schema según el BC)
+-- ¿Se marcó este evento? Una fila NO garantiza que el trabajo se haya hecho:
+-- ver "Entender processed_events" en nats-dlq-reprocess.md
 SELECT * FROM settlement.processed_events WHERE event_id = '<uuid>';
 
--- Conexiones activas del pool — útil si readyz falla por agotamiento de conexiones
+-- Conexiones activas, si readyz falla por agotamiento
 SELECT count(*), state FROM pg_stat_activity WHERE datname = 'posnet' GROUP BY state;
 ```
 
-`pkg/pgutil.HealthCheck` (lo que corre `readyz`) es solo un `pool.Ping(ctx)` — si falla, es
-conectividad de red o el pool agotado, no un problema de una query puntual.
+`pkg/pgutil.HealthCheck` es un `pool.Ping(ctx)`: si falla, es conectividad o un pool agotado, no una
+consulta puntual.
+
+**Si la base es anterior a la blocklist,** todas las transacciones fallan por la falta de la columna
+`card_token`. Ver
+[Aplicar la migración](../technical/AUTHORIZATION.md#aplicar-la-migración-de-blocklist).
 
 ---
 
-## 5. Cuándo derivar a un runbook específico
+## 5. Lo que ninguna alerta detecta
+
+Estas consultas encuentran fallas silenciosas. Conviene ejecutarlas durante un incidente, incluso si el
+síntoma parece otro.
+
+### Transacciones trabadas
+
+```sql
+SELECT t.id, t.state, t.terminal_id, t.amount_cents, t.created_at, fc.decision AS fraud_decision
+FROM pn_authorization.transactions t
+LEFT JOIN fraud_detection.fraud_cases fc ON fc.transaction_id = t.id
+WHERE t.state IN ('FRAUD_CHECKING', 'INDETERMINATE')
+  AND t.created_at < NOW() - INTERVAL '5 minutes'
+ORDER BY t.created_at;
+```
+
+| Resultado | Causa probable | Qué hacer |
+|---|---|---|
+| `FRAUD_CHECKING`, sin caso de fraude | El pedido se perdió, Fraud Detection no lo procesó, o falló su motor | [Reprocesar](nats-dlq-reprocess.md) desde `check-requested` |
+| `FRAUD_CHECKING`, con caso de fraude | El score se perdió o falló su procesamiento | [Reprocesar](nats-dlq-reprocess.md) según la tabla de `processed_events` |
+| `INDETERMINATE` | Error del adquirente; no hay conciliación automática ni evento. Con el mock actual no debería ocurrir | Conciliar con el adquirente, de forma manual |
+
+**No hay timeout ni bypass de fraude**, aunque los logs y comentarios los mencionen: una transacción
+trabada no se resuelve sola. Para el cliente, Terminal Gateway borra la sesión vencida, y `GET
+/api/sessions/{id}/status` pasa a responder `404`.
+
+### Aprobaciones fuera de todo lote
+
+```sql
+SELECT t.id, t.terminal_id, t.amount_cents, t.authorized_at
+FROM pn_authorization.transactions t
+LEFT JOIN settlement.batch_transactions bt ON bt.transaction_id = t.id
+WHERE t.state = 'APPROVED'
+  AND bt.transaction_id IS NULL
+  AND t.authorized_at < NOW() - INTERVAL '5 minutes'
+ORDER BY t.authorized_at DESC;
+```
+
+Ver el [Escenario D](batch-close-failure.md#escenario-d--aprobaciones-fuera-de-todo-lote).
+
+### Notificaciones perdidas
+
+```sql
+SELECT id, transaction_id, channel, state, attempt_count, created_at
+FROM notification.notifications
+WHERE state = 'DEAD'
+   OR (state = 'PENDING' AND created_at < NOW() - INTERVAL '5 minutes')
+ORDER BY created_at DESC;
+```
+
+Las notificaciones en `PENDING` no se reintentan nunca, y `force-retry` no saca a ninguna de `DEAD`. Ver
+[Notification](../technical/NOTIFICATION.md#reenviar-una-notificación-dead).
+
+En un entorno recién levantado, que todos los webhooks lleguen a `DEAD` suele indicar que `webhook-mock`
+no tiene una respuesta configurada.
+
+### Control de fraude degradado
+
+```promql
+rate(posnet_fraud_engine_timeouts_total[5m])
+```
+
+Si fallan las consultas de historial, las reglas no se activan y la transacción puede quedar como
+`APPROVE` con score 0, **sin error ni log**. Solo los timeouts dejan esta métrica. Para confirmar:
+
+```sql
+SELECT decision, count(*), avg(score)::int AS avg_score
+FROM fraud_detection.fraud_cases
+WHERE evaluated_at > NOW() - INTERVAL '1 hour'
+GROUP BY decision;
+```
+
+Las reglas también pueden haberse cambiado: `PUT /rules/{id}/threshold` no tiene autenticación ni deja
+registro. Compará `GET /rules` con los pesos por defecto (20, 15, 25, 20 y 30).
+
+---
+
+## 6. Cuándo derivar a un runbook específico
 
 | Síntoma | Runbook |
 |---|---|
-| Batches de liquidación en `DISPUTED` o atascados en `CLOSED` sin pasar a `SUBMITTED` | [batch-close-failure.md](batch-close-failure.md) |
-| Mensajes que agotaron `MaxDeliver` y dejaron de redeliverse | [nats-dlq-reprocess.md](nats-dlq-reprocess.md) |
+| Lotes en `DISPUTED` o `CLOSED`, cierres sin efecto, reinicios de Settlement, aprobaciones fuera de lote o reversas sin descontar | [batch-close-failure.md](batch-close-failure.md) |
+| Mensajes que agotaron sus entregas, eventos perdidos o transacciones trabadas | [nats-dlq-reprocess.md](nats-dlq-reprocess.md) |
 
-## 6. Después del incidente
+## 7. Después del incidente
 
-- Guardá los `event_id`/`transaction_id` afectados — son la clave para auditar en
-  `processed_events` y en los logs de los 5 BCs.
-- Si el incidente reveló un gap de recuperación (algo que tuviste que arreglar a mano por SQL
-  porque no había una vía self-service), documentalo — varios de esos gaps ya están señalados
-  explícitamente en los ADRs y en los otros runbooks; si encontrás uno nuevo, agregalo ahí en vez
-  de dejarlo solo en la memoria del que respondió.
+- Guardá los `event_id` y `transaction_id` afectados, y cualquier SQL que hayas ejecutado.
+- Si algo se resolvió a mano, documentalo. Las brechas conocidas están en
+  [`docs/technical/`](../technical/): si encontrás una nueva, agregala ahí y no la dejes solo en la
+  memoria de quien respondió.
