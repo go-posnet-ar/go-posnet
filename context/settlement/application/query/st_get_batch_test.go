@@ -33,7 +33,7 @@ func (f *fakeBatchRepo) FindByID(context.Context, string) (*aggregate.Settlement
 	return f.findByIDResult, f.findByIDErr
 }
 
-func (f *fakeBatchRepo) FindOpenByTerminal(context.Context, domain.TerminalID, time.Time) (*aggregate.SettlementBatch, error) {
+func (f *fakeBatchRepo) FindOpenByTerminal(context.Context, domain.TerminalID, time.Time, string) (*aggregate.SettlementBatch, error) {
 	return nil, nil
 }
 

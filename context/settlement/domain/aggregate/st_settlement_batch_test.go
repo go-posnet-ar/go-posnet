@@ -179,7 +179,7 @@ func TestRemoveTransaction_Success(t *testing.T) {
 	b := newOpenBatch(t)
 	txID := domain.NewTransactionID()
 
-	if err := b.RemoveTransaction(txID); err != nil {
+	if err := b.RemoveTransaction(txID, 750); err != nil {
 		t.Fatalf("RemoveTransaction() error = %v", err)
 	}
 
@@ -190,8 +190,8 @@ func TestRemoveTransaction_Success(t *testing.T) {
 	if txs[0].Type() != valueobject.BatchTxReversal {
 		t.Errorf("Type() = %v, want %v", txs[0].Type(), valueobject.BatchTxReversal)
 	}
-	if txs[0].AmountCents() != 1 {
-		t.Errorf("AmountCents() = %d, want 1", txs[0].AmountCents())
+	if txs[0].AmountCents() != 750 {
+		t.Errorf("AmountCents() = %d, want 750", txs[0].AmountCents())
 	}
 	if !txs[0].TransactionID().Equals(txID) {
 		t.Errorf("TransactionID() = %v, want %v", txs[0].TransactionID(), txID)
@@ -204,7 +204,7 @@ func TestRemoveTransaction_ErrorWhenNotOpen(t *testing.T) {
 		t.Fatalf("RequestClose() error = %v", err)
 	}
 
-	err := b.RemoveTransaction(domain.NewTransactionID())
+	err := b.RemoveTransaction(domain.NewTransactionID(), 1)
 	if err == nil || !strings.Contains(err.Error(), "cannot remove transaction in state") {
 		t.Fatalf("error = %v, want it to mention the invalid state", err)
 	}
@@ -212,7 +212,7 @@ func TestRemoveTransaction_ErrorWhenNotOpen(t *testing.T) {
 
 func TestRemoveTransaction_PropagatesEntityError(t *testing.T) {
 	b := newOpenBatch(t)
-	err := b.RemoveTransaction(domain.TransactionID{})
+	err := b.RemoveTransaction(domain.TransactionID{}, 1)
 	if err == nil {
 		t.Fatal("RemoveTransaction() error = nil, want the entity's zero-id validation error")
 	}
@@ -261,7 +261,7 @@ func closableBatch(t *testing.T) *aggregate.SettlementBatch {
 	if err := b.AddTransaction(domain.NewTransactionID(), 2000, valueobject.BatchTxPurchase); err != nil {
 		t.Fatalf("AddTransaction() error = %v", err)
 	}
-	if err := b.RemoveTransaction(domain.NewTransactionID()); err != nil { // reversal, amountCents=1
+	if err := b.RemoveTransaction(domain.NewTransactionID(), 1); err != nil { // reversal, amountCents=1
 		t.Fatalf("RemoveTransaction() error = %v", err)
 	}
 	if err := b.RequestClose(); err != nil {
@@ -673,5 +673,62 @@ func TestMarkSettled_WithoutSummary(t *testing.T) {
 	}
 	if b.State() != valueobject.BatchStateSubmitted {
 		t.Errorf("State() = %v, want it unchanged", b.State())
+	}
+}
+
+func TestRemoveTransaction_RejectsNonPositiveAmount(t *testing.T) {
+	if err := newOpenBatch(t).RemoveTransaction(domain.NewTransactionID(), 0); err == nil {
+		t.Fatal("RemoveTransaction() error = nil with amount 0, want an error")
+	}
+}
+
+func TestClose_DiscountsReversalWithItsRealAmount(t *testing.T) {
+	b := newOpenBatch(t)
+	txID := domain.NewTransactionID()
+	if err := b.AddTransaction(txID, 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	if err := b.AddTransaction(domain.NewTransactionID(), 500, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	if err := b.RemoveTransaction(txID, 1000); err != nil {
+		t.Fatalf("RemoveTransaction() error = %v", err)
+	}
+	if err := b.RequestClose(); err != nil {
+		t.Fatalf("RequestClose() error = %v", err)
+	}
+	if err := b.Close(3, 500); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if b.Discrepancies() != 0 {
+		t.Errorf("Discrepancies() = %d, want 0", b.Discrepancies())
+	}
+	s := b.Summary()
+	if s.TotalAmount().Cents() != 500 || s.PurchaseAmount().Cents() != 1500 || s.ReversalAmount().Cents() != 1000 {
+		t.Errorf("total = %d, purchases = %d, reversals = %d, want 500, 1500, 1000",
+			s.TotalAmount().Cents(), s.PurchaseAmount().Cents(), s.ReversalAmount().Cents())
+	}
+}
+
+// Una reversa de una compra de un lote anterior puede dejar el lote en negativo.
+func TestClose_OnlyReversalGivesNegativeTotal(t *testing.T) {
+	b := newOpenBatch(t)
+	if err := b.RemoveTransaction(domain.NewTransactionID(), 700); err != nil {
+		t.Fatalf("RemoveTransaction() error = %v", err)
+	}
+	if err := b.CloseWithBackendTotals(); err != nil {
+		t.Fatalf("CloseWithBackendTotals() error = %v", err)
+	}
+	if got := b.Summary().TotalAmount().Cents(); got != -700 {
+		t.Errorf("TotalAmount = %d, want -700", got)
+	}
+}
+
+func TestMarkPersisted_IncrementsVersion(t *testing.T) {
+	b := newOpenBatch(t)
+	b.MarkPersisted()
+	if b.Version() != 1 {
+		t.Errorf("Version() = %d, want 1", b.Version())
 	}
 }

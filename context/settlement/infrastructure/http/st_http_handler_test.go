@@ -11,6 +11,7 @@ import (
 	"github.com/juantevez/go-posnet/context/settlement/application/command"
 	"github.com/juantevez/go-posnet/context/settlement/application/query"
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
@@ -474,6 +475,41 @@ func TestHandleSettleBatch(t *testing.T) {
 			}
 			if body["error"] != tc.wantErr {
 				t.Errorf("body[error] = %v, want %q", body["error"], tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestAdminRoutes_StaleBatchReturnsConflict(t *testing.T) {
+	newSubmitted := func() *aggregate.SettlementBatch {
+		b := newBatch(t)
+		if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+			t.Fatalf("AddTransaction() error = %v", err)
+		}
+		if err := b.CloseWithBackendTotals(); err != nil {
+			t.Fatalf("CloseWithBackendTotals() error = %v", err)
+		}
+		if err := b.Submit(); err != nil {
+			t.Fatalf("Submit() error = %v", err)
+		}
+		return b
+	}
+	tests := []struct {
+		path  string
+		batch *aggregate.SettlementBatch
+	}{
+		{"/batches/b/force-close", newBatch(t)},
+		{"/batches/b/resubmit", newClosedBatch(t)},
+		{"/batches/b/settle", newSubmitted()},
+	}
+	for _, tc := range tests {
+		t.Run(tc.path, func(t *testing.T) {
+			repo := &fakeBatchRepo{findByIDResult: tc.batch, saveErr: repository.ErrStaleBatch}
+			mux := newTestMux(newTestHandler(repo, &fakePool{}))
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{"operator_id":"op-1"}`)))
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusConflict, rec.Body.String())
 			}
 		})
 	}

@@ -123,7 +123,7 @@ del consumidor:**
 | `fraud-check-consumer` | El caso se guardó. El score pudo perderse | Si la transacción sigue en `FRAUD_CHECKING`: borrar la fila y republicar. Se evalúa de nuevo: el score publicado puede diferir del caso guardado |
 | `gateway-auth-consumer` | El resultado se aplicó a la sesión | Nada |
 | `settlement-auth-consumer` | La compra entró al lote | Nada |
-| `settlement-reversal-consumer` | Se procesó, pero **la reversa nunca se guarda** | Republicar no ayuda: ver el [Escenario E](batch-close-failure.md#escenario-e--reversas-sin-descontar) |
+| `settlement-reversal-consumer` | La reversa se registró. **Antes de la corrección, se descartaba igual** | Nada, salvo en reversas antiguas: ver el [Escenario E](batch-close-failure.md#escenario-e--reversas-anteriores-sin-descontar) |
 | `settlement-batch-consumer` | El lote se cerró | Nada: seguí [batch-close-failure.md](batch-close-failure.md) |
 | `notify-*` | Las notificaciones se crearon | No borrar: crearía duplicados. Ver [Notification](../technical/NOTIFICATION.md#reenviar-una-notificación-dead) |
 

@@ -9,6 +9,7 @@ import (
 	"github.com/juantevez/go-posnet/context/settlement/application/command"
 	"github.com/juantevez/go-posnet/context/settlement/application/port"
 	"github.com/juantevez/go-posnet/context/settlement/application/query"
+	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
 	"github.com/juantevez/go-posnet/context/settlement/domain/service"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
 	"github.com/juantevez/go-posnet/pkg/observability"
@@ -129,6 +130,10 @@ func (h *Handler) handleForceClose(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, errResp("VALIDATION_ERROR", err.Error()))
 			return
 		}
+		if errors.Is(err, repository.ErrStaleBatch) {
+			writeJSON(w, http.StatusConflict, errResp("CONFLICT", "batch was modified concurrently; retry"))
+			return
+		}
 		observability.RecordError(ctx, err)
 		writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", "internal error"))
 		return
@@ -163,6 +168,10 @@ func (h *Handler) handleResubmitBatch(w http.ResponseWriter, r *http.Request) {
 		var validationErr *pkgerrors.ValidationError
 		if errors.As(err, &validationErr) {
 			writeJSON(w, http.StatusBadRequest, errResp("VALIDATION_ERROR", err.Error()))
+			return
+		}
+		if errors.Is(err, repository.ErrStaleBatch) {
+			writeJSON(w, http.StatusConflict, errResp("CONFLICT", "batch was modified concurrently; retry"))
 			return
 		}
 		if errors.Is(err, service.ErrProcessorUnavailable) {
@@ -254,6 +263,10 @@ func (h *Handler) writeAdminResult(w http.ResponseWriter, r *http.Request, err e
 	var validationErr *pkgerrors.ValidationError
 	if errors.As(err, &validationErr) {
 		writeJSON(w, http.StatusBadRequest, errResp("VALIDATION_ERROR", err.Error()))
+		return
+	}
+	if errors.Is(err, repository.ErrStaleBatch) {
+		writeJSON(w, http.StatusConflict, errResp("CONFLICT", "batch was modified concurrently; retry"))
 		return
 	}
 	observability.RecordError(r.Context(), err)

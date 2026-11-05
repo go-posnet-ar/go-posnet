@@ -184,6 +184,7 @@ func (s *Subscriber) handleBatchCloseRequested(msg *natsclient.Msg) {
 		TerminalID:     payload.TerminalID,
 		MerchantID:     payload.MerchantID,
 		BatchDate:      payload.BatchDate,
+		RequestedAt:    payload.RequestedAt,
 		TerminalCount:  payload.TerminalCount,
 		TerminalAmount: payload.TerminalAmount,
 		Currency:       payload.Currency,

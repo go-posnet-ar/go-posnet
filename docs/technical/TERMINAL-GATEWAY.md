@@ -186,8 +186,8 @@ estado `REVERSED`. TG ignora el evento `reversal-completed`: lo confirma con `Ac
 ### 5.5 Cierre de lote
 
 `POST /batch-close` publica `batch-close` con los totales informados por el terminal; Settlement hace
-la conciliación. TG no persiste nada en este flujo. El `batch_date` del request se ignora y se usa la
-fecha UTC actual.
+la conciliación. TG no persiste nada en este flujo. `currency` es obligatorio y `batch_date`, opcional: sin
+él, Settlement usa el día de negocio del pedido. Una moneda o una fecha inválidas se rechazan, hoy con `500`.
 
 ### 5.6 Expiración
 
@@ -548,7 +548,6 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Un terminal puede tener varias sesiones activas | Nada impide la creación, aunque el diseño pide una sola; `GetActiveSession` devuelve una cualquiera | `CreateSession`, `FindActiveByTerminal` |
 | El guardado de la sesión queda fuera de la transacción de idempotencia | `Save` usa el pool en lugar de `tx`: si falla el commit, la sesión queda guardada sin el evento marcado | `ApplyApproval`, `ApplyRejection` |
 | La transición se valida antes que la idempotencia | Un evento duplicado falla con un error genérico y agota los reintentos en lugar de confirmarse | `ApplyApproval`, `ApplyRejection` |
-| `batch_date` se ignora | El lote toma la fecha UTC: en UTC-3, un cierre posterior a las 21:00 queda con la fecha del día siguiente | `PublishBatchCloseRequested` |
 
 ### Funcionalidad incompleta
 

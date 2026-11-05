@@ -165,17 +165,24 @@ CREATE TABLE IF NOT EXISTS settlement.settlement_batches (
     closed_at       TIMESTAMPTZ,
     submitted_at    TIMESTAMPTZ,
     settled_at      TIMESTAMPTZ,
-    UNIQUE (terminal_id, batch_date)
+    version         INTEGER     NOT NULL DEFAULT 0
 );
+-- Un solo lote abierto por terminal, fecha y moneda.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_settlement_batches_open
+    ON settlement.settlement_batches (terminal_id, batch_date, currency)
+    WHERE state = 'OPEN';
 CREATE TABLE IF NOT EXISTS settlement.batch_transactions (
     id              UUID        PRIMARY KEY,
     batch_id        UUID        NOT NULL REFERENCES settlement.settlement_batches(id),
-    transaction_id  UUID        NOT NULL UNIQUE,
+    transaction_id  UUID        NOT NULL,
     amount_cents    BIGINT      NOT NULL,
     currency        CHAR(3)     NOT NULL,
     tx_type         VARCHAR(20) NOT NULL,
     included_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- La reversa usa el transaction_id de la compra: la unicidad incluye el tipo.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_batch_transactions_tx_type
+    ON settlement.batch_transactions (transaction_id, tx_type);
 CREATE TABLE IF NOT EXISTS settlement.processed_events (
     event_id     UUID        PRIMARY KEY,
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

@@ -145,6 +145,18 @@ func (h *AdminHandler) ReopenBatch(ctx context.Context, cmd port.ReopenBatchComm
 		return fmt.Errorf("ReopenBatch: %w", err)
 	}
 
+	// Solo puede haber un lote abierto por terminal, fecha y moneda. Si ya hay otro
+	// (por ventas posteriores al cierre), este se resuelve con ResolveDispute.
+	open, err := h.batchRepo.FindOpenByTerminal(ctx, batch.TerminalID(), batch.BatchDate(), batch.Currency())
+	if err != nil {
+		return fmt.Errorf("ReopenBatch: find open batch: %w", err)
+	}
+	if open != nil {
+		return pkgerrors.NewValidationError(fmt.Sprintf(
+			"terminal already has an OPEN batch for that date and currency (%s); use resolve-dispute", open.ID(),
+		))
+	}
+
 	previousDiscrepancies := batch.Discrepancies()
 	if err := batch.Reopen(); err != nil {
 		return fmt.Errorf("ReopenBatch: %w", err)

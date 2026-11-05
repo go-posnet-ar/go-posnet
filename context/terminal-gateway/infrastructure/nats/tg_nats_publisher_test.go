@@ -235,7 +235,7 @@ func TestPublishBatchCloseRequested_Success(t *testing.T) {
 	terminalID := domain.NewTerminalID()
 	merchantID := domain.NewMerchantID()
 
-	if err := p.PublishBatchCloseRequested(context.Background(), terminalID, merchantID, 5, 5000, "ARS"); err != nil {
+	if err := p.PublishBatchCloseRequested(context.Background(), terminalID, merchantID, "2026-01-15", 5, 5000, "ARS"); err != nil {
 		t.Fatalf("PublishBatchCloseRequested() error = %v", err)
 	}
 
@@ -259,6 +259,9 @@ func TestPublishBatchCloseRequested_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unwrap() error = %v", err)
 	}
+	if payload.BatchDate != "2026-01-15" {
+		t.Errorf("BatchDate = %q, want the date reported by the terminal", payload.BatchDate)
+	}
 	if payload.TerminalID != terminalID.String() {
 		t.Errorf("TerminalID = %q, want %q", payload.TerminalID, terminalID.String())
 	}
@@ -280,7 +283,7 @@ func TestPublishBatchCloseRequested_Error(t *testing.T) {
 	js := &fakeJetStream{publishErr: errors.New("nats unavailable")}
 	p := newTestPublisher(js)
 
-	err := p.PublishBatchCloseRequested(context.Background(), domain.NewTerminalID(), domain.NewMerchantID(), 1, 1000, "ARS")
+	err := p.PublishBatchCloseRequested(context.Background(), domain.NewTerminalID(), domain.NewMerchantID(), "", 1, 1000, "ARS")
 	if err == nil || !strings.Contains(err.Error(), "tg publisher: publish BatchCloseRequested") {
 		t.Fatalf("error = %v, want it to contain %q", err, "tg publisher: publish BatchCloseRequested")
 	}

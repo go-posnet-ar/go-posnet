@@ -145,7 +145,7 @@ func (f *fakePublisher) PublishReversalRequested(context.Context, domain.Transac
 	return f.publishReversalErr
 }
 
-func (f *fakePublisher) PublishBatchCloseRequested(context.Context, domain.TerminalID, domain.MerchantID, int, int64, string) error {
+func (f *fakePublisher) PublishBatchCloseRequested(context.Context, domain.TerminalID, domain.MerchantID, string, int, int64, string) error {
 	f.publishBatchCloseCall++
 	return f.publishBatchCloseErr
 }

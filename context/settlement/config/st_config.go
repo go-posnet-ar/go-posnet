@@ -52,7 +52,8 @@ type SettlementConfig struct {
 	MDRPercent float64
 
 	// BatchCloseHour es la hora UTC desde la que corre el cierre automático, que
-	// alcanza a los lotes OPEN de días UTC anteriores. Default: 3 = 00:00 en Argentina.
+	// alcanza a los lotes OPEN de días de negocio anteriores. Default: 3 = 00:00 en
+	// Argentina. Debe ser posterior a la medianoche de BusinessTimezone.
 	// Si es 0, el cierre es solo por pedido del terminal o de un operador.
 	BatchCloseHour int
 
@@ -65,6 +66,9 @@ type SettlementConfig struct {
 
 	// Processor selecciona el procesador externo: ProcessorNone o ProcessorMock.
 	Processor string
+
+	// BusinessTimezone es la zona IANA que define a qué día pertenece una transacción.
+	BusinessTimezone string
 }
 
 const (
@@ -112,6 +116,8 @@ func Load() (*Config, error) {
 			SubmitRetries:  envInt("SETTLEMENT_SUBMIT_RETRIES", 3),
 			SubmitTimeout:  envDuration("SETTLEMENT_SUBMIT_TIMEOUT", 30*time.Second),
 			Processor:      envStr("SETTLEMENT_PROCESSOR", ProcessorNone),
+
+			BusinessTimezone: envStr("SETTLEMENT_BUSINESS_TIMEZONE", "America/Argentina/Buenos_Aires"),
 		},
 	}
 
@@ -136,6 +142,9 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("config: SETTLEMENT_PROCESSOR %q must be %q or %q",
 			c.Settlement.Processor, ProcessorNone, ProcessorMock)
+	}
+	if _, err := time.LoadLocation(c.Settlement.BusinessTimezone); err != nil {
+		return fmt.Errorf("config: SETTLEMENT_BUSINESS_TIMEZONE %q is invalid: %w", c.Settlement.BusinessTimezone, err)
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"time"
 
 	"github.com/google/uuid"
@@ -32,6 +33,23 @@ type BatchHandler struct {
 	pool        pgutil.PgxPool
 	mdrPercent  float64
 	metrics     *Metrics // opcional; nil = sin instrumentación (tests)
+	location    *time.Location
+}
+
+// SetBusinessLocation define la zona horaria del día de negocio. Sin configurar, usa UTC.
+func (h *BatchHandler) SetBusinessLocation(loc *time.Location) {
+	h.location = loc
+}
+
+// businessDate devuelve el día de negocio de t, a medianoche UTC para que el valor
+// no dependa de la zona al formatearlo o guardarlo como DATE.
+func (h *BatchHandler) businessDate(t time.Time) time.Time {
+	loc := h.location
+	if loc == nil {
+		loc = time.UTC
+	}
+	y, m, d := t.In(loc).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 }
 
 // SetMetrics inyecta los instrumentos de negocio (desde el wiring, tras InitMeter).
@@ -81,31 +99,40 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 	if err != nil {
 		return pkgerrors.NewValidationError("invalid transaction_id")
 	}
+	if _, err := domain.ParseCurrency(cmd.Currency); err != nil {
+		return pkgerrors.NewValidationError("invalid currency")
+	}
+	if cmd.AmountCents <= 0 {
+		return pkgerrors.NewValidationError("amount_cents must be positive")
+	}
 	authorizedAt, err := time.Parse(time.RFC3339, cmd.AuthorizedAt)
 	if err != nil {
 		authorizedAt = time.Now().UTC()
 	}
 
 	var batchID string
-	err = pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
-		inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
-		if err != nil {
-			return err
-		}
-		if !inserted {
-			log.Info("approval event already registered — skipping")
-			return nil
-		}
+	err = retryOnStale(ctx, func() error {
+		batchID = ""
+		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
+			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
+			if err != nil {
+				return err
+			}
+			if !inserted {
+				log.Info("approval event already registered — skipping")
+				return nil
+			}
 
-		batch, err := h.batchRepo.FindOrCreateOpen(ctx, terminalID, merchantID, authorizedAt, cmd.Currency)
-		if err != nil {
-			return fmt.Errorf("find or create batch: %w", err)
-		}
-		if err := batch.AddTransaction(txID, cmd.AmountCents, valueobject.BatchTxPurchase); err != nil {
-			return fmt.Errorf("add transaction: %w", err)
-		}
-		batchID = batch.ID()
-		return h.batchRepo.Save(ctx, batch)
+			batch, err := h.batchRepo.FindOrCreateOpen(ctx, terminalID, merchantID, h.businessDate(authorizedAt), cmd.Currency)
+			if err != nil {
+				return fmt.Errorf("find or create batch: %w", err)
+			}
+			if err := batch.AddTransaction(txID, cmd.AmountCents, valueobject.BatchTxPurchase); err != nil {
+				return fmt.Errorf("add transaction: %w", err)
+			}
+			batchID = batch.ID()
+			return h.batchRepo.Save(ctx, batch)
+		})
 	})
 	if err != nil {
 		observability.RecordError(ctx, err)
@@ -139,30 +166,39 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 	if err != nil {
 		return pkgerrors.NewValidationError("invalid original_transaction_id")
 	}
+	if _, err := domain.ParseCurrency(cmd.Currency); err != nil {
+		return pkgerrors.NewValidationError("invalid currency")
+	}
+	if cmd.AmountCents <= 0 {
+		return pkgerrors.NewValidationError("amount_cents must be positive")
+	}
 	completedAt, err := time.Parse(time.RFC3339, cmd.CompletedAt)
 	if err != nil {
 		completedAt = time.Now().UTC()
 	}
 
 	var registered bool
-	err = pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
-		inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
-		if err != nil {
-			return err
-		}
-		if !inserted {
-			return nil
-		}
+	err = retryOnStale(ctx, func() error {
+		registered = false
+		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
+			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
+			if err != nil {
+				return err
+			}
+			if !inserted {
+				return nil
+			}
 
-		batch, err := h.batchRepo.FindOrCreateOpen(ctx, terminalID, merchantID, completedAt, cmd.Currency)
-		if err != nil {
-			return fmt.Errorf("find or create batch: %w", err)
-		}
-		if err := batch.RemoveTransaction(origTxID); err != nil {
-			return fmt.Errorf("remove transaction: %w", err)
-		}
-		registered = true
-		return h.batchRepo.Save(ctx, batch)
+			batch, err := h.batchRepo.FindOrCreateOpen(ctx, terminalID, merchantID, h.businessDate(completedAt), cmd.Currency)
+			if err != nil {
+				return fmt.Errorf("find or create batch: %w", err)
+			}
+			if err := batch.RemoveTransaction(origTxID, cmd.AmountCents); err != nil {
+				return fmt.Errorf("remove transaction: %w", err)
+			}
+			registered = true
+			return h.batchRepo.Save(ctx, batch)
+		})
 	})
 	if err != nil {
 		return err
@@ -191,44 +227,52 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 		return pkgerrors.NewValidationError("invalid terminal_id")
 	}
 
-	batchDate, err := time.Parse("2006-01-02", cmd.BatchDate)
-	if err != nil {
-		batchDate = time.Now().UTC()
+	if _, err := domain.ParseCurrency(cmd.Currency); err != nil {
+		return pkgerrors.NewValidationError("invalid currency")
 	}
 
-	// Recuperar el batch OPEN del terminal
-	batch, err := h.batchRepo.FindOpenByTerminal(ctx, terminalID, batchDate)
+	// Carga, cierre y guardado se reintentan juntos: si entró una venta en el medio,
+	// el cierre tiene que volver a calcular los totales con ella.
+	var batch *aggregate.SettlementBatch
+	processed := false
+	err = retryOnStale(ctx, func() error {
+		processed = false
+		var err error
+		batch, err = h.batchRepo.FindOpenByTerminal(ctx, terminalID, h.closeDate(cmd), cmd.Currency)
+		if err != nil {
+			return fmt.Errorf("find open batch: %w", err)
+		}
+		if batch == nil {
+			return nil
+		}
+
+		// Solicitar cierre → calcular totales → comparar con terminal
+		if err := batch.RequestClose(); err != nil {
+			return fmt.Errorf("request close: %w", err)
+		}
+		if err := batch.Close(cmd.TerminalCount, cmd.TerminalAmount); err != nil {
+			return fmt.Errorf("close batch: %w", err)
+		}
+
+		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
+			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
+			if err != nil {
+				return err
+			}
+			if !inserted {
+				log.Info("batch close event already processed — skipping")
+				return nil
+			}
+			processed = true
+			return h.batchRepo.Save(ctx, batch)
+		})
+	})
 	if err != nil {
-		return fmt.Errorf("ProcessBatchClose: find open batch: %w", err)
+		return fmt.Errorf("ProcessBatchClose: %w", err)
 	}
 	if batch == nil {
 		log.Warn("no open batch found for terminal — nothing to close")
 		return nil
-	}
-
-	// Solicitar cierre → calcular totales → comparar con terminal
-	if err := batch.RequestClose(); err != nil {
-		return fmt.Errorf("ProcessBatchClose: request close: %w", err)
-	}
-	if err := batch.Close(cmd.TerminalCount, cmd.TerminalAmount); err != nil {
-		return fmt.Errorf("ProcessBatchClose: close batch: %w", err)
-	}
-
-	processed := false
-	err = pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
-		inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
-		if err != nil {
-			return err
-		}
-		if !inserted {
-			log.Info("batch close event already processed — skipping")
-			return nil
-		}
-		processed = true
-		return h.batchRepo.Save(ctx, batch)
-	})
-	if err != nil {
-		return fmt.Errorf("ProcessBatchClose: %w", err)
 	}
 	if !processed {
 		return nil
@@ -260,20 +304,63 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 	return h.submitBatch(ctx, batch)
 }
 
-// CloseStaleBatches cierra los batches OPEN de días UTC anteriores a now, para los
+// Reintentos ante un conflicto de versión. Son internos porque las entregas de NATS
+// se reintentan de inmediato: con varias ventas simultáneas de un terminal, un
+// conflicto agotaba MaxDeliver y la venta se perdía.
+const (
+	staleRetryAttempts = 8
+	staleRetryBaseWait = 10 * time.Millisecond
+	staleRetryMaxWait  = 400 * time.Millisecond
+)
+
+// retryOnStale ejecuta fn y la repite con espera aleatoria mientras el batch haya
+// cambiado desde que se cargó. fn debe volver a cargarlo en cada intento.
+func retryOnStale(ctx context.Context, fn func() error) error {
+	wait := staleRetryBaseWait
+	var err error
+	for attempt := 1; attempt <= staleRetryAttempts; attempt++ {
+		if err = fn(); !errors.Is(err, repository.ErrStaleBatch) {
+			return err
+		}
+		if attempt == staleRetryAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(wait/2 + rand.N(wait/2+1)):
+		}
+		wait = min(wait*2, staleRetryMaxWait)
+	}
+	return err
+}
+
+// closeDate resuelve qué día cierra el terminal: el que informó o, si no informó
+// uno válido, el día de negocio del pedido.
+func (h *BatchHandler) closeDate(cmd port.ProcessBatchCloseCommand) time.Time {
+	if d, err := time.Parse("2006-01-02", cmd.BatchDate); err == nil {
+		return d
+	}
+	if t, err := time.Parse(time.RFC3339, cmd.RequestedAt); err == nil {
+		return h.businessDate(t)
+	}
+	return h.businessDate(time.Now())
+}
+
+// CloseStaleBatches cierra los batches OPEN de días de negocio anteriores a now, para los
 // que el terminal nunca pidió el cierre. No toca el lote del día: cerrarlo dejaría
 // afuera las ventas posteriores. Un error en un batch no frena a los demás.
 func (h *BatchHandler) CloseStaleBatches(ctx context.Context, now time.Time) (closed, failed int, err error) {
 	ctx, span := observability.StartSpan(ctx, "command.CloseStaleBatches")
 	defer span.End()
 
-	utc := now.UTC()
-	ids, err := h.batchRepo.FindStaleOpenIDs(ctx, utc)
+	today := h.businessDate(now)
+	ids, err := h.batchRepo.FindStaleOpenIDs(ctx, today)
 	if err != nil {
 		return 0, 0, fmt.Errorf("CloseStaleBatches: find batches: %w", err)
 	}
 
-	runDate := utc.Format("2006-01-02")
+	runDate := today.Format("2006-01-02")
 	for _, id := range ids {
 		wasClosed, err := h.autoCloseBatch(ctx, id, runDate)
 		if err != nil {

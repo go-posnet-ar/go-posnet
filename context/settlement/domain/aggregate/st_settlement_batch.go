@@ -37,6 +37,9 @@ type SettlementBatch struct {
 	// Discrepancias detectadas en la conciliación
 	discrepancies int
 
+	// Versión persistida, para el bloqueo optimista
+	version int
+
 	// Eventos pendientes
 	domainEvents []event.DomainEvent
 }
@@ -95,15 +98,15 @@ func (b *SettlementBatch) AddTransaction(
 	return nil
 }
 
-// RemoveTransaction descuenta una reversión del lote.
-// Busca la transacción original y la marca como revertida.
-func (b *SettlementBatch) RemoveTransaction(transactionID domain.TransactionID) error {
+// RemoveTransaction descuenta una reversión del lote con su monto real. La compra
+// original puede estar en este lote o en uno anterior: la reversa se registra en el
+// lote abierto al momento de completarse.
+func (b *SettlementBatch) RemoveTransaction(transactionID domain.TransactionID, amountCents int64) error {
 	if b.state != valueobject.BatchStateOpen {
 		return fmt.Errorf("settlement_batch %s: cannot remove transaction in state %s", b.id, b.state)
 	}
 
-	// Agregar como REVERSAL negativo
-	tx, err := entity.NewBatchTransaction(b.id, transactionID, 1, b.currency, valueobject.BatchTxReversal)
+	tx, err := entity.NewBatchTransaction(b.id, transactionID, amountCents, b.currency, valueobject.BatchTxReversal)
 	if err != nil {
 		return err
 	}
@@ -289,6 +292,11 @@ func abs(x int) int {
 	return x
 }
 
+// MarkPersisted registra que el repositorio guardó esta versión.
+func (b *SettlementBatch) MarkPersisted() {
+	b.version++
+}
+
 // ─── Getters ──────────────────────────────────────────────────────────────────
 
 func (b *SettlementBatch) ID() string                               { return b.id }
@@ -304,5 +312,6 @@ func (b *SettlementBatch) CreatedAt() time.Time                     { return b.c
 func (b *SettlementBatch) ClosedAt() *time.Time                     { return b.closedAt }
 func (b *SettlementBatch) SubmittedAt() *time.Time                  { return b.submittedAt }
 func (b *SettlementBatch) SettledAt() *time.Time                    { return b.settledAt }
+func (b *SettlementBatch) Version() int                             { return b.version }
 func (b *SettlementBatch) DomainEvents() []event.DomainEvent        { return b.domainEvents }
 func (b *SettlementBatch) ClearDomainEvents()                       { b.domainEvents = nil }

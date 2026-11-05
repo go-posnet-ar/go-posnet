@@ -11,6 +11,9 @@ El ciclo del lote tiene salidas por API para cada estado, pero **no hay un proce
 
 La liquidación (`SETTLED`) la confirma un operador con `settle`.
 
+**Si Settlement falla justo después de un despliegue con errores sobre `version`,** falta aplicar la
+[migración](../technical/SETTLEMENT.md#aplicar-la-migración).
+
 Revisado contra el código el 2026-11-05. Detalle técnico en
 [SETTLEMENT.md](../technical/SETTLEMENT.md). Puerto HTTP en Docker Compose: `8084`.
 
@@ -19,8 +22,8 @@ Revisado contra el código el 2026-11-05. Detalle técnico en
 | Lote en `DISPUTED` | [A](#escenario-a--lote-en-disputed) |
 | Cierre sin efecto, log `no open batch found` | [B](#escenario-b--cierre-sin-lote-abierto) |
 | Lote en `CLOSED` que no avanza | [C](#escenario-c--lote-en-closed-sin-enviar) |
-| Aprobaciones sin lote, log `reload after conflict` | [D](#escenario-d--aprobaciones-fuera-de-todo-lote) |
-| Reversa que no se descontó | [E](#escenario-e--reversas-sin-descontar) |
+| Aprobaciones sin lote | [D](#escenario-d--aprobaciones-fuera-de-todo-lote) |
+| Reversa anterior a la corrección que no se descontó | [E](#escenario-e--reversas-anteriores-sin-descontar) |
 | Lote `OPEN` de días anteriores | [F](#escenario-f--lotes-abiertos-de-días-anteriores) |
 | Lote en `SUBMITTED` que no se liquida | [G](#escenario-g--confirmar-la-liquidación) |
 
@@ -50,8 +53,11 @@ Terminal Gateway publica `posnet.transaction.batch-close.v1`, y `settlement-batc
 
 **Restricciones que explican varios escenarios:**
 
-- Hay **un solo lote por terminal y fecha, en cualquier estado** (`UNIQUE (terminal_id, batch_date)`).
-- Las fechas son **UTC**, y Terminal Gateway siempre publica la fecha UTC actual.
+- Hay **un solo lote `OPEN` por terminal, día de negocio y moneda**. Puede haber otros lotes de esa misma
+  combinación en otros estados: un terminal que sigue vendiendo tras un cierre abre un lote nuevo.
+- El día de negocio se calcula con `SETTLEMENT_BUSINESS_TIMEZONE` (Argentina por defecto).
+- El cierre usa el `batch_date` del pedido. Sin él, usa el día de negocio del pedido.
+- `terminal_count` cuenta compras y reversas, y `terminal_amount` es el monto neto.
 
 ### Modificar un lote a mano
 
@@ -76,13 +82,14 @@ marking as disputed` o `resubmit blocked by discrepancies`.
 
 | Causa | Cómo reconocerla |
 |---|---|
-| El terminal descontó una reversa y el backend no | [Escenario E](#escenario-e--reversas-sin-descontar) |
+| Reversa de antes de la corrección | [Escenario E](#escenario-e--reversas-anteriores-sin-descontar) |
 | Aprobaciones que no llegaron al lote | [Escenario D](#escenario-d--aprobaciones-fuera-de-todo-lote) |
-| Ventas de otra fecha UTC | Cierres cerca de las 21:00 en UTC-3: [Escenario F](#escenario-f--lotes-abiertos-de-días-anteriores) |
+| El terminal no reinició sus contadores | Un cierre anterior ese día, con el mismo total acumulado |
+| El terminal contó solo las compras | La diferencia de cantidad coincide con las reversas del lote |
 | Totales enviados incorrectamente por el terminal | El backend coincide con `pn_authorization.transactions` |
 | El lote pasó por `force-close` | Discrepancias falsas: el cierre forzado compara contra 0 |
 
-Una transacción no puede contarse dos veces: `transaction_id` es único en la tabla.
+Una compra o su reversa no pueden contarse dos veces: `(transaction_id, tx_type)` es único.
 
 **Diagnóstico:**
 
@@ -100,7 +107,7 @@ FROM settlement.batch_transactions WHERE batch_id = '<batch_id>' ORDER BY includ
 SELECT state, count(*), sum(amount_cents)
 FROM pn_authorization.transactions
 WHERE terminal_id = '<terminal_id>'
-  AND (COALESCE(authorized_at, created_at) AT TIME ZONE 'UTC')::date = '<batch_date>'
+  AND (COALESCE(authorized_at, created_at) AT TIME ZONE 'America/Argentina/Buenos_Aires')::date = '<batch_date>'
 GROUP BY state;
 ```
 
@@ -123,9 +130,11 @@ curl -X POST http://<host>:8084/batches/<batch_id>/reopen \
   -d '{"operator_id":"<tu_usuario>","reason":"<motivo o ticket>"}'
 ```
 
-**Atención con `reopen` en lotes de otro día:** un nuevo cierre del terminal no llega a ese lote, porque
-Terminal Gateway siempre publica la fecha UTC actual. Lo cerrará el job automático en su próxima corrida
-del día siguiente, **sin conciliar**. Si el backend ya es correcto, usá `resolve-dispute`.
+**`reopen` responde `400` si ya hay otro lote `OPEN`** de ese terminal, día y moneda. En ese caso, usá
+`resolve-dispute`.
+
+**En lotes de otro día,** el nuevo cierre debe informar `batch_date`. Si no llega, lo cerrará el job
+automático en su corrida del día siguiente, **sin conciliar**.
 
 Ninguna de las dos publica un nuevo `batch-closed`: si los totales cambian, avisale al comercio por otro
 medio.
@@ -140,15 +149,15 @@ nothing to close`. El mensaje se confirma, sin reintento, y el cliente ya había
 **Causas típicas:**
 
 - El lote ya estaba cerrado: un reintento del terminal o de un reprocesamiento.
-- No hubo transacciones en esa fecha UTC.
-- El cierre ocurrió con otra fecha UTC que la de las ventas: el lote de las ventas sigue `OPEN`
+- No hubo transacciones de esa moneda en esa fecha.
+- Un `batch_date` distinto al de las ventas: el lote de las ventas sigue `OPEN`
   ([Escenario F](#escenario-f--lotes-abiertos-de-días-anteriores)).
 
 **Diagnóstico:**
 
 ```sql
-SELECT id, state, batch_date, closed_at FROM settlement.settlement_batches
-WHERE terminal_id = '<terminal_id>' ORDER BY batch_date DESC LIMIT 5;
+SELECT id, state, batch_date, currency, closed_at FROM settlement.settlement_batches
+WHERE terminal_id = '<terminal_id>' ORDER BY batch_date DESC, created_at DESC LIMIT 5;
 ```
 
 | Resultado | Qué significa |
@@ -187,6 +196,7 @@ curl -X POST http://<host>:8084/batches/<batch_id>/resubmit -d '{"operator_id":"
 | `503 PROCESSOR_UNAVAILABLE` | No hay procesador configurado | El lote queda en `CLOSED`, sin riesgo. **No lo fuerces:** esperá a tener un procesador, o activá `mock` solo en desarrollo |
 | `400`, "moved to DISPUTED" | Tenía discrepancias y **no se envió** | Escenario A |
 | `400`, otro estado | El lote no está en `CLOSED` | Verificá su estado |
+| `409` | Otro proceso modificó el lote | Consultá el estado y repetí |
 | `500` | Falló el procesador o la base de datos | Revisá los logs y reintentá |
 
 **Riesgo cuando exista un procesador real:** si el procesador acepta y falla el guardado, el lote queda en
@@ -197,103 +207,72 @@ lo recibió.
 
 ## Escenario D — Aprobaciones fuera de todo lote
 
-**Síntoma:** transacciones `APPROVED` sin fila en `batch_transactions`. Logs de Settlement: `transient
-error` con `reload after conflict`, hasta agotar 5 entregas.
+**Síntoma:** transacciones `APPROVED` sin fila en `batch_transactions`. Una venta posterior al cierre ya no
+causa esto: abre un lote nuevo.
 
 **Causas:**
 
 | Causa | Cómo reconocerla |
 |---|---|
-| Venta posterior al cierre, en la misma fecha UTC | `reload after conflict`; el lote de esa fecha no está `OPEN` |
 | `auth.approved` no se publicó | `failed to publish approval event` en Authorization; el evento no está en el stream |
-| Settlement no pudo procesar el evento | Otros errores repetidos en `settlement-auth-consumer` |
+| Settlement no pudo procesar el evento | `transient error` repetido en `settlement-auth-consumer`, hasta agotar 5 entregas |
+| Moneda inválida o monto no positivo | `permanent error` con `invalid currency` o `amount_cents`: se descartó |
 
 **Diagnóstico:**
 
 ```sql
-SELECT t.id, t.terminal_id, t.amount_cents, t.authorized_at, b.id AS batch_id, b.state AS batch_state
+SELECT t.id, t.terminal_id, t.amount_cents, t.currency, t.authorized_at
 FROM pn_authorization.transactions t
-LEFT JOIN settlement.batch_transactions bt ON bt.transaction_id = t.id
-LEFT JOIN settlement.settlement_batches b
-       ON b.terminal_id = t.terminal_id
-      AND b.batch_date = (t.authorized_at AT TIME ZONE 'UTC')::date
-WHERE t.state = 'APPROVED' AND bt.transaction_id IS NULL
+LEFT JOIN settlement.batch_transactions bt ON bt.transaction_id = t.id AND bt.tx_type = 'PURCHASE'
+WHERE t.state IN ('APPROVED', 'REVERSED') AND bt.transaction_id IS NULL
 ORDER BY t.authorized_at DESC;
 ```
 
 **Resolución:**
 
-1. **Dejá el lote de esa fecha en `OPEN`:**
-
-   | Estado del lote | Qué hacer |
-   |---|---|
-   | `OPEN` o sin lote | Nada: seguí al paso 2 |
-   | `DISPUTED` | `reopen` (Escenario A) |
-   | `CLOSED` | Con aprobación, reabrirlo con el SQL de abajo: el endpoint solo acepta `DISPUTED` |
-   | `SUBMITTED` o `SETTLED` | **No lo reabras:** el lote ya se envió. Coordiná una corrección con el equipo |
-
-   ```sql
-   BEGIN;
-   UPDATE settlement.settlement_batches
-   SET state = 'OPEN', closed_at = NULL, discrepancies = 0,
-       total_count = NULL, total_amount = NULL,
-       purchase_count = NULL, purchase_amount = NULL,
-       reversal_count = NULL, reversal_amount = NULL
-   WHERE id = '<batch_id>' AND state = 'CLOSED'
-   RETURNING id, state;
-   -- COMMIT;  o ROLLBACK;
-   ```
-
-2. **Republicá el `auth.approved` original** con [nats-dlq-reprocess.md](nats-dlq-reprocess.md). No debería
+1. **Republicá el `auth.approved` original** con [nats-dlq-reprocess.md](nats-dlq-reprocess.md). La venta entra
+   en el lote `OPEN` de su día y moneda, o abre uno nuevo: no hace falta reabrir ningún lote. No debería
    existir una fila en `settlement.processed_events`, porque la transacción se deshace al fallar.
-3. **Si el evento no está en el stream,** no hay un procedimiento seguro: coordinalo con el equipo.
-4. **Cerrá de nuevo el lote:** si es de hoy, con un nuevo pedido del terminal. Si es de otro día, lo cierra
-   el job automático al día siguiente.
-
-Mientras esto no se corrija en el código, seguir vendiendo después de cerrar el lote el mismo día UTC
-vuelve a producir el problema. Evitá también `force-close` en lotes de terminales activos. El job
-automático no lo provoca, porque solo cierra lotes de días anteriores.
+2. **Si el evento no está en el stream,** no hay un procedimiento seguro: coordinalo con el equipo.
+3. **El lote nuevo se cierra** con un nuevo pedido del terminal, con su `batch_date`, o con el job automático
+   al día siguiente.
 
 ---
 
-## Escenario E — Reversas sin descontar
+## Escenario E — Reversas anteriores sin descontar
 
-**Síntoma:** una venta anulada sigue sumando en el lote. La métrica `posnet_settlement_reversals_total`
-aumenta y no hay errores en los logs.
+**Síntoma:** una venta anulada **antes de esta corrección** sigue sumando. Las reversas nuevas se guardan con
+su monto real.
 
-**Causa:** **ocurre con todas las reversas.** La fila `REVERSAL` usa el `transaction_id` de la compra,
-y `ON CONFLICT (transaction_id) DO NOTHING` la descarta. Reprocesar no sirve: se descartaría de nuevo.
+**Causa:** antes, la fila `REVERSAL` se descartaba sin error. Su evento quedó en
+`settlement.processed_events`, de modo que republicarlo no tiene efecto.
 
 **Diagnóstico:**
 
 ```sql
-SELECT bt.batch_id, b.state AS batch_state, bt.transaction_id, bt.amount_cents, t.state AS tx_state
-FROM settlement.batch_transactions bt
-JOIN settlement.settlement_batches b ON b.id = bt.batch_id
-JOIN pn_authorization.transactions t ON t.id = bt.transaction_id
-WHERE t.state = 'REVERSED' AND bt.tx_type = 'PURCHASE'
+-- Transacciones revertidas sin fila de reversa
+SELECT p.batch_id, b.state AS batch_state, p.transaction_id, p.amount_cents, t.state AS tx_state
+FROM settlement.batch_transactions p
+JOIN settlement.settlement_batches b ON b.id = p.batch_id
+JOIN pn_authorization.transactions t ON t.id = p.transaction_id
+LEFT JOIN settlement.batch_transactions r
+       ON r.transaction_id = p.transaction_id AND r.tx_type = 'REVERSAL'
+WHERE t.state = 'REVERSED' AND p.tx_type = 'PURCHASE' AND r.transaction_id IS NULL
 ORDER BY b.batch_date DESC;
 ```
 
-**Resolución:** ninguna automática. Con el lote en `OPEN`, y con aprobación, se puede quitar la compra
-para que los totales coincidan con el monto neto:
+**Resolución:** para registrarla, con aprobación, borrá la marca del evento y republicá el
+`auth.reversal-completed` original con [nats-dlq-reprocess.md](nats-dlq-reprocess.md). La reversa entra en
+el lote abierto del momento.
 
 ```sql
 BEGIN;
-DELETE FROM settlement.batch_transactions
-WHERE transaction_id = '<transaction_id>' AND tx_type = 'PURCHASE'
-  AND batch_id IN (SELECT id FROM settlement.settlement_batches WHERE state = 'OPEN')
-RETURNING *;
+DELETE FROM settlement.processed_events WHERE event_id = '<event_id>' RETURNING *;
 -- COMMIT;  o ROLLBACK;
 ```
 
-Esto borra el rastro de la compra en el lote, así que guardá la fila en el ticket. Si el terminal cuenta
-las reversas en su `terminal_count`, confirmá cómo cuadrar la cantidad antes de cerrar.
-
-**Hacelo antes del cierre automático:** el job cierra y envía los lotes de días anteriores **sin revisar
-reversas**. Si el lote ya está en `SUBMITTED` o `SETTLED`, coordiná una corrección con el equipo.
-
-Una reversa en otra fecha UTC también crea un lote `OPEN` vacío, que después cierra el job.
+Si la compra ya estaba en un lote `SUBMITTED` o `SETTLED`, el descuento recién impacta en un lote posterior:
+confirmá con el equipo que ese sea el tratamiento correcto.
 
 ---
 
@@ -303,7 +282,7 @@ Una reversa en otra fecha UTC también crea un lote `OPEN` vacío, que después 
 cierra.
 
 **Cómo funciona el job:** corre desde las **03:00 UTC (00:00 en Argentina)** y al arrancar el servicio.
-Cierra los lotes de días UTC anteriores con los totales del backend, **sin conciliar con el terminal**,
+Cierra los lotes de días de negocio anteriores con los totales del backend, **sin conciliar con el terminal**,
 publica `batch-closed` y los envía al procesador. Log: `batch closed automatically without terminal
 totals`.
 
@@ -313,7 +292,7 @@ totals`.
 SELECT b.id, b.terminal_id, b.batch_date, count(bt.id) AS tx_count, sum(bt.amount_cents) AS amount
 FROM settlement.settlement_batches b
 LEFT JOIN settlement.batch_transactions bt ON bt.batch_id = b.id
-WHERE b.state = 'OPEN' AND b.batch_date < (NOW() AT TIME ZONE 'UTC')::date
+WHERE b.state = 'OPEN' AND b.batch_date < (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::date
 GROUP BY b.id, b.terminal_id, b.batch_date
 ORDER BY b.batch_date;
 ```
@@ -367,7 +346,7 @@ Si falla la publicación, queda `failed to publish SettlementCompleted` en el lo
 | Endpoint | Sobre qué estado | Resultado |
 |---|---|---|
 | `GET /batches/{id}` | Cualquiera | Estado y totales. Un lote `OPEN` muestra totales en 0. Los campos están en PascalCase (`State`, `TotalCount`) |
-| `GET /merchants/{merchant_id}/batches?date=YYYY-MM-DD` | Cualquiera | Lotes del comercio; `date` es obligatorio |
+| `GET /merchants/{merchant_id}/batches?date=YYYY-MM-DD` | Cualquiera | Lotes del comercio, que pueden ser varios por terminal; `date` es obligatorio |
 | `POST /batches/{id}/force-close` | Solo `OPEN`; otros, `500` | Pasa a `CLOSED` |
 | `POST /batches/{id}/resubmit` | Solo `CLOSED`; otros, `400` | Pasa a `SUBMITTED`, o a `DISPUTED` si tiene discrepancias. Sin procesador, `503` |
 | `POST /batches/{id}/reopen` | Solo `DISPUTED`; otros, `400` | Pasa a `OPEN` |
@@ -375,7 +354,8 @@ Si falla la publicación, queda `failed to publish SettlementCompleted` en el lo
 | `POST /batches/{id}/settle` | Solo `SUBMITTED`; otros, `400` | Pasa a `SETTLED` |
 
 Todos los `POST` exigen `operator_id`; `reopen` y `resolve-dispute`, también `reason`. **Ninguno tiene
-autenticación**, y esos datos solo quedan en los logs.
+autenticación**, y esos datos solo quedan en los logs. Un `409` indica que otro proceso modificó el lote: hay
+que consultarlo y repetir.
 
 **Limitaciones de `force-close`:**
 
@@ -383,7 +363,7 @@ autenticación**, y esos datos solo quedan en los logs.
   `resubmit` pasa a `DISPUTED`, y sale con `resolve-dispute`.
 - No publica `batch-closed`, así que Notification no se entera.
 - No guarda ni registra `operator_id`: anotá en el ticket quién lo ejecutó y por qué.
-- Bloquea el lote de esa fecha: las aprobaciones posteriores del terminal caen en el Escenario D.
+- Las ventas posteriores del terminal abren un lote nuevo, que hay que volver a cerrar.
 
 ### Lotes que necesitan atención
 
@@ -391,6 +371,6 @@ autenticación**, y esos datos solo quedan en los logs.
 SELECT id, terminal_id, merchant_id, batch_date, state, discrepancies, closed_at, submitted_at
 FROM settlement.settlement_batches
 WHERE state IN ('DISPUTED', 'CLOSED', 'SUBMITTED')
-   OR (state = 'OPEN' AND batch_date < (NOW() AT TIME ZONE 'UTC')::date)
+   OR (state = 'OPEN' AND batch_date < (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::date)
 ORDER BY batch_date DESC;
 ```

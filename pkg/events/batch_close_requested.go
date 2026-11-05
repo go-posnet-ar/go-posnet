@@ -11,7 +11,7 @@ package events
 type BatchCloseRequestedPayload struct {
 	TerminalID     string `json:"terminal_id"`
 	MerchantID     string `json:"merchant_id"`
-	BatchDate      string `json:"batch_date"`      // "2025-06-04" — fecha del lote
+	BatchDate      string `json:"batch_date"`      // "2025-06-04"; vacía = día de negocio de RequestedAt
 	TerminalCount  int    `json:"terminal_count"`  // Cantidad de tx reportadas por el terminal
 	TerminalAmount int64  `json:"terminal_amount"` // Total en centavos reportado por el terminal
 	Currency       string `json:"currency"`

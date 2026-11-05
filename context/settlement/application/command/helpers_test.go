@@ -20,11 +20,15 @@ type fakeBatchRepo struct {
 	findByIDResult *aggregate.SettlementBatch
 	findByIDErr    error
 
-	findOpenResult *aggregate.SettlementBatch
-	findOpenErr    error
+	findOpenResult   *aggregate.SettlementBatch
+	findOpenErr      error
+	findOpenDate     time.Time
+	findOpenCurrency string
 
-	findOrCreateResult *aggregate.SettlementBatch
-	findOrCreateErr    error
+	findOrCreateResult   *aggregate.SettlementBatch
+	findOrCreateErr      error
+	findOrCreateDate     time.Time
+	findOrCreateCurrency string
 
 	listResult []*aggregate.SettlementBatch
 	listErr    error
@@ -52,11 +56,13 @@ func (f *fakeBatchRepo) FindByID(context.Context, string) (*aggregate.Settlement
 	return f.findByIDResult, f.findByIDErr
 }
 
-func (f *fakeBatchRepo) FindOpenByTerminal(context.Context, domain.TerminalID, time.Time) (*aggregate.SettlementBatch, error) {
+func (f *fakeBatchRepo) FindOpenByTerminal(_ context.Context, _ domain.TerminalID, date time.Time, currency string) (*aggregate.SettlementBatch, error) {
+	f.findOpenDate, f.findOpenCurrency = date, currency
 	return f.findOpenResult, f.findOpenErr
 }
 
-func (f *fakeBatchRepo) FindOrCreateOpen(context.Context, domain.TerminalID, domain.MerchantID, time.Time, string) (*aggregate.SettlementBatch, error) {
+func (f *fakeBatchRepo) FindOrCreateOpen(_ context.Context, _ domain.TerminalID, _ domain.MerchantID, date time.Time, currency string) (*aggregate.SettlementBatch, error) {
+	f.findOrCreateDate, f.findOrCreateCurrency = date, currency
 	return f.findOrCreateResult, f.findOrCreateErr
 }
 

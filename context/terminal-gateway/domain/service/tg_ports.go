@@ -45,5 +45,6 @@ type EventPublisher interface {
 
 	// PublishBatchCloseRequested publica el cierre de lote solicitado por el terminal.
 	// Consumido por: Settlement BC.
-	PublishBatchCloseRequested(ctx context.Context, terminalID domain.TerminalID, merchantID domain.MerchantID, terminalCount int, terminalAmount int64, currency string) error
+	// batchDate es la fecha que informó el terminal; vacía, la resuelve Settlement.
+	PublishBatchCloseRequested(ctx context.Context, terminalID domain.TerminalID, merchantID domain.MerchantID, batchDate string, terminalCount int, terminalAmount int64, currency string) error
 }

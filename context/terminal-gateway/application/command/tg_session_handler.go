@@ -348,8 +348,19 @@ func (h *SessionHandler) RequestBatchClose(ctx context.Context, cmd port.Request
 		return pkgerrors.NewValidationError("invalid merchant_id")
 	}
 
+	// Settlement busca el lote por moneda y descarta un pedido sin una válida: se
+	// rechaza acá para que el terminal reciba el error en lugar de un 202 sin efecto.
+	if _, err := domain.ParseCurrency(cmd.Currency); err != nil {
+		return pkgerrors.NewValidationError("invalid currency")
+	}
+	if cmd.BatchDate != "" {
+		if _, err := time.Parse("2006-01-02", cmd.BatchDate); err != nil {
+			return pkgerrors.NewValidationError("invalid batch_date")
+		}
+	}
+
 	return h.publisher.PublishBatchCloseRequested(ctx,
-		terminalID, merchantID,
+		terminalID, merchantID, cmd.BatchDate,
 		cmd.TerminalCount, cmd.TerminalAmount, cmd.Currency,
 	)
 }

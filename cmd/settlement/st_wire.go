@@ -107,6 +107,11 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		return nil, fmt.Errorf("init settlement metrics: %w", err)
 	}
 	batchHandler.SetMetrics(settlementMetrics)
+	businessLocation, err := time.LoadLocation(cfg.Settlement.BusinessTimezone)
+	if err != nil {
+		return nil, fmt.Errorf("wire: load business timezone: %w", err)
+	}
+	batchHandler.SetBusinessLocation(businessLocation)
 	adminHandler := command.NewAdminHandler(batchRepo, processor)
 	adminHandler.ConfigureSettlement(eventPub, cfg.Settlement.MDRPercent)
 	queryHandler := query.NewBatchQueryHandler(batchRepo)

@@ -72,7 +72,7 @@ var batchColumns = []string{
 	"id", "terminal_id", "merchant_id", "batch_date", "state", "currency",
 	"total_count", "total_amount", "purchase_count", "purchase_amount",
 	"reversal_count", "reversal_amount", "discrepancies",
-	"created_at", "closed_at", "submitted_at", "settled_at",
+	"created_at", "closed_at", "submitted_at", "settled_at", "version",
 }
 
 var batchTxColumns = []string{
@@ -95,6 +95,7 @@ type batchRow struct {
 	closedAt      *time.Time
 	submittedAt   *time.Time
 	settledAt     *time.Time
+	version       int
 }
 
 func newBatchRow() batchRow {
@@ -126,7 +127,7 @@ func (r batchRow) rows() *pgxmock.Rows {
 		r.id, r.terminalID, r.merchantID, r.batchDate, r.state, r.currency,
 		r.totalCount, r.totalAmount, r.purchaseCount, r.purchaseAmount,
 		r.reversalCount, r.reversalAmount, r.discrepancies,
-		r.createdAt, r.closedAt, r.submittedAt, r.settledAt,
+		r.createdAt, r.closedAt, r.submittedAt, r.settledAt, r.version,
 	)
 }
 

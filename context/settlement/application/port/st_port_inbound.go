@@ -73,7 +73,8 @@ type ProcessBatchCloseCommand struct {
 	EventID        string
 	TerminalID     string
 	MerchantID     string
-	BatchDate      string // "2025-06-04"
+	BatchDate      string // "2025-06-04"; vacío = día de negocio de RequestedAt
+	RequestedAt    string // RFC3339 UTC
 	TerminalCount  int    // Total reportado por el terminal
 	TerminalAmount int64  // Monto total reportado por el terminal
 	Currency       string

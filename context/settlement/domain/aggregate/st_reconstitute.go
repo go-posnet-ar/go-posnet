@@ -20,6 +20,7 @@ type ReconstituteParams struct {
 	Transactions  []*entity.BatchTransaction
 	Summary       *valueobject.BatchSummary
 	Discrepancies int
+	Version       int
 	CreatedAt     time.Time
 	ClosedAt      *time.Time
 	SubmittedAt   *time.Time
@@ -39,6 +40,7 @@ func Reconstitute(p ReconstituteParams) *SettlementBatch {
 		transactions:  p.Transactions,
 		summary:       p.Summary,
 		discrepancies: p.Discrepancies,
+		version:       p.Version,
 		createdAt:     p.CreatedAt,
 		closedAt:      p.ClosedAt,
 		submittedAt:   p.SubmittedAt,

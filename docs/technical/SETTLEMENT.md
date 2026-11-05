@@ -13,22 +13,23 @@ registra la liquidación.
 
 **El ciclo completo funciona, pero el envío y la confirmación no son reales:** no hay un procesador
 externo. Con `SETTLEMENT_PROCESSOR=mock`, el envío se simula; con `none`, el default, el lote queda en
-`CLOSED`. La liquidación la confirma un operador. Además, dos fallas siguen afectando los montos:
+`CLOSED`. La liquidación la confirma un operador.
 
-- **Las reversas no descuentan nada** del lote.
-- **Una aprobación posterior al cierre del día no entra en ningún lote.**
+**Una base anterior a esta versión necesita la
+[migración](#aplicar-la-migración) antes del despliegue:** sin ella, el servicio falla al leer y guardar
+lotes.
 
 | Capacidad | Estado | Detalle |
 |---|---|---|
-| Apertura de lotes y registro de compras | Implementado | Un lote por terminal y fecha UTC |
+| Apertura de lotes y registro de compras | Implementado | Un lote abierto por terminal, día de negocio y moneda |
+| Registro de reversas | Implementado | Con su monto real, en el lote abierto del momento |
 | Cierre y detección de discrepancias | Implementado | Por pedido del terminal |
-| Cierre automático | Implementado | Lotes de días UTC anteriores, sin conciliación |
+| Cierre automático | Implementado | Lotes de días de negocio anteriores, sin conciliación |
 | Resolución de disputas | Implementado | `reopen` y `resolve-dispute` |
 | Liquidación y comisión (MDR) | Implementado | Confirmación manual con `settle` |
 | Publicación de `batch-closed` y `settlement.completed` | Implementado | Directa a NATS, sin outbox. Nadie consume `settlement.completed` |
 | Consulta de lotes | Implementado | HTTP, sin autenticación |
 | Envío al procesador | **Simulado** | `none` no envía; `mock` acepta sin enviar nada |
-| Registro de reversas | **Roto** | Se confirma, pero no se persiste |
 | Cierre forzado por soporte | **Parcial** | Registra discrepancias falsas y no publica eventos |
 | Archivo de remesa | **Pendiente** | Requiere la especificación del procesador |
 
@@ -81,17 +82,17 @@ Las rutas de `domain/`, `application/` e `infrastructure/` son relativas a `cont
 |---|---|
 | `id` | UUID del lote |
 | `terminalID`, `merchantID` | Terminal y comercio |
-| `batchDate` | Fecha **UTC** de la primera transacción del lote |
+| `batchDate` | **Día de negocio** de la primera transacción, según `SETTLEMENT_BUSINESS_TIMEZONE` |
 | `state` | Estado actual |
-| `currency` | Moneda de la primera transacción; se aplica a todo el lote |
+| `currency` | Moneda del lote. Las transacciones de otra moneda van a otro lote |
 | `transactions` | Transacciones incluidas |
 | `summary` | Totales; `nil` hasta el cierre |
 | `discrepancies` | Resultado de la conciliación |
 | `createdAt`, `closedAt`, `submittedAt`, `settledAt` | Marcas de tiempo |
+| `version` | Bloqueo optimista (ver [§5.10](#510-concurrencia)) |
 
-**Solo puede existir un lote por terminal y fecha, en cualquier estado.** La restricción es
-`UNIQUE (terminal_id, batch_date)`, aunque el comentario del schema hable de un lote *abierto*. Esta
-diferencia causa la pérdida de aprobaciones descrita en [§5.3](#53-aprobación-después-del-cierre).
+**Solo puede haber un lote `OPEN` por terminal, día de negocio y moneda.** Puede haber varios lotes de esa
+misma combinación en otros estados, por ejemplo si el terminal sigue vendiendo después de un cierre.
 
 ### 4.2 Máquina de estados
 
@@ -119,11 +120,11 @@ Solo `SETTLED` es un estado final.
 | Tipo | Uso real |
 |---|---|
 | `PURCHASE` | Compra aprobada |
-| `REVERSAL` | Se crea en memoria, pero no llega a guardarse (ver [§5.2](#52-reversa)) |
+| `REVERSAL` | Reversa, con su monto real (ver [§5.2](#52-reversa)) |
 | `OFFLINE` | Definido, pero ningún flujo lo genera |
 
-`transaction_id` es único en la tabla: una transacción no puede estar en dos lotes ni contarse dos
-veces, incluso si la aprobación llega con otro `event_id`.
+`(transaction_id, tx_type)` es único: una compra o su reversa no se cuentan dos veces, incluso si el evento
+llega con otro `event_id`.
 
 ### 4.4 Conciliación
 
@@ -142,57 +143,45 @@ monto    = monto de compras − monto de reversas
 
 El valor no mide la diferencia de dinero: solo indica cuántas transacciones faltan o sobran.
 
+**El terminal debe informar `terminal_count` contando compras y reversas, y `terminal_amount` como monto
+neto.** Después de cada cierre, sus contadores deben volver a cero: el cierre siguiente solo abarca lo
+posterior. Esta es la regla del backend: hay que confirmarla al integrar terminales reales.
+
 ## 5. Flujos
 
 ### 5.1 Registro de una compra
 
 Al recibir `auth.approved`:
 
-1. Valida los IDs y toma la fecha UTC de `authorized_at`.
+1. Valida los IDs, la moneda y el monto, y calcula el día de negocio de `authorized_at`.
 2. Marca el evento en `processed_events` dentro de una transacción.
-3. Busca el lote `OPEN` del terminal para esa fecha o lo crea, en una transacción `SERIALIZABLE`.
+3. Busca el lote `OPEN` del terminal para ese día y moneda o lo crea, en una transacción `SERIALIZABLE`.
 4. Agrega la transacción y guarda el lote, en otra transacción.
 
 El guardado queda fuera de la transacción de idempotencia. Si el commit final falla, la reentrega
-reprocesa sin duplicar, gracias a `ON CONFLICT (transaction_id) DO NOTHING`.
+reprocesa sin duplicar, gracias a `ON CONFLICT (transaction_id, tx_type) DO NOTHING`.
 
 ### 5.2 Reversa
 
-**Hoy una reversa no modifica el lote:**
+Al recibir `auth.reversal-completed`, se agrega una fila `REVERSAL` con el `transaction_id` de la compra y el
+monto del evento. La fila va al **lote abierto del momento**, no necesariamente al de la compra:
 
-1. Al recibir `auth.reversal-completed`, se crea una fila `REVERSAL` con el `transaction_id` de la
-   compra original.
-2. Como esa compra ya está en la tabla, `UNIQUE (transaction_id)` y `ON CONFLICT DO NOTHING` descartan
-   la fila sin error.
-3. El mensaje se confirma y `posnet_settlement_reversals_total` aumenta, como si hubiera funcionado.
-
-El efecto en la conciliación depende de lo que informe el terminal:
-
-| El terminal informa | Resultado |
+| Situación | Resultado |
 |---|---|
-| El total neto, descontando la reversa | `DISPUTED`: no coincide con el backend |
-| El total bruto, sin descontarla | El lote cierra sin discrepancias e incluye la venta anulada |
+| La compra está en el lote abierto | Ese lote queda con el monto neto |
+| La compra está en un lote ya cerrado | La reversa entra en un lote nuevo, que puede dar un **total negativo** |
 
-Aunque la fila se guardara, tampoco sería correcta: `RemoveTransaction` usa **un monto fijo de 1
-centavo** e ignora el monto de la reversa. Los tests no lo detectan porque validan el aggregate en
-memoria y usan una base simulada.
+No se verifica que la compra exista en Settlement ni que el monto coincida: se confía en el evento de
+Authorization.
 
-Si la reversa llega en otra fecha UTC, además crea un lote `OPEN` vacío, que después cierra el job
-automático.
+**Las reversas anteriores a esta corrección no se recuperan solas:** se descartaron, y su evento ya figura
+como procesado. Ver el
+[Escenario E](../runbooks/batch-close-failure.md#escenario-e--reversas-anteriores-sin-descontar).
 
 ### 5.3 Aprobación después del cierre
 
-Si el terminal cierra su lote y sigue operando durante la misma fecha UTC:
-
-1. `FindOrCreateOpen` no encuentra un lote `OPEN`, porque el del día está cerrado.
-2. Intenta crear uno nuevo, pero `UNIQUE (terminal_id, batch_date)` lo impide.
-3. Vuelve a buscar un lote `OPEN`, no lo encuentra y devuelve un error.
-4. El mensaje se reintenta de inmediato hasta agotar sus 5 entregas, y deja de procesarse.
-
-**La venta queda aprobada y nunca entra en un lote.** Lo mismo ocurre con una reversa posterior al
-cierre. Los mensajes siguen en el stream y se pueden recuperar con el runbook
-[nats-dlq-reprocess](../runbooks/nats-dlq-reprocess.md), pero volverán a fallar mientras el lote del
-día no esté `OPEN`.
+Si el terminal cierra su lote y sigue vendiendo durante el mismo día, la venta abre un **lote nuevo** para
+esa fecha y moneda. Ese lote se cierra con un nuevo pedido del terminal o con el cierre automático.
 
 ### 5.4 Cierre de lote
 
@@ -223,23 +212,27 @@ Sin procesador, el mensaje se confirma: reintentarlo no cambiaría nada. El lote
 un `resubmit`. Con cualquier otro error del procesador, el mensaje se reintenta, pero la reentrega ya no
 encuentra un lote `OPEN` y no hace nada: la vía para reintentar también es `resubmit`.
 
-### 5.5 Desfase por fecha UTC
+### 5.5 Día de negocio
 
-Los lotes se agrupan por fecha UTC, y Terminal Gateway siempre publica la fecha UTC actual, ignorando
-el `batch_date` del request. Para un terminal en UTC-3:
+Los lotes se agrupan por día de negocio, en la zona de `SETTLEMENT_BUSINESS_TIMEZONE`
+(`America/Argentina/Buenos_Aires` por defecto). Una venta de las 22:30 en Argentina pertenece a ese día,
+aunque en UTC ya sea el siguiente.
 
-- Las ventas posteriores a las 21:00 caen en el lote del día siguiente.
-- Un cierre después de las 21:00 solo ve ese lote nuevo, y los totales del terminal no coinciden. El lote
-  del día queda `OPEN` hasta el cierre automático.
+El cierre usa el `batch_date` que informa el terminal. Sin él, usa el día de negocio del pedido. Terminal
+Gateway rechaza una moneda o una fecha inválidas.
+
+Hay una sola zona horaria para todo el servicio. Las fechas de los lotes creados antes de este cambio
+siguen en UTC.
 
 ### 5.6 Cierre automático
 
 Con `SETTLEMENT_BATCH_CLOSE_HOUR` en 3 (00:00 en Argentina), el job corre una vez por día desde las 03:00
-UTC. También corre al arrancar, por si el servicio estaba caído a esa hora. Con el valor `0` queda
+UTC. Esa hora es **UTC**: si se cambia la zona de negocio, hay que ajustarla para que sea posterior a la
+medianoche de esa zona. También corre al arrancar, por si el servicio estaba caído a esa hora. Con el valor `0` queda
 desactivado.
 
-1. Busca los lotes `OPEN` de **días UTC anteriores**. No toca el lote del día, porque cerrarlo dejaría
-   afuera las ventas posteriores (ver [§5.3](#53-aprobación-después-del-cierre)).
+1. Busca los lotes `OPEN` de **días de negocio anteriores**. No toca el lote del día, porque sigue
+   recibiendo ventas.
 2. Los cierra con los totales del backend: **no hay conciliación**, porque el terminal no informó los
    suyos, y por eso tampoco hay discrepancias.
 3. Publica `batch-closed` y envía el lote al procesador. Un lote vacío solo se cierra.
@@ -255,9 +248,11 @@ siguiente.
 | `reopen` | `DISPUTED` → `OPEN`. Descarta los totales y vuelve a aceptar transacciones | Faltan transacciones, o el terminal puede volver a cerrar con los totales correctos |
 | `resolve-dispute` | `DISPUTED` → `CLOSED`. Recalcula con las transacciones actuales y deja las discrepancias en 0 | El backend es correcto y los totales del terminal no |
 
-**Con `reopen`, el nuevo cierre solo llega si la fecha del lote es la de hoy**, porque Terminal Gateway
-siempre publica la fecha UTC actual. Un lote de otro día reabierto lo cierra el job automático al día
-siguiente, sin conciliar. Para resolverlo antes, usar `resolve-dispute`.
+**Para volver a cerrar un lote de otro día,** el pedido debe informar su `batch_date`. Si no llega ninguno,
+lo cierra el job automático al día siguiente, sin conciliar.
+
+**`reopen` falla si ya hay otro lote `OPEN`** de ese terminal, día y moneda, porque solo puede haber uno. En
+ese caso, usar `resolve-dispute`.
 
 Después de `resolve-dispute`, hay que enviar el lote con `resubmit`. Ninguna de las dos operaciones publica
 un nuevo evento: si los totales cambian, Notification no se entera.
@@ -283,8 +278,8 @@ evento con el total acumulado.
 |---|---|---|
 | IDs inválidos | `Term`; no se reintenta | No |
 | Error de base de datos al registrar | `Nak` y reintento | **Sí** |
-| Conflicto de serialización (`40001`) | `Nak` y reentrega inmediata, hasta 5 veces | Generalmente |
-| Aprobación con lote del día ya cerrado | `Nak` hasta agotar entregas | No |
+| Conflicto con otro guardado del mismo lote | Reintento interno, y después `Nak` | **Sí** (ver [§5.10](#510-concurrencia)) |
+| Moneda inválida o monto no positivo | `Term`; no se reintenta | No |
 | Se pierde `auth.approved` en Authorization | La transacción falta en el lote; el cierre da `DISPUTED` | No |
 | Falla la publicación de `batch-closed` | Solo log; Notification no se entera | No |
 | Falla el guardado de `DISPUTED` | `Nak`; la reentrega no hace nada y queda `CLOSED` con discrepancias. El próximo `resubmit` lo pasa a `DISPUTED` | Con operador |
@@ -293,6 +288,16 @@ evento con el total acumulado.
 | El terminal nunca pide el cierre | El job lo cierra sin conciliar | **Sí** |
 | Falla el cierre automático de un lote | Reintenta en el minuto siguiente | **Sí** |
 | Falla la publicación de `settlement.completed` | Solo log; el lote queda `SETTLED`, y nada lo reintenta | No |
+
+### 5.10 Concurrencia
+
+Cada lote tiene una `version`. `Save` solo actualiza si la versión de la base es la que se cargó: si otro
+proceso la cambió, nada se guarda y devuelve `ErrStaleBatch`. Así, una venta simultánea no puede devolver a
+`OPEN` un lote recién cerrado, y un cierre no calcula totales sin esa venta.
+
+Las ventas, reversas y cierres **reintentan internamente** hasta 8 veces, con espera aleatoria, volviendo a
+cargar el lote. Si el conflicto persiste, el error llega a NATS como transitorio. Las operaciones de
+administración responden `409`, y hay que repetirlas.
 
 ## 6. API HTTP
 
@@ -306,11 +311,11 @@ ni siquiera en las operaciones de escritura.
 | `GET /metrics` | Métricas Prometheus | `200` | — |
 | `GET /batches/{id}` | Consultar un lote | `200` | `404`, `500` |
 | `GET /merchants/{merchant_id}/batches?date=YYYY-MM-DD` | Lotes de un comercio; `date` es obligatorio | `200` | `400`, `500` |
-| `POST /batches/{id}/force-close` | Forzar el cierre | `200` | `400`, `404`, `500` |
-| `POST /batches/{id}/resubmit` | Enviar un lote `CLOSED` | `200` | `400`, `404`, `500`, `503` |
-| `POST /batches/{id}/reopen` | Reabrir un lote `DISPUTED` | `200` | `400`, `404`, `500` |
-| `POST /batches/{id}/resolve-dispute` | Aceptar los totales del backend | `200` | `400`, `404`, `500` |
-| `POST /batches/{id}/settle` | Confirmar la liquidación | `200` | `400`, `404`, `500` |
+| `POST /batches/{id}/force-close` | Forzar el cierre | `200` | `400`, `404`, `409`, `500` |
+| `POST /batches/{id}/resubmit` | Enviar un lote `CLOSED` | `200` | `400`, `404`, `409`, `500`, `503` |
+| `POST /batches/{id}/reopen` | Reabrir un lote `DISPUTED` | `200` | `400`, `404`, `409`, `500` |
+| `POST /batches/{id}/resolve-dispute` | Aceptar los totales del backend | `200` | `400`, `404`, `409`, `500` |
+| `POST /batches/{id}/settle` | Confirmar la liquidación | `200` | `400`, `404`, `409`, `500` |
 
 Un ID que no sea un UUID responde `500`, no `400`. Los errores tienen la forma
 `{"error": "CODIGO", "message": "..."}`.
@@ -340,7 +345,7 @@ Responde con nombres en PascalCase, porque el struct no tiene tags JSON:
 campos se calculan al cerrar. La respuesta no incluye el desglose de compras y reversas.
 
 `GET /merchants/{merchant_id}/batches` devuelve `{"batches": [...], "count": N}`, con la misma forma,
-pero sin completar `SubmittedAt` ni `SettledAt`.
+pero sin completar `SubmittedAt` ni `SettledAt`. Puede haber varios lotes de un terminal en una misma fecha.
 
 ### Forzar el cierre
 
@@ -371,7 +376,8 @@ Lleva el mismo body y responde `{"status": "submitted"}`.
 ### Resolver disputas
 
 `reopen` y `resolve-dispute` exigen `operator_id` y `reason`, y responden `{"status": "reopened"}` o
-`{"status": "closed"}`. Con un lote que no esté en `DISPUTED`, responden `400`.
+`{"status": "closed"}`. Con un lote que no esté en `DISPUTED`, responden `400`. `reopen` también responde
+`400` si ya hay otro lote `OPEN` de ese terminal, día y moneda.
 
 ```json
 { "operator_id": "soporte-juan", "reason": "Conciliado con el comercio, ticket 123" }
@@ -448,14 +454,30 @@ hace nada, `migrations/settlement/` está vacío y
 
 | Tabla | Propósito | Claves e índices |
 |---|---|---|
-| `settlement_batches` | Lotes | PK `id`; `UNIQUE (terminal_id, batch_date)` |
-| `batch_transactions` | Transacciones del lote | PK `id`; `transaction_id` único; FK `batch_id` |
+| `settlement_batches` | Lotes | PK `id`; único `(terminal_id, batch_date, currency)` solo para `OPEN` |
+| `batch_transactions` | Transacciones del lote | PK `id`; único `(transaction_id, tx_type)`; FK `batch_id` |
 | `processed_events` | Idempotencia | PK `event_id` |
 
 Diferencia entre ambos archivos: `st_schema.sql` define tres índices
 (`idx_settlement_batches_merchant_date`, `idx_settlement_batches_state` e `idx_batch_transactions_batch`)
 que `01-init.sql` no crea. **`loadTransactions` recorre `batch_transactions` por `batch_id` en cada
 aprobación, sin índice.**
+
+### Aplicar la migración
+
+**Una base existente necesita esta migración antes de desplegar esta versión del servicio.** `01-init.sql`
+solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
+
+```bash
+psql "$POSTGRES_DSN" -f migrations/settlement/000001_batch_integrity.up.sql
+```
+
+Es idempotente y no toca los datos. Se probó sobre una base con el schema anterior: el resultado coincide
+con el de una base nueva.
+
+`000001_batch_integrity.down.sql` la revierte, pero **falla sin cambiar nada** si ya hay varios lotes por
+terminal y fecha o filas `REVERSAL`, porque el schema anterior no los admite. Resolver esos datos es una
+decisión financiera, y el script no los borra.
 
 ### Costo por aprobación
 
@@ -474,7 +496,7 @@ El servidor gRPC no se detiene de forma ordenada.
 | Métrica | Tipo | Labels | Significado |
 |---|---|---|---|
 | `posnet_settlement_auth_approved_total` | Counter | — | Aprobaciones registradas |
-| `posnet_settlement_reversals_total` | Counter | — | Reversas procesadas; **aumenta aunque no se guarden** |
+| `posnet_settlement_reversals_total` | Counter | — | Reversas procesadas; incluye duplicados que no agregan fila |
 | `posnet_settlement_batches_total` | Counter | `currency`, `state` | Cierres; `state` siempre es `CLOSED`, porque se registra antes de marcar la disputa |
 | `posnet_settlement_batch_duration_seconds` | Histogram | — | Duración del cierre |
 | `posnet_settlement_submissions_total` | Counter | `result` | Envíos tras un cierre: `submitted`, `unavailable` o `error`. No incluye `resubmit` |
@@ -497,8 +519,8 @@ WHERE state IN ('DISPUTED', 'CLOSED')
 ORDER BY batch_date DESC;
 ```
 
-En los logs, buscar `reload after conflict` para detectar aprobaciones rechazadas tras un cierre, y
-`no open batch found` para cierres sin efecto. `batch closed automatically` identifica los cierres sin
+En los logs, `modified concurrently` indica conflictos de versión, que son esperables con tráfico simultáneo,
+y `no open batch found` indica cierres sin efecto. `batch closed automatically` identifica los cierres sin
 conciliar, y `no settlement processor configured` los lotes que quedaron sin enviar.
 
 ### Variables de entorno
@@ -518,6 +540,7 @@ conciliar, y `no settlement processor configured` los lotes que quedaron sin env
 | `SETTLEMENT_MDR_PERCENT` | `2.5` | Sí; se usa para calcular el neto. Fuera de 0–10, el servicio no arranca |
 | `SETTLEMENT_BATCH_CLOSE_HOUR` | `3` | Sí; hora UTC del cierre automático, y `0` lo desactiva. Fuera de 0–23, el servicio no arranca |
 | `SETTLEMENT_PROCESSOR` | `none` | Sí; `none` o `mock`. Docker Compose usa `mock`. Con otro valor, el servicio no arranca |
+| `SETTLEMENT_BUSINESS_TIMEZONE` | `America/Argentina/Buenos_Aires` | Sí; zona IANA del día de negocio. Si es inválida, el servicio no arranca |
 | `SETTLEMENT_SUBMIT_RETRIES` | `3` | **No**: no hay procesador real |
 | `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | **No**: no hay procesador real |
 | `GRPC_PORT` | `9093` | **No**: el puerto está fijo en 9093 |
@@ -578,8 +601,8 @@ locust -f posnet-load-tests/settlement/settlement_locust.py \
   --headless -u 10 -r 2 --run-time 2m --host http://localhost:8084
 ```
 
-Los tests usan una base simulada y un procesador falso, por lo que **no detectan** problemas como la
-pérdida de reversas. No hay tests de integración automatizados contra Postgres y NATS reales, ni tests del
+Los tests usan una base simulada y un procesador falso, por lo que **no detectan** problemas que dependan
+del SQL real, como restricciones o concurrencia. No hay tests de integración automatizados contra Postgres y NATS reales, ni tests del
 wiring.
 Para la carga, ver también [`LOCUST.md`](../../LOCUST.md).
 
@@ -587,16 +610,15 @@ Para la carga, ver también [`LOCUST.md`](../../LOCUST.md).
 
 Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
-### Montos incorrectos o pérdida de datos
+### Montos
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| Las reversas no se guardan | Una venta anulada puede liquidarse como si siguiera vigente, mientras la métrica indica que se procesó (ver [§5.2](#52-reversa)) | `SettlementBatchRepo.Save`, `batch_transactions` |
-| La reversa usa un monto fijo de 1 centavo | Corregir solo la persistencia no alcanza: se descontaría 1 centavo | `RemoveTransaction` |
-| Las aprobaciones posteriores al cierre se pierden | La venta queda aprobada y fuera de todo lote. Es parte de la operación normal si el terminal sigue vendiendo (ver [§5.3](#53-aprobación-después-del-cierre)) | `FindOrCreateOpen`, `UNIQUE (terminal_id, batch_date)` |
-| El lote mezcla monedas | Una transacción en USD se suma a un lote en ARS como si fuera la misma moneda; `cmd.Currency` se ignora tras crear el lote | `RegisterApproval`, `AddTransaction` |
-| Un cierre puede sobrescribirse | Si una aprobación ya cargó el lote `OPEN` cuando otro handler lo cierra, su `Save` lo devuelve a `OPEN` y borra los totales. No hay bloqueo entre la carga y el guardado | `Save`, `ProcessBatchClose` |
-| El agrupamiento usa fecha UTC | Los lotes no coinciden con el día local del comercio (ver [§5.5](#55-desfase-por-fecha-utc)) | `RegisterApproval`, `PublishBatchCloseRequested` |
+| Reversas anteriores sin recuperar | Las procesadas antes de la corrección no se guardaron, y sus eventos figuran como procesados | Datos históricos |
+| Un cierre tardío usa solo lo pendiente | Si los contadores del terminal no se reinician tras cada cierre, el segundo cierre del día da `DISPUTED` | `ProcessBatchClose` |
+| La reversa no se valida contra la compra | Se confía en el monto y la moneda del evento | `RegisterReversal` |
+| Una sola zona horaria | No sirve para comercios de distintas zonas | `SETTLEMENT_BUSINESS_TIMEZONE` |
+| `batch_date` no valida coherencia | Un terminal puede pedir el cierre de cualquier fecha con un lote `OPEN` | `closeDate` |
 
 ### Ciclo de vida del lote
 
@@ -632,7 +654,7 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Faltan índices y hay costo creciente por aprobación | Cada evento recorre las transacciones del lote sin índice | `01-init.sql`, `Save`, `loadTransactions` |
 | `batch-closed` se publica sin outbox | Si falla, Notification no se entera y nada lo reintenta | `ProcessBatchClose` |
 | Un cierre sin lote no recibe respuesta | Terminal Gateway ya respondió `202`, y Settlement solo deja un `WARN` | `ProcessBatchClose` |
-| Sin reintentos con backoff | Los conflictos de serialización y los errores persistentes consumen las 5 entregas de inmediato | `nak` |
+| Sin backoff en NATS | Los errores persistentes, como una base caída, consumen las 5 entregas de inmediato. Los conflictos de versión sí tienen reintento interno | `nak` |
 | Sin migraciones reales | Los cambios de schema no se aplican a bases existentes, y `01-init.sql` y `st_schema.sql` difieren | `pkg/pgutil/migrate.go` |
 | gRPC placeholder y sin apagado ordenado | Abre un puerto que no ofrece nada y que ignora `GRPC_PORT` | `st_grpc_server.go`, `st_wire.go` |
 | `/readyz` no verifica NATS | Una instancia sin NATS sigue figurando como lista | `st_http_handler.go` |

@@ -583,3 +583,31 @@ func TestSettleBatch_CompletionErrorsAreNonFatal(t *testing.T) {
 		})
 	}
 }
+
+func TestReopenBatch_RejectedWhenAnotherBatchIsOpen(t *testing.T) {
+	b := newDisputedBatch(t)
+	other := newOpenBatch(t, b.TerminalID(), b.MerchantID())
+	repo := &fakeBatchRepo{findByIDResult: b, findOpenResult: other}
+	h := command.NewAdminHandler(repo, nil)
+
+	err := h.ReopenBatch(context.Background(), port.ReopenBatchCommand{BatchID: b.ID(), OperatorID: "op-1", Reason: "r"})
+	var ve *pkgerrors.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("error type = %T, want *pkgerrors.ValidationError", err)
+	}
+	if repo.saveCallCount != 0 {
+		t.Errorf("Save call count = %d, want 0", repo.saveCallCount)
+	}
+	if b.State() != valueobject.BatchStateDisputed {
+		t.Errorf("State() = %v, want it unchanged", b.State())
+	}
+}
+
+func TestReopenBatch_FindOpenError(t *testing.T) {
+	b := newDisputedBatch(t)
+	repo := &fakeBatchRepo{findByIDResult: b, findOpenErr: errors.New("connection reset")}
+	err := command.NewAdminHandler(repo, nil).ReopenBatch(context.Background(), port.ReopenBatchCommand{BatchID: b.ID(), OperatorID: "op-1", Reason: "r"})
+	if err == nil || !strings.Contains(err.Error(), "ReopenBatch: find open batch") {
+		t.Fatalf("error = %v, want it to mention ReopenBatch: find open batch", err)
+	}
+}

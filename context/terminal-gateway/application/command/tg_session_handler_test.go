@@ -625,7 +625,7 @@ func TestRequestBatchClose_PublishError(t *testing.T) {
 	publisher := &fakePublisher{publishBatchCloseErr: errors.New("nats unavailable")}
 	h := newHandler(nil, &fakeSessionRepo{}, &fakeTerminalRepo{}, &fakeNotifier{}, publisher)
 
-	err := h.RequestBatchClose(context.Background(), port.RequestBatchCloseCommand{TerminalID: domain.NewTerminalID().String(), MerchantID: domain.NewMerchantID().String()})
+	err := h.RequestBatchClose(context.Background(), port.RequestBatchCloseCommand{TerminalID: domain.NewTerminalID().String(), MerchantID: domain.NewMerchantID().String(), Currency: "ARS"})
 	if err == nil || !strings.Contains(err.Error(), "nats unavailable") {
 		t.Fatalf("error = %v, want it to propagate the publish error", err)
 	}
@@ -729,5 +729,33 @@ func TestRequestReversal_Success(t *testing.T) {
 	}
 	if publisher.publishReversalCalls != 1 {
 		t.Errorf("PublishReversalRequested calls = %d, want 1", publisher.publishReversalCalls)
+	}
+}
+
+func TestRequestBatchClose_InvalidCurrencyOrDate(t *testing.T) {
+	tests := []struct {
+		name                string
+		currency, batchDate string
+	}{
+		{"missing currency", "", ""},
+		{"unknown currency", "XXX", ""},
+		{"invalid date", "ARS", "05/11/2026"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			publisher := &fakePublisher{}
+			h := newHandler(nil, &fakeSessionRepo{}, &fakeTerminalRepo{}, &fakeNotifier{}, publisher)
+			err := h.RequestBatchClose(context.Background(), port.RequestBatchCloseCommand{
+				TerminalID: domain.NewTerminalID().String(), MerchantID: domain.NewMerchantID().String(),
+				Currency: tc.currency, BatchDate: tc.batchDate,
+			})
+			var ve *pkgerrors.ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("error type = %T, want *pkgerrors.ValidationError", err)
+			}
+			if publisher.publishBatchCloseCall != 0 {
+				t.Errorf("publish calls = %d, want 0", publisher.publishBatchCloseCall)
+			}
+		})
 	}
 }

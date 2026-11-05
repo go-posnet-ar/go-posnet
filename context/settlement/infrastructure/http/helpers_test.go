@@ -34,7 +34,7 @@ func (f *fakeBatchRepo) FindByID(context.Context, string) (*aggregate.Settlement
 	return f.findByIDResult, f.findByIDErr
 }
 
-func (f *fakeBatchRepo) FindOpenByTerminal(context.Context, domain.TerminalID, time.Time) (*aggregate.SettlementBatch, error) {
+func (f *fakeBatchRepo) FindOpenByTerminal(context.Context, domain.TerminalID, time.Time, string) (*aggregate.SettlementBatch, error) {
 	return nil, nil
 }
 
@@ -62,7 +62,7 @@ func (p *panickyBatchRepo) FindByID(context.Context, string) (*aggregate.Settlem
 	panic("boom")
 }
 
-func (p *panickyBatchRepo) FindOpenByTerminal(context.Context, domain.TerminalID, time.Time) (*aggregate.SettlementBatch, error) {
+func (p *panickyBatchRepo) FindOpenByTerminal(context.Context, domain.TerminalID, time.Time, string) (*aggregate.SettlementBatch, error) {
 	return nil, nil
 }
 

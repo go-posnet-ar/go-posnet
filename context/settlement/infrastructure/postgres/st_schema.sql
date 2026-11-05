@@ -30,9 +30,14 @@ CREATE TABLE settlement.settlement_batches (
     submitted_at    TIMESTAMPTZ,
     settled_at      TIMESTAMPTZ,
 
-    -- Garantiza un solo batch OPEN por terminal por día
-    UNIQUE (terminal_id, batch_date)
+    -- Bloqueo optimista
+    version         INTEGER     NOT NULL DEFAULT 0
 );
+
+-- Garantiza un solo batch OPEN por terminal, día y moneda
+CREATE UNIQUE INDEX uq_settlement_batches_open
+    ON settlement.settlement_batches (terminal_id, batch_date, currency)
+    WHERE state = 'OPEN';
 
 CREATE INDEX idx_settlement_batches_merchant_date
     ON settlement.settlement_batches(merchant_id, batch_date DESC);
@@ -46,12 +51,16 @@ CREATE INDEX idx_settlement_batches_state
 CREATE TABLE settlement.batch_transactions (
     id              UUID        PRIMARY KEY,
     batch_id        UUID        NOT NULL REFERENCES settlement.settlement_batches(id),
-    transaction_id  UUID        NOT NULL UNIQUE, -- Una tx solo puede estar en un batch
+    transaction_id  UUID        NOT NULL,
     amount_cents    BIGINT      NOT NULL,
     currency        CHAR(3)     NOT NULL,
     tx_type         VARCHAR(20) NOT NULL,        -- PURCHASE | REVERSAL | OFFLINE
     included_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Una compra y su reversa comparten transaction_id
+CREATE UNIQUE INDEX uq_batch_transactions_tx_type
+    ON settlement.batch_transactions (transaction_id, tx_type);
 
 CREATE INDEX idx_batch_transactions_batch
     ON settlement.batch_transactions(batch_id);

@@ -114,7 +114,7 @@ en Authorization es normal.
 | `acquirer reversal failed` | La reversa no se hizo y el mensaje se confirmó: requiere intervención manual |
 | `rule engine failed — using neutral score` | La transacción pasó como `REVIEW`, sin caso de fraude guardado |
 | `issuer ordered card capture` | Orden de retener la tarjeta; hoy no llega a ningún terminal |
-| `reload after conflict` | Aprobación rechazada porque el lote del día ya cerró ([Escenario D](batch-close-failure.md#escenario-d--aprobaciones-fuera-de-todo-lote)) |
+| `modified concurrently` | Conflicto de versión en un lote. Esperable con tráfico simultáneo: se reintenta solo. Solo es un problema si termina agotando entregas |
 | `no open batch found for terminal` | Cierre sin efecto ([Escenario B](batch-close-failure.md#escenario-b--cierre-sin-lote-abierto)) |
 | `no settlement processor configured` | Lote sin enviar ([Escenario C](batch-close-failure.md#escenario-c--lote-en-closed-sin-enviar)) |
 | `batch closed automatically without terminal totals` | Cierre automático, sin conciliar ([Escenario F](batch-close-failure.md#escenario-f--lotes-abiertos-de-días-anteriores)) |
@@ -196,9 +196,10 @@ SELECT count(*), state FROM pg_stat_activity WHERE datname = 'posnet' GROUP BY s
 `pkg/pgutil.HealthCheck` es un `pool.Ping(ctx)`: si falla, es conectividad o un pool agotado, no una
 consulta puntual.
 
-**Si la base es anterior a la blocklist,** todas las transacciones fallan por la falta de la columna
-`card_token`. Ver
-[Aplicar la migración](../technical/AUTHORIZATION.md#aplicar-la-migración-de-blocklist).
+**Migraciones manuales:** no se aplican solas. Sin la de la
+[blocklist](../technical/AUTHORIZATION.md#aplicar-la-migración-de-blocklist), todas las transacciones fallan
+por la falta de `card_token`. Sin la de
+[lotes](../technical/SETTLEMENT.md#aplicar-la-migración), Settlement falla por la falta de `version`.
 
 ---
 
@@ -233,7 +234,7 @@ trabada no se resuelve sola. Para el cliente, Terminal Gateway borra la sesión 
 ```sql
 SELECT t.id, t.terminal_id, t.amount_cents, t.authorized_at
 FROM pn_authorization.transactions t
-LEFT JOIN settlement.batch_transactions bt ON bt.transaction_id = t.id
+LEFT JOIN settlement.batch_transactions bt ON bt.transaction_id = t.id AND bt.tx_type = 'PURCHASE'
 WHERE t.state = 'APPROVED'
   AND bt.transaction_id IS NULL
   AND t.authorized_at < NOW() - INTERVAL '5 minutes'

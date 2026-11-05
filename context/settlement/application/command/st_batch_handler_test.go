@@ -3,6 +3,7 @@ package command_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -123,14 +124,15 @@ func TestRegisterApproval_AddTransactionError(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimedThenFail(pool, 1)
 
-	batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	// Un batch que no está OPEN no acepta transacciones.
+	batch := aggregate.Reconstitute(aggregate.ReconstituteParams{
+		ID: "batch-1", TerminalID: domain.NewTerminalID(), MerchantID: domain.NewMerchantID(),
+		State: valueobject.BatchStateClosed, Currency: "ARS",
+	})
 	repo := &fakeBatchRepo{findOrCreateResult: batch}
 	h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
 
-	cmd := validApprovalCmd()
-	cmd.AmountCents = 0 // entity.NewBatchTransaction rechaza monto <= 0
-
-	err := h.RegisterApproval(context.Background(), cmd)
+	err := h.RegisterApproval(context.Background(), validApprovalCmd())
 	if err == nil || !strings.Contains(err.Error(), "add transaction") {
 		t.Fatalf("error = %v, want it to mention add transaction", err)
 	}
@@ -814,4 +816,261 @@ func TestCloseStaleBatches_SubmitErrorIsNotAFailure(t *testing.T) {
 	if got := repo.lastSaved().State(); got != valueobject.BatchStateClosed {
 		t.Errorf("State() = %v, want %v", got, valueobject.BatchStateClosed)
 	}
+}
+
+// ─── Montos: reversas, monedas y día de negocio ───────────────────────────────
+
+func TestRegisterReversal_UsesRealAmount(t *testing.T) {
+	batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	repo := &fakeBatchRepo{findOrCreateResult: batch}
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+
+	cmd := validReversalCmd()
+	cmd.AmountCents = 4321
+	if err := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{}).RegisterReversal(context.Background(), cmd); err != nil {
+		t.Fatalf("RegisterReversal() error = %v", err)
+	}
+
+	txs := repo.lastSaved().Transactions()
+	if len(txs) != 1 || txs[0].Type() != valueobject.BatchTxReversal || txs[0].AmountCents() != 4321 {
+		t.Fatalf("transactions = %+v, want one REVERSAL of 4321", txs)
+	}
+}
+
+func TestRegister_InvalidCurrencyOrAmountIsPermanent(t *testing.T) {
+	var ve *pkgerrors.ValidationError
+	h := newHandler(newMockPool(t), &fakeBatchRepo{}, &fakePublisher{}, &fakeProcessor{})
+
+	approvals := []func(*port.RegisterApprovalCommand){
+		func(c *port.RegisterApprovalCommand) { c.Currency = "" },
+		func(c *port.RegisterApprovalCommand) { c.AmountCents = 0 },
+	}
+	for _, mut := range approvals {
+		cmd := validApprovalCmd()
+		mut(&cmd)
+		if err := h.RegisterApproval(context.Background(), cmd); !errors.As(err, &ve) {
+			t.Errorf("RegisterApproval(%+v) error = %v, want ValidationError", cmd, err)
+		}
+	}
+
+	reversals := []func(*port.RegisterReversalCommand){
+		func(c *port.RegisterReversalCommand) { c.Currency = "" },
+		func(c *port.RegisterReversalCommand) { c.AmountCents = -1 },
+	}
+	for _, mut := range reversals {
+		cmd := validReversalCmd()
+		mut(&cmd)
+		if err := h.RegisterReversal(context.Background(), cmd); !errors.As(err, &ve) {
+			t.Errorf("RegisterReversal(%+v) error = %v, want ValidationError", cmd, err)
+		}
+	}
+
+	closeCmd := validProcessCloseCmd()
+	closeCmd.Currency = ""
+	if err := h.ProcessBatchClose(context.Background(), closeCmd); !errors.As(err, &ve) {
+		t.Errorf("ProcessBatchClose() error = %v, want ValidationError", err)
+	}
+}
+
+func TestRegisterApproval_LooksUpBatchByCurrency(t *testing.T) {
+	batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	repo := &fakeBatchRepo{findOrCreateResult: batch}
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+
+	cmd := validApprovalCmd()
+	cmd.Currency = "USD"
+	if err := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{}).RegisterApproval(context.Background(), cmd); err != nil {
+		t.Fatalf("RegisterApproval() error = %v", err)
+	}
+	if repo.findOrCreateCurrency != "USD" {
+		t.Errorf("currency = %q, want USD", repo.findOrCreateCurrency)
+	}
+}
+
+// 22:30 del 5 en Argentina ya es el 6 en UTC: la venta pertenece al día 5.
+func TestBusinessDate_UsesConfiguredLocation(t *testing.T) {
+	loc, err := time.LoadLocation("America/Argentina/Buenos_Aires")
+	if err != nil {
+		t.Fatalf("LoadLocation() error = %v", err)
+	}
+	batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	repo := &fakeBatchRepo{findOrCreateResult: batch}
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+
+	h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+	h.SetBusinessLocation(loc)
+	cmd := validApprovalCmd()
+	cmd.AuthorizedAt = "2026-11-06T01:30:00Z"
+	if err := h.RegisterApproval(context.Background(), cmd); err != nil {
+		t.Fatalf("RegisterApproval() error = %v", err)
+	}
+	if got := repo.findOrCreateDate.Format("2006-01-02"); got != "2026-11-05" {
+		t.Errorf("batch date = %s, want 2026-11-05", got)
+	}
+}
+
+func TestProcessBatchClose_ResolvesDate(t *testing.T) {
+	loc, err := time.LoadLocation("America/Argentina/Buenos_Aires")
+	if err != nil {
+		t.Fatalf("LoadLocation() error = %v", err)
+	}
+	tests := []struct {
+		name, batchDate, requestedAt, want string
+	}{
+		{"fecha del terminal", "2026-11-04", "2026-11-06T01:30:00Z", "2026-11-04"},
+		{"sin fecha usa el dia de negocio del pedido", "", "2026-11-06T01:30:00Z", "2026-11-05"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &fakeBatchRepo{}
+			h := newHandler(newMockPool(t), repo, &fakePublisher{}, &fakeProcessor{})
+			h.SetBusinessLocation(loc)
+			cmd := validProcessCloseCmd()
+			cmd.BatchDate, cmd.RequestedAt, cmd.Currency = tc.batchDate, tc.requestedAt, "USD"
+			if err := h.ProcessBatchClose(context.Background(), cmd); err != nil {
+				t.Fatalf("ProcessBatchClose() error = %v", err)
+			}
+			if got := repo.findOpenDate.Format("2006-01-02"); got != tc.want {
+				t.Errorf("date = %s, want %s", got, tc.want)
+			}
+			if repo.findOpenCurrency != "USD" {
+				t.Errorf("currency = %q, want USD", repo.findOpenCurrency)
+			}
+		})
+	}
+}
+
+// fakeBatchRepoStale devuelve un conflicto de versión en las primeras llamadas a Save.
+type fakeBatchRepoStale struct {
+	fakeBatchRepo
+	staleSaves int
+}
+
+func (f *fakeBatchRepoStale) Save(ctx context.Context, b *aggregate.SettlementBatch) error {
+	if f.staleSaves > 0 {
+		f.staleSaves--
+		f.saveCallCount++
+		return fmt.Errorf("save: %w", repository.ErrStaleBatch)
+	}
+	return f.fakeBatchRepo.Save(ctx, b)
+}
+
+func TestRegisterApproval_RetriesInternallyOnStaleBatch(t *testing.T) {
+	batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	repo := &fakeBatchRepoStale{fakeBatchRepo: fakeBatchRepo{findOrCreateResult: batch}, staleSaves: 2}
+	pool := newMockPool(t)
+	expectClaimedThenFail(pool, 1)
+	expectClaimedThenFail(pool, 1)
+	expectClaimed(pool, 1)
+
+	if err := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{}).RegisterApproval(context.Background(), validApprovalCmd()); err != nil {
+		t.Fatalf("RegisterApproval() error = %v, want nil after retrying", err)
+	}
+	if repo.saveCallCount != 3 {
+		t.Errorf("Save call count = %d, want 3", repo.saveCallCount)
+	}
+}
+
+func TestRegisterReversal_RetriesInternallyOnStaleBatch(t *testing.T) {
+	batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	repo := &fakeBatchRepoStale{fakeBatchRepo: fakeBatchRepo{findOrCreateResult: batch}, staleSaves: 1}
+	pool := newMockPool(t)
+	expectClaimedThenFail(pool, 1)
+	expectClaimed(pool, 1)
+
+	if err := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{}).RegisterReversal(context.Background(), validReversalCmd()); err != nil {
+		t.Fatalf("RegisterReversal() error = %v, want nil after retrying", err)
+	}
+}
+
+// Si entró una venta, el cierre se recalcula con el lote recargado.
+func TestProcessBatchClose_ReloadsBatchOnStale(t *testing.T) {
+	repo := &fakeBatchRepoStaleReload{builds: func() *aggregate.SettlementBatch { return closableFoundBatch(t) }, staleSaves: 1}
+	pool := newMockPool(t)
+	expectClaimedThenFail(pool, 1)
+	expectClaimed(pool, 1)
+
+	if err := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{confirmationID: "c"}).ProcessBatchClose(context.Background(), validProcessCloseCmd()); err != nil {
+		t.Fatalf("ProcessBatchClose() error = %v, want nil after retrying", err)
+	}
+	if repo.findOpenCalls != 2 {
+		t.Errorf("FindOpenByTerminal calls = %d, want 2 (debe recargar el lote)", repo.findOpenCalls)
+	}
+}
+
+type fakeBatchRepoStaleReload struct {
+	fakeBatchRepo
+	builds        func() *aggregate.SettlementBatch
+	staleSaves    int
+	findOpenCalls int
+}
+
+func (f *fakeBatchRepoStaleReload) FindOpenByTerminal(context.Context, domain.TerminalID, time.Time, string) (*aggregate.SettlementBatch, error) {
+	f.findOpenCalls++
+	return f.builds(), nil
+}
+
+func (f *fakeBatchRepoStaleReload) Save(ctx context.Context, b *aggregate.SettlementBatch) error {
+	if f.staleSaves > 0 {
+		f.staleSaves--
+		return repository.ErrStaleBatch
+	}
+	return f.fakeBatchRepo.Save(ctx, b)
+}
+
+// Si el conflicto persiste, el error llega al subscriber para que NATS reintente.
+func TestRegisterApproval_StaleBatchExhaustedIsTransient(t *testing.T) {
+	batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	repo := &fakeBatchRepoStale{fakeBatchRepo: fakeBatchRepo{findOrCreateResult: batch}, staleSaves: 1000}
+	pool := newMockPool(t)
+	pool.MatchExpectationsInOrder(true)
+	for range 8 {
+		expectClaimedThenFail(pool, 1)
+	}
+
+	err := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{}).RegisterApproval(context.Background(), validApprovalCmd())
+	if !errors.Is(err, repository.ErrStaleBatch) {
+		t.Fatalf("error = %v, want ErrStaleBatch", err)
+	}
+	var ve *pkgerrors.ValidationError
+	if errors.As(err, &ve) {
+		t.Error("error is a ValidationError, want a transient error so the message is retried")
+	}
+	if repo.saveCallCount != 8 {
+		t.Errorf("Save call count = %d, want 8", repo.saveCallCount)
+	}
+}
+
+func TestRegisterApproval_StopsRetryingWhenContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	repo := &fakeBatchRepoCancelOnSave{fakeBatchRepo: fakeBatchRepo{findOrCreateResult: batch}, cancel: cancel}
+	pool := newMockPool(t)
+	expectClaimedThenFail(pool, 1)
+
+	err := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{}).RegisterApproval(ctx, validApprovalCmd())
+	if !errors.Is(err, repository.ErrStaleBatch) {
+		t.Fatalf("error = %v, want ErrStaleBatch", err)
+	}
+	if repo.saves != 1 {
+		t.Errorf("Save calls = %d, want 1 (no debe seguir reintentando)", repo.saves)
+	}
+}
+
+// fakeBatchRepoCancelOnSave simula un apagado durante un conflicto de versión.
+type fakeBatchRepoCancelOnSave struct {
+	fakeBatchRepo
+	cancel context.CancelFunc
+	saves  int
+}
+
+func (f *fakeBatchRepoCancelOnSave) Save(context.Context, *aggregate.SettlementBatch) error {
+	f.saves++
+	f.cancel()
+	return repository.ErrStaleBatch
 }

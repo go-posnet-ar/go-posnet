@@ -8,8 +8,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pashagolub/pgxmock/v4"
 
+	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	"github.com/juantevez/go-posnet/context/settlement/infrastructure/postgres"
 	"github.com/juantevez/go-posnet/pkg/domain"
@@ -22,7 +24,7 @@ func TestSave_NoSummary_NoTransactions(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(17)...).
+		WithArgs(anyArgs(18)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectCommit()
 	pool.ExpectRollback()
@@ -39,7 +41,7 @@ func TestSave_WithSummaryAndTransactions(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(17)...).
+		WithArgs(anyArgs(18)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectExec("INSERT INTO settlement.batch_transactions").
 		WithArgs(anyArgs(7)...).
@@ -65,7 +67,7 @@ func TestSave_MultipleTransactions(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(17)...).
+		WithArgs(anyArgs(18)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectExec("INSERT INTO settlement.batch_transactions").
 		WithArgs(anyArgs(7)...).
@@ -86,7 +88,7 @@ func TestSave_UpsertBatchError(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(17)...).
+		WithArgs(anyArgs(18)...).
 		WillReturnError(errors.New("connection reset"))
 	pool.ExpectRollback()
 
@@ -106,7 +108,7 @@ func TestSave_InsertBatchTransactionError(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(17)...).
+		WithArgs(anyArgs(18)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectExec("INSERT INTO settlement.batch_transactions").
 		WithArgs(anyArgs(7)...).
@@ -292,14 +294,14 @@ func TestFindOpenByTerminal_Success(t *testing.T) {
 	date := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
 
 	pool.ExpectQuery("LIMIT 1").
-		WithArgs(row.terminalID, "2026-01-15").
+		WithArgs(row.terminalID, "2026-01-15", "ARS").
 		WillReturnRows(row.rows())
 	pool.ExpectQuery("FROM settlement.batch_transactions").
 		WithArgs(row.id).
 		WillReturnRows(emptyBatchTxRows())
 
 	repo := postgres.NewSettlementBatchRepo(pool)
-	b, err := repo.FindOpenByTerminal(context.Background(), terminalID, date)
+	b, err := repo.FindOpenByTerminal(context.Background(), terminalID, date, "ARS")
 	if err != nil {
 		t.Fatalf("FindOpenByTerminal() error = %v", err)
 	}
@@ -311,11 +313,11 @@ func TestFindOpenByTerminal_Success(t *testing.T) {
 func TestFindOpenByTerminal_NotFound_ReturnsNilNil(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectQuery("LIMIT 1").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(pgx.ErrNoRows)
 
 	repo := postgres.NewSettlementBatchRepo(pool)
-	b, err := repo.FindOpenByTerminal(context.Background(), domain.NewTerminalID(), time.Now())
+	b, err := repo.FindOpenByTerminal(context.Background(), domain.NewTerminalID(), time.Now(), "ARS")
 	if err != nil {
 		t.Fatalf("FindOpenByTerminal() error = %v, want nil", err)
 	}
@@ -327,11 +329,11 @@ func TestFindOpenByTerminal_NotFound_ReturnsNilNil(t *testing.T) {
 func TestFindOpenByTerminal_ScanError(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectQuery("LIMIT 1").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(errors.New("connection reset"))
 
 	repo := postgres.NewSettlementBatchRepo(pool)
-	_, err := repo.FindOpenByTerminal(context.Background(), domain.NewTerminalID(), time.Now())
+	_, err := repo.FindOpenByTerminal(context.Background(), domain.NewTerminalID(), time.Now(), "ARS")
 	if err == nil || !strings.Contains(err.Error(), "scanBatch") {
 		t.Fatalf("error = %v, want it to contain %q", err, "scanBatch")
 	}
@@ -342,14 +344,14 @@ func TestFindOpenByTerminal_LoadTransactionsError(t *testing.T) {
 	row := newBatchRow()
 
 	pool.ExpectQuery("LIMIT 1").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(row.rows())
 	pool.ExpectQuery("FROM settlement.batch_transactions").
 		WithArgs(row.id).
 		WillReturnError(errors.New("connection reset"))
 
 	repo := postgres.NewSettlementBatchRepo(pool)
-	_, err := repo.FindOpenByTerminal(context.Background(), domain.NewTerminalID(), time.Now())
+	_, err := repo.FindOpenByTerminal(context.Background(), domain.NewTerminalID(), time.Now(), "ARS")
 	if err == nil || !strings.Contains(err.Error(), "loadTransactions") {
 		t.Fatalf("error = %v, want it to contain %q", err, "loadTransactions")
 	}
@@ -363,7 +365,7 @@ func TestFindOrCreateOpen_ExistingBatch(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.Serializable})
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(row.id))
 	pool.ExpectQuery("WHERE id =").
 		WithArgs(row.id).
@@ -390,7 +392,7 @@ func TestFindOrCreateOpen_ExistingBatch_FindByIDError(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.Serializable})
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(row.id))
 	pool.ExpectQuery("WHERE id =").
 		WithArgs(row.id).
@@ -409,7 +411,7 @@ func TestFindOrCreateOpen_CreatesNewBatch(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.Serializable})
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(pgx.ErrNoRows)
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
 		WithArgs(anyArgs(8)...).
@@ -438,13 +440,13 @@ func TestFindOrCreateOpen_ConcurrentConflict_ReloadsWinner(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.Serializable})
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(pgx.ErrNoRows)
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
 		WithArgs(anyArgs(8)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 0)) // conflicto — otro proceso ya insertó
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(row.id))
 	pool.ExpectQuery("WHERE id =").
 		WithArgs(row.id).
@@ -471,13 +473,13 @@ func TestFindOrCreateOpen_ConcurrentConflict_FindByIDError(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.Serializable})
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(pgx.ErrNoRows)
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
 		WithArgs(anyArgs(8)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 0))
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(row.id))
 	pool.ExpectQuery("WHERE id =").
 		WithArgs(row.id).
@@ -506,7 +508,7 @@ func TestFindOrCreateOpen_CheckExistingError(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.Serializable})
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(errors.New("connection reset"))
 	pool.ExpectRollback()
 
@@ -521,7 +523,7 @@ func TestFindOrCreateOpen_InvalidTerminalIDPropagatesCreateError(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.Serializable})
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(pgx.ErrNoRows)
 	pool.ExpectRollback()
 
@@ -536,7 +538,7 @@ func TestFindOrCreateOpen_InsertBatchError(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.Serializable})
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(pgx.ErrNoRows)
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
 		WithArgs(anyArgs(8)...).
@@ -554,13 +556,13 @@ func TestFindOrCreateOpen_ReloadAfterConflictError(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.Serializable})
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(pgx.ErrNoRows)
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
 		WithArgs(anyArgs(8)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 0))
 	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(errors.New("connection reset"))
 	pool.ExpectRollback()
 
@@ -585,11 +587,11 @@ func TestListByMerchantDate_Success(t *testing.T) {
 			AddRow(row1.id, row1.terminalID, row1.merchantID, row1.batchDate, row1.state, row1.currency,
 				row1.totalCount, row1.totalAmount, row1.purchaseCount, row1.purchaseAmount,
 				row1.reversalCount, row1.reversalAmount, row1.discrepancies,
-				row1.createdAt, row1.closedAt, row1.submittedAt, row1.settledAt).
+				row1.createdAt, row1.closedAt, row1.submittedAt, row1.settledAt, row1.version).
 			AddRow(row2.id, row2.terminalID, row2.merchantID, row2.batchDate, row2.state, row2.currency,
 				row2.totalCount, row2.totalAmount, row2.purchaseCount, row2.purchaseAmount,
 				row2.reversalCount, row2.reversalAmount, row2.discrepancies,
-				row2.createdAt, row2.closedAt, row2.submittedAt, row2.settledAt))
+				row2.createdAt, row2.closedAt, row2.submittedAt, row2.settledAt, row2.version))
 	pool.ExpectQuery("FROM settlement.batch_transactions").
 		WithArgs(row1.id).
 		WillReturnRows(emptyBatchTxRows())
@@ -729,5 +731,85 @@ func TestFindStaleOpenIDs_RowsError(t *testing.T) {
 
 	if _, err := postgres.NewSettlementBatchRepo(pool).FindStaleOpenIDs(context.Background(), time.Now()); err == nil {
 		t.Fatal("FindStaleOpenIDs() error = nil, want the rows error")
+	}
+}
+
+// ─── Bloqueo optimista y reversas ─────────────────────────────────────────────
+
+func TestSave_StaleVersionReturnsErrStaleBatch(t *testing.T) {
+	pool := newMockPool(t)
+	b := newOpenBatch(t)
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectExec("WHERE settlement.settlement_batches.version = EXCLUDED.version - 1").
+		WithArgs(anyArgs(18)...).
+		WillReturnResult(pgxmock.NewResult("INSERT", 0))
+	pool.ExpectRollback()
+
+	err := postgres.NewSettlementBatchRepo(pool).Save(context.Background(), b)
+	if !errors.Is(err, repository.ErrStaleBatch) {
+		t.Fatalf("error = %v, want ErrStaleBatch", err)
+	}
+	if b.Version() != 0 {
+		t.Errorf("Version() = %d, want 0 (nada se guardó)", b.Version())
+	}
+}
+
+func TestSave_IncrementsVersionOnEachSave(t *testing.T) {
+	pool := newMockPool(t)
+	b := newOpenBatch(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+
+	for want := 1; want <= 2; want++ {
+		args := anyArgs(18)
+		args[17] = want // la versión nueva es el último argumento
+		pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		pool.ExpectExec("INSERT INTO settlement.settlement_batches").
+			WithArgs(args...).
+			WillReturnResult(pgxmock.NewResult("INSERT", 1))
+		pool.ExpectCommit()
+		pool.ExpectRollback()
+
+		if err := repo.Save(context.Background(), b); err != nil {
+			t.Fatalf("Save() error = %v", err)
+		}
+		if b.Version() != want {
+			t.Errorf("Version() = %d, want %d", b.Version(), want)
+		}
+	}
+}
+
+func TestSave_ReversalUsesConflictOnTransactionAndType(t *testing.T) {
+	pool := newMockPool(t)
+	b := newOpenBatch(t)
+	if err := b.RemoveTransaction(domain.NewTransactionID(), 750); err != nil {
+		t.Fatalf("RemoveTransaction() error = %v", err)
+	}
+
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
+		WithArgs(anyArgs(18)...).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectExec(`ON CONFLICT \(transaction_id, tx_type\) DO NOTHING`).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), int64(750), "ARS", "REVERSAL", pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectCommit()
+	pool.ExpectRollback()
+
+	if err := postgres.NewSettlementBatchRepo(pool).Save(context.Background(), b); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+}
+
+func TestFindOrCreateOpen_SerializationFailureIsStale(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.Serializable})
+	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnError(&pgconn.PgError{Code: "40001"})
+	pool.ExpectRollback()
+
+	_, err := postgres.NewSettlementBatchRepo(pool).FindOrCreateOpen(context.Background(), domain.NewTerminalID(), domain.NewMerchantID(), time.Now(), "ARS")
+	if !errors.Is(err, repository.ErrStaleBatch) {
+		t.Fatalf("error = %v, want ErrStaleBatch", err)
 	}
 }

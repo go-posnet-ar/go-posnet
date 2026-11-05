@@ -135,6 +135,7 @@ func (p *EventPublisher) PublishBatchCloseRequested(
 	ctx context.Context,
 	terminalID domain.TerminalID,
 	merchantID domain.MerchantID,
+	batchDate string,
 	terminalCount int,
 	terminalAmount int64,
 	currency string,
@@ -142,7 +143,7 @@ func (p *EventPublisher) PublishBatchCloseRequested(
 	payload := events.BatchCloseRequestedPayload{
 		TerminalID:     terminalID.String(),
 		MerchantID:     merchantID.String(),
-		BatchDate:      time.Now().UTC().Format("2006-01-02"),
+		BatchDate:      batchDate,
 		TerminalCount:  terminalCount,
 		TerminalAmount: terminalAmount,
 		Currency:       currency,
