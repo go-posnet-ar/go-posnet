@@ -691,3 +691,43 @@ func TestLoadTransactions_ScanErrorMidLoop(t *testing.T) {
 		t.Fatalf("error = %v, want it to contain %q", err, "loadTransactions: scan")
 	}
 }
+
+// ─── FindStaleOpenIDs ─────────────────────────────────────────────────────────
+
+func TestFindStaleOpenIDs_Success(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectQuery("state = 'OPEN' AND batch_date <").
+		WithArgs("2026-01-15").
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("batch-1").AddRow("batch-2"))
+
+	ids, err := postgres.NewSettlementBatchRepo(pool).FindStaleOpenIDs(context.Background(), time.Date(2026, 1, 15, 3, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("FindStaleOpenIDs() error = %v", err)
+	}
+	if len(ids) != 2 || ids[0] != "batch-1" || ids[1] != "batch-2" {
+		t.Errorf("ids = %v, want [batch-1 batch-2]", ids)
+	}
+}
+
+func TestFindStaleOpenIDs_QueryError(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectQuery("state = 'OPEN' AND batch_date <").
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnError(errors.New("connection reset"))
+
+	_, err := postgres.NewSettlementBatchRepo(pool).FindStaleOpenIDs(context.Background(), time.Now())
+	if err == nil || !strings.Contains(err.Error(), "FindStaleOpenIDs: query") {
+		t.Fatalf("error = %v, want it to mention FindStaleOpenIDs: query", err)
+	}
+}
+
+func TestFindStaleOpenIDs_RowsError(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectQuery("state = 'OPEN' AND batch_date <").
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("batch-1").RowError(0, errors.New("broken")))
+
+	if _, err := postgres.NewSettlementBatchRepo(pool).FindStaleOpenIDs(context.Background(), time.Now()); err == nil {
+		t.Fatal("FindStaleOpenIDs() error = nil, want the rows error")
+	}
+}

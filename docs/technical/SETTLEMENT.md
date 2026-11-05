@@ -1,37 +1,36 @@
 # Settlement — Documentación técnica
 
-> Revisado contra el commit `8acbfdf` (2026-11-05). Este documento describe lo que el código hace
+> Revisado el 2026-11-05. Este documento describe lo que el código hace
 > hoy. Si algo difiere del [README del contexto](../../context/settlement/README.md) o de los
 > comentarios del código, vale lo que está acá. Para operar un incidente, ver el
 > [runbook de cierre de lote](../runbooks/batch-close-failure.md).
 
 ## 1. Resumen
 
-Settlement agrupa las transacciones aprobadas en lotes diarios por terminal, los cierra cuando el
-terminal lo pide y compara los totales del terminal con los del backend. El siguiente paso previsto es
-enviar la remesa a un procesador externo y registrar la liquidación.
+Settlement agrupa las transacciones aprobadas en lotes diarios por terminal, los cierra a pedido del
+terminal o de forma automática, compara los totales con los del backend, los envía a un procesador y
+registra la liquidación.
 
-**Solo la primera mitad funciona.** Un lote puede abrirse, acumular compras y cerrarse, pero no hay
-procesador ni liquidación, y además hay cuatro fallas que afectan directamente el resultado:
+**El ciclo completo funciona, pero el envío y la confirmación no son reales:** no hay un procesador
+externo. Con `SETTLEMENT_PROCESSOR=mock`, el envío se simula; con `none`, el default, el lote queda en
+`CLOSED`. La liquidación la confirma un operador. Además, dos fallas siguen afectando los montos:
 
-- **Un cierre sin discrepancias hace caer el servicio**, porque el procesador es `nil`.
 - **Las reversas no descuentan nada** del lote.
 - **Una aprobación posterior al cierre del día no entra en ningún lote.**
-- **Un lote en `DISPUTED` no tiene salida** sin intervenir la base de datos.
 
 | Capacidad | Estado | Detalle |
 |---|---|---|
 | Apertura de lotes y registro de compras | Implementado | Un lote por terminal y fecha UTC |
-| Cierre y detección de discrepancias | Implementado | Solo por pedido del terminal |
+| Cierre y detección de discrepancias | Implementado | Por pedido del terminal |
+| Cierre automático | Implementado | Lotes de días UTC anteriores, sin conciliación |
+| Resolución de disputas | Implementado | `reopen` y `resolve-dispute` |
+| Liquidación y comisión (MDR) | Implementado | Confirmación manual con `settle` |
+| Publicación de `batch-closed` y `settlement.completed` | Implementado | Directa a NATS, sin outbox. Nadie consume `settlement.completed` |
 | Consulta de lotes | Implementado | HTTP, sin autenticación |
-| Publicación de `batch-closed` | Implementado | Directa a NATS, sin outbox |
+| Envío al procesador | **Simulado** | `none` no envía; `mock` acepta sin enviar nada |
 | Registro de reversas | **Roto** | Se confirma, pero no se persiste |
 | Cierre forzado por soporte | **Parcial** | Registra discrepancias falsas y no publica eventos |
-| Envío al procesador externo | **Pendiente** | `processor` es `nil`: provoca un panic |
-| Reenvío manual (`resubmit`) | **Pendiente** | Siempre responde `500` por el mismo motivo |
-| Liquidación (`SETTLED`) y comisión (MDR) | **Pendiente** | Nada invoca `MarkSettled` ni calcula el neto |
-| Publicación de `settlement.completed` | **Pendiente** | Existe el método, pero no se invoca |
-| Cierre automático de lotes | **Pendiente** | El job solo escribe un log |
+| Archivo de remesa | **Pendiente** | Requiere la especificación del procesador |
 
 Las consecuencias de estos pendientes están en [§11](#11-brechas-conocidas).
 
@@ -40,9 +39,10 @@ Las consecuencias de estos pendientes están en [§11](#11-brechas-conocidas).
 ```
 Authorization ── auth.approved ────────────►┌────────────┐
 Authorization ── auth.reversal-completed ──►│ Settlement │── settlement.batch-closed ──► Notification
+                                            │            │── settlement.completed ──► (sin consumidores)
 Terminal Gateway ── transaction.batch-close►│            │
                                             └─────┬──────┘
-                                                  ┆ Submit (no implementado)
+                                                  ┆ Submit (none o mock)
                                                   ▼
                                         Procesador externo (Visa/MC)
 ```
@@ -67,6 +67,7 @@ Terminal Gateway ── transaction.batch-close►│            │
 | [`application/query/`](../../context/settlement/application/query/) | Consulta de lotes |
 | [`infrastructure/nats/`](../../context/settlement/infrastructure/nats/) | Publisher y subscriber |
 | [`infrastructure/postgres/`](../../context/settlement/infrastructure/postgres/) | Repositorio |
+| [`infrastructure/processor/`](../../context/settlement/infrastructure/processor/) | Procesador simulado |
 | [`infrastructure/http/`](../../context/settlement/infrastructure/http/) | Health checks, consulta y administración |
 | [`infrastructure/grpc/server/`](../../context/settlement/infrastructure/grpc/server/) | Servidor sin servicios |
 
@@ -96,25 +97,22 @@ diferencia causa la pérdida de aprobaciones descrita en [§5.3](#53-aprobación
 
 ```
 OPEN ──► PENDING_CLOSE ──► CLOSED ──► SUBMITTED ──► SETTLED
-              │               │            │
-              │               ▼            ▼
-              └─────────► DISPUTED ◄───────┘
-                              │
-                              └──► SUBMITTED
+  ▲           │            ▲  │            │
+  │           ▼            │  ▼            ▼
+  └───────────────── DISPUTED ◄────────────┘
 ```
 
-Qué transiciones ocurren realmente:
-
-| Transición | ¿Se usa? |
+| Transición | ¿Cuándo ocurre? |
 |---|---|
-| `OPEN` → `PENDING_CLOSE` → `CLOSED` | Sí, en un solo paso: `PENDING_CLOSE` nunca se guarda |
-| `CLOSED` → `DISPUTED` | Sí, cuando hay discrepancias |
-| `CLOSED` → `SUBMITTED` | No: el procesador es `nil` |
-| `SUBMITTED` → `SETTLED` | No: `MarkSettled` no se invoca |
-| `PENDING_CLOSE` o `SUBMITTED` → `DISPUTED` | No |
-| `DISPUTED` → `SUBMITTED` | No: `resubmit` exige `CLOSED` |
+| `OPEN` → `PENDING_CLOSE` → `CLOSED` | Al cerrar, en un solo paso: `PENDING_CLOSE` nunca se guarda |
+| `CLOSED` → `DISPUTED` | Al cerrar con discrepancias, o en un `resubmit` si el lote las tiene |
+| `DISPUTED` → `OPEN` | Con `reopen` |
+| `DISPUTED` → `CLOSED` | Con `resolve-dispute` |
+| `CLOSED` → `SUBMITTED` | Si el procesador acepta el envío (hoy, solo `mock`) |
+| `SUBMITTED` → `SETTLED` | Con `settle` |
+| `PENDING_CLOSE` o `SUBMITTED` → `DISPUTED`, `DISPUTED` → `SUBMITTED` | Permitidas, pero sin uso |
 
-`IsTerminal()` considera final a `DISPUTED`, aunque la máquina de estados le permita una salida.
+Solo `SETTLED` es un estado final.
 
 ### 4.3 `BatchTransaction`
 
@@ -179,7 +177,8 @@ Aunque la fila se guardara, tampoco sería correcta: `RemoveTransaction` usa **u
 centavo** e ignora el monto de la reversa. Los tests no lo detectan porque validan el aggregate en
 memoria y usan una base simulada.
 
-Si la reversa llega en otra fecha UTC, además crea un lote `OPEN` vacío, que nadie cierra.
+Si la reversa llega en otra fecha UTC, además crea un lote `OPEN` vacío, que después cierra el job
+automático.
 
 ### 5.3 Aprobación después del cierre
 
@@ -215,16 +214,14 @@ Publica settlement.batch-closed (si falla, solo log)
    │
    ├─ discrepancies > 0 ─► guarda DISPUTED ─► fin
    │
-   └─ discrepancies = 0 ─► processor.Submit ─► PANIC: el proceso se cae
+   └─ discrepancies = 0 ─► envía al procesador
+                              ├─ none ─► queda CLOSED, WARN y métrica
+                              └─ mock ─► guarda SUBMITTED
 ```
 
-**El caso exitoso es el que falla.** `processor` es una interfaz `nil`, a pesar de que el comentario de
-`st_wire.go` dice que es un no-op, y `submitBatch` no lo verifica. El handler de NATS no tiene `recover`
-ni lo tiene `nats.go`, de modo que el panic termina el proceso. Al reiniciar:
-
-- El lote ya está guardado en `CLOSED` y el evento `batch-closed` ya se publicó.
-- La reentrega no encuentra un lote `OPEN`, así que confirma el mensaje sin hacer nada.
-- El lote queda en `CLOSED` y no hay forma de avanzar, porque `resubmit` tampoco funciona.
+Sin procesador, el mensaje se confirma: reintentarlo no cambiaría nada. El lote sigue en `CLOSED` hasta
+un `resubmit`. Con cualquier otro error del procesador, el mensaje se reintenta, pero la reentrega ya no
+encuentra un lote `OPEN` y no hace nada: la vía para reintentar también es `resubmit`.
 
 ### 5.5 Desfase por fecha UTC
 
@@ -232,10 +229,55 @@ Los lotes se agrupan por fecha UTC, y Terminal Gateway siempre publica la fecha 
 el `batch_date` del request. Para un terminal en UTC-3:
 
 - Las ventas posteriores a las 21:00 caen en el lote del día siguiente.
-- Un cierre después de las 21:00 solo ve ese lote nuevo: el lote del día queda `OPEN` para siempre, y
-  los totales del terminal no coinciden.
+- Un cierre después de las 21:00 solo ve ese lote nuevo, y los totales del terminal no coinciden. El lote
+  del día queda `OPEN` hasta el cierre automático.
 
-### 5.6 Qué pasa cuando falla cada paso
+### 5.6 Cierre automático
+
+Con `SETTLEMENT_BATCH_CLOSE_HOUR` en 3 (00:00 en Argentina), el job corre una vez por día desde las 03:00
+UTC. También corre al arrancar, por si el servicio estaba caído a esa hora. Con el valor `0` queda
+desactivado.
+
+1. Busca los lotes `OPEN` de **días UTC anteriores**. No toca el lote del día, porque cerrarlo dejaría
+   afuera las ventas posteriores (ver [§5.3](#53-aprobación-después-del-cierre)).
+2. Los cierra con los totales del backend: **no hay conciliación**, porque el terminal no informó los
+   suyos, y por eso tampoco hay discrepancias.
+3. Publica `batch-closed` y envía el lote al procesador. Un lote vacío solo se cierra.
+
+Un evento sintético en `processed_events`, determinístico por lote y día, evita que dos instancias cierren
+el mismo lote. Si falla el cierre de un lote, el job sigue con los demás y reintenta en el minuto
+siguiente.
+
+### 5.7 Disputas
+
+| Operación | Efecto | Cuándo usarla |
+|---|---|---|
+| `reopen` | `DISPUTED` → `OPEN`. Descarta los totales y vuelve a aceptar transacciones | Faltan transacciones, o el terminal puede volver a cerrar con los totales correctos |
+| `resolve-dispute` | `DISPUTED` → `CLOSED`. Recalcula con las transacciones actuales y deja las discrepancias en 0 | El backend es correcto y los totales del terminal no |
+
+**Con `reopen`, el nuevo cierre solo llega si la fecha del lote es la de hoy**, porque Terminal Gateway
+siempre publica la fecha UTC actual. Un lote de otro día reabierto lo cierra el job automático al día
+siguiente, sin conciliar. Para resolverlo antes, usar `resolve-dispute`.
+
+Después de `resolve-dispute`, hay que enviar el lote con `resubmit`. Ninguna de las dos operaciones publica
+un nuevo evento: si los totales cambian, Notification no se entera.
+
+### 5.8 Liquidación
+
+`settle` confirma un lote `SUBMITTED` y lo pasa a `SETTLED`. La confirmación es manual, porque no hay un
+procesador que la informe.
+
+Cuando se liquidó el último lote con transacciones de un comercio en esa fecha, se publica
+`settlement.completed`, un evento por moneda:
+
+```
+neto = bruto − redondeo(bruto × MDR / 100)
+```
+
+Si después un terminal del mismo comercio abre otro lote para esa fecha, al liquidarlo se publica otro
+evento con el total acumulado.
+
+### 5.9 Qué pasa cuando falla cada paso
 
 | Fallo | Resultado | ¿Se recupera solo? |
 |---|---|---|
@@ -245,9 +287,12 @@ el `batch_date` del request. Para un terminal en UTC-3:
 | Aprobación con lote del día ya cerrado | `Nak` hasta agotar entregas | No |
 | Se pierde `auth.approved` en Authorization | La transacción falta en el lote; el cierre da `DISPUTED` | No |
 | Falla la publicación de `batch-closed` | Solo log; Notification no se entera | No |
-| Falla el guardado de `DISPUTED` | `Nak`; la reentrega no hace nada y queda `CLOSED` con discrepancias | No |
-| Cierre sin discrepancias | Panic y reinicio; queda `CLOSED` | No |
-| El terminal nunca pide el cierre | El lote queda `OPEN` para siempre | No |
+| Falla el guardado de `DISPUTED` | `Nak`; la reentrega no hace nada y queda `CLOSED` con discrepancias. El próximo `resubmit` lo pasa a `DISPUTED` | Con operador |
+| Cierre sin procesador configurado | Queda `CLOSED` | Con `resubmit` |
+| El procesador falla | Queda `CLOSED` | Con `resubmit` |
+| El terminal nunca pide el cierre | El job lo cierra sin conciliar | **Sí** |
+| Falla el cierre automático de un lote | Reintenta en el minuto siguiente | **Sí** |
+| Falla la publicación de `settlement.completed` | Solo log; el lote queda `SETTLED`, y nada lo reintenta | No |
 
 ## 6. API HTTP
 
@@ -262,7 +307,10 @@ ni siquiera en las operaciones de escritura.
 | `GET /batches/{id}` | Consultar un lote | `200` | `404`, `500` |
 | `GET /merchants/{merchant_id}/batches?date=YYYY-MM-DD` | Lotes de un comercio; `date` es obligatorio | `200` | `400`, `500` |
 | `POST /batches/{id}/force-close` | Forzar el cierre | `200` | `400`, `404`, `500` |
-| `POST /batches/{id}/resubmit` | Reintentar el envío | — | `400`, `404`, `500` |
+| `POST /batches/{id}/resubmit` | Enviar un lote `CLOSED` | `200` | `400`, `404`, `500`, `503` |
+| `POST /batches/{id}/reopen` | Reabrir un lote `DISPUTED` | `200` | `400`, `404`, `500` |
+| `POST /batches/{id}/resolve-dispute` | Aceptar los totales del backend | `200` | `400`, `404`, `500` |
+| `POST /batches/{id}/settle` | Confirmar la liquidación | `200` | `400`, `404`, `500` |
 
 Un ID que no sea un UUID responde `500`, no `400`. Los errores tienen la forma
 `{"error": "CODIGO", "message": "..."}`.
@@ -305,13 +353,36 @@ Responde `{"status": "closed"}`. Tiene varias limitaciones:
 - Solo funciona sobre lotes `OPEN`. En cualquier otro estado responde `500`, no `400`.
 - Cierra comparando contra 0, por lo que **cualquier lote con transacciones queda con discrepancias
   falsas**, aunque su estado sea `CLOSED`.
-- No publica `batch-closed` ni intenta el envío.
+- No publica `batch-closed` ni intenta el envío. Por las discrepancias falsas, el lote pasa a `DISPUTED`
+  en el primer `resubmit`, y sale con `resolve-dispute`.
 - `operator_id` es obligatorio, pero **no se guarda ni se registra en ningún log**.
 
-### Reenviar al procesador
+### Enviar al procesador
 
-Lleva el mismo body. Si el lote no está en `CLOSED`, responde `400`. Si lo está, llama al procesador
-`nil`: el panic lo captura el middleware HTTP y responde `500`. Nunca puede completarse.
+Lleva el mismo body y responde `{"status": "submitted"}`.
+
+| Situación | Respuesta |
+|---|---|
+| El lote no está en `CLOSED` | `400` |
+| El lote tiene discrepancias | `400`, y **el lote pasa a `DISPUTED`**, sin enviarse |
+| Sin procesador configurado | `503` con `PROCESSOR_UNAVAILABLE`; el lote queda en `CLOSED` |
+| Falla el procesador | `500` |
+
+### Resolver disputas
+
+`reopen` y `resolve-dispute` exigen `operator_id` y `reason`, y responden `{"status": "reopened"}` o
+`{"status": "closed"}`. Con un lote que no esté en `DISPUTED`, responden `400`.
+
+```json
+{ "operator_id": "soporte-juan", "reason": "Conciliado con el comercio, ticket 123" }
+```
+
+Ambos datos quedan **solo en los logs**, en nivel `WARN`.
+
+### Confirmar la liquidación
+
+`settle` exige `operator_id` y responde `{"status": "settled"}`. Con un lote que no esté en `SUBMITTED`,
+responde `400`. El `operator_id` queda en los logs.
 
 ## 7. gRPC
 
@@ -347,7 +418,7 @@ Un mensaje que agota las entregas no pasa a una DLQ. Para recuperarlo, seguir el
 | Subject | Stream | ¿Se publica? | Consumidor |
 |---|---|---|---|
 | `posnet.settlement.batch-closed.v1` | `POSNET_SETTLEMENT` | Sí, sin outbox | Notification |
-| `posnet.settlement.completed.v1` | `POSNET_SETTLEMENT` | **No**: nada lo invoca | Ninguno |
+| `posnet.settlement.completed.v1` | `POSNET_SETTLEMENT` | Sí, sin outbox | Ninguno: Notification no lo consume |
 
 Payload de `batch-closed`:
 
@@ -358,6 +429,15 @@ Payload de `batch-closed`:
 | `total_count`, `total_amount`, `currency` | Totales del backend |
 | `discrepancies` | Permite distinguir un cierre con diferencias |
 | `closed_at` | RFC3339 UTC |
+
+Payload de `settlement.completed`:
+
+| Campo | Notas |
+|---|---|
+| `merchant_id`, `settlement_date` | `merchant_id` también es el `correlation_id` |
+| `total_batches`, `currency` | Lotes liquidados en esa moneda |
+| `total_amount`, `net_amount`, `mdr_percent` | Bruto, neto y comisión aplicada; el MDR no se guarda por lote |
+| `completed_at` | RFC3339 UTC |
 
 ## 9. Persistencia
 
@@ -397,6 +477,7 @@ El servidor gRPC no se detiene de forma ordenada.
 | `posnet_settlement_reversals_total` | Counter | — | Reversas procesadas; **aumenta aunque no se guarden** |
 | `posnet_settlement_batches_total` | Counter | `currency`, `state` | Cierres; `state` siempre es `CLOSED`, porque se registra antes de marcar la disputa |
 | `posnet_settlement_batch_duration_seconds` | Histogram | — | Duración del cierre |
+| `posnet_settlement_submissions_total` | Counter | `result` | Envíos tras un cierre: `submitted`, `unavailable` o `error`. No incluye `resubmit` |
 
 También se exponen métricas del pool de Postgres y de mensajes NATS.
 
@@ -417,8 +498,8 @@ ORDER BY batch_date DESC;
 ```
 
 En los logs, buscar `reload after conflict` para detectar aprobaciones rechazadas tras un cierre, y
-`no open batch found` para cierres sin efecto. Un reinicio del servicio cerca de un cierre puede
-deberse al panic descrito en [§5.4](#54-cierre-de-lote).
+`no open batch found` para cierres sin efecto. `batch closed automatically` identifica los cierres sin
+conciliar, y `no settlement processor configured` los lotes que quedaron sin enviar.
 
 ### Variables de entorno
 
@@ -434,15 +515,13 @@ deberse al panic descrito en [§5.4](#54-cierre-de-lote).
 | `OTEL_SERVICE_VERSION` | `1.0.0` | Sí |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel-collector:4317` | Sí |
 | `ENVIRONMENT` | `development` | Sí |
-| `SETTLEMENT_MDR_PERCENT` | `2.5` | **No**: se valida y se registra, pero no se aplica a ningún cálculo |
-| `SETTLEMENT_BATCH_CLOSE_HOUR` | `23` | **No**: el job usa 23 fijo, y solo escribe un log |
-| `SETTLEMENT_SUBMIT_RETRIES` | `3` | **No**: no hay procesador |
-| `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | **No**: no hay procesador |
+| `SETTLEMENT_MDR_PERCENT` | `2.5` | Sí; se usa para calcular el neto. Fuera de 0–10, el servicio no arranca |
+| `SETTLEMENT_BATCH_CLOSE_HOUR` | `3` | Sí; hora UTC del cierre automático, y `0` lo desactiva. Fuera de 0–23, el servicio no arranca |
+| `SETTLEMENT_PROCESSOR` | `none` | Sí; `none` o `mock`. Docker Compose usa `mock`. Con otro valor, el servicio no arranca |
+| `SETTLEMENT_SUBMIT_RETRIES` | `3` | **No**: no hay procesador real |
+| `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | **No**: no hay procesador real |
 | `GRPC_PORT` | `9093` | **No**: el puerto está fijo en 9093 |
 | `MIGRATIONS_DIR` | `migrations/settlement` | **No**: `Migrate` no hace nada |
-
-Un `SETTLEMENT_MDR_PERCENT` fuera de 0–10 o un `SETTLEMENT_BATCH_CLOSE_HOUR` fuera de 0–23 impiden el
-arranque, aunque esos valores no se usen.
 
 ### Levantar y probar
 
@@ -468,8 +547,7 @@ MERCHANT=b2c3d4e5-f6a7-8901-bcde-f12345678901
 curl -s "localhost:8084/merchants/$MERCHANT/batches?date=$(date -u +%F)" | jq
 ```
 
-Para probar el cierre, informar totales que **no** coincidan, de modo que el lote pase a `DISPUTED`. Con
-totales correctos, hoy el servicio se cae (ver [§5.4](#54-cierre-de-lote)):
+Para probar una disputa, cerrar con totales que **no** coincidan, y después resolverla:
 
 ```bash
 curl -s localhost:8081/batch-close -H 'Content-Type: application/json' -d '{
@@ -481,8 +559,14 @@ curl -s localhost:8081/batch-close -H 'Content-Type: application/json' -d '{
 }'
 ```
 
-Ese lote ya no se puede reutilizar: para seguir probando el mismo día, hay que borrarlo a mano o usar
-otro terminal.
+```bash
+BATCH=$(curl -s "localhost:8084/merchants/$MERCHANT/batches?date=$(date -u +%F)" | jq -r '.batches[0].ID')
+OP='"operator_id":"prueba"'
+
+curl -s -X POST localhost:8084/batches/$BATCH/resolve-dispute -d "{$OP,\"reason\":\"prueba\"}"
+curl -s -X POST localhost:8084/batches/$BATCH/resubmit -d "{$OP}"
+curl -s -X POST localhost:8084/batches/$BATCH/settle -d "{$OP}"
+```
 
 ### Tests
 
@@ -494,8 +578,9 @@ locust -f posnet-load-tests/settlement/settlement_locust.py \
   --headless -u 10 -r 2 --run-time 2m --host http://localhost:8084
 ```
 
-Los tests usan una base simulada y un procesador falso, por lo que **no detectan** el panic ni la
-pérdida de reversas. No hay tests de integración contra Postgres y NATS reales, ni tests del wiring.
+Los tests usan una base simulada y un procesador falso, por lo que **no detectan** problemas como la
+pérdida de reversas. No hay tests de integración automatizados contra Postgres y NATS reales, ni tests del
+wiring.
 Para la carga, ver también [`LOCUST.md`](../../LOCUST.md).
 
 ## 11. Brechas conocidas
@@ -517,20 +602,24 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| El procesador es `nil` | Todo cierre sin discrepancias provoca un panic y un reinicio del servicio. Debería al menos fallar con un error controlado o ser un no-op real, como dice el comentario | `st_wire.go`, `submitBatch` |
-| `DISPUTED` no tiene salida | Ni `resubmit` ni `force-close` lo aceptan, y tampoco hay reapertura o recálculo: requiere SQL manual | `AdminHandler` |
-| `CLOSED` no tiene salida real | `resubmit` siempre falla mientras no exista el procesador | `ResubmitBatch` |
-| No hay liquidación | `SUBMITTED`, `SETTLED`, el MDR, el archivo de remesa y `settlement.completed` no están implementados | `MarkSettled`, `PublishSettlementCompleted` |
-| No hay cierre automático | Un terminal que no pide el cierre deja su lote `OPEN` para siempre. El job solo escribe un log | `runBatchCloser` |
-| `resubmit` no revisa discrepancias | Un lote `CLOSED` con discrepancias, como los de `force-close`, se enviaría igual cuando exista el procesador | `ResubmitBatch` |
+| No hay procesador real | `mock` marca `SUBMITTED` sin enviar nada. Falta el adaptador y el archivo de remesa, que requieren la especificación del procesador. `SETTLEMENT_SUBMIT_RETRIES` y `SETTLEMENT_SUBMIT_TIMEOUT` siguen sin efecto | `st_mock_processor.go` |
+| La confirmación de liquidación es manual | Un operador debe llamar a `settle`, sin autenticación ni referencia del procesador | `SettleBatch` |
+| Nadie consume `settlement.completed` | El comercio no recibe el neto liquidado: Notification no se suscribe | `nt_nats_subscriber.go` |
+| `settlement.completed` sin outbox | Si falla la publicación, nada la reintenta y el lote ya está `SETTLED` | `publishCompletedIfDone` |
+| Evento adicional por lotes tardíos | Un lote abierto después de la liquidación diaria genera otro evento con el total acumulado | `publishCompletedIfDone` |
+| El cierre automático no concilia | Los lotes se envían con los totales del backend, sin comparar con el terminal | `CloseStaleBatches` |
+| Doble envío posible | Si el procesador acepta y falla el guardado, el lote queda `CLOSED`, y `resubmit` lo enviaría otra vez | `submitBatch`, `ResubmitBatch` |
+| `resolve-dispute` no notifica | Si los totales cambian, Notification solo conoce los del primer cierre | `ResolveDispute` |
+| Auditoría solo en logs | `operator_id` y `reason` no se guardan en la base | `AdminHandler` |
+| Lotes vacíos en `CLOSED` | Los lotes vacíos que cierra el job quedan en `CLOSED` y aparecen en las consultas de lotes pendientes | `autoCloseBatch` |
 
 ### Cierre forzado y seguridad
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
 | Operaciones sin autenticación | Con acceso de red, cualquiera puede cerrar el lote de cualquier terminal; un cierre hecho así también hace perder las aprobaciones posteriores | `st_http_router.go` |
-| `force-close` compara contra 0 | Todo lote con transacciones queda con discrepancias falsas | `ForceClose` |
-| `operator_id` no se audita | Es obligatorio, pero `ForceClose` no lo guarda ni lo registra. `ResubmitBatch` solo lo registra en un log si tiene éxito | `AdminHandler` |
+| `force-close` compara contra 0 | Todo lote con transacciones queda con discrepancias falsas, y debe pasar por `resolve-dispute` antes de enviarse | `ForceClose` |
+| `force-close` no registra el operador | `operator_id` es obligatorio, pero no se guarda ni se registra | `ForceClose` |
 | `force-close` no notifica | No se publica `batch-closed`, así que Notification no se entera | `ForceClose` |
 
 ### Operación y datos
@@ -539,6 +628,7 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 |---|---|---|
 | Sin alertas de lotes | Los lotes trabados o en disputa solo se descubren consultando la base | Prometheus |
 | Las disputas no se ven en las métricas | `state` siempre vale `CLOSED` en `posnet_settlement_batches_total` | `ProcessBatchClose` |
+| Sin alerta para lotes sin enviar | `posnet_settlement_submissions_total{result="unavailable"}` existe, pero ninguna regla la usa | Prometheus |
 | Faltan índices y hay costo creciente por aprobación | Cada evento recorre las transacciones del lote sin índice | `01-init.sql`, `Save`, `loadTransactions` |
 | `batch-closed` se publica sin outbox | Si falla, Notification no se entera y nada lo reintenta | `ProcessBatchClose` |
 | Un cierre sin lote no recibe respuesta | Terminal Gateway ya respondió `202`, y Settlement solo deja un `WARN` | `ProcessBatchClose` |

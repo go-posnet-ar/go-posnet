@@ -94,6 +94,10 @@ func (f *fakeBatchRepo) ListByMerchantDate(context.Context, domain.MerchantID, t
 	return nil, nil
 }
 
+func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, error) {
+	return nil, nil
+}
+
 // ─── fakeDomainPublisher / fakeProcessor ─────────────────────────────────────
 
 // fakeDomainPublisher implementa service.EventPublisher — distinto del

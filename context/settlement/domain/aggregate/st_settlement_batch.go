@@ -128,23 +128,10 @@ func (b *SettlementBatch) Close(terminalCount int, terminalAmount int64) error {
 		return err
 	}
 
-	// Calcular totales del backend
-	var backendPurchaseCount, backendReversalCount int
-	var backendPurchaseAmount, backendReversalAmount int64
-
-	for _, tx := range b.transactions {
-		switch tx.Type() {
-		case valueobject.BatchTxPurchase, valueobject.BatchTxOffline:
-			backendPurchaseCount++
-			backendPurchaseAmount += tx.AmountCents()
-		case valueobject.BatchTxReversal:
-			backendReversalCount++
-			backendReversalAmount += tx.AmountCents()
-		}
+	summary, backendTotalCount, backendTotalAmount, err := b.calculateSummary()
+	if err != nil {
+		return err
 	}
-
-	backendTotalCount := backendPurchaseCount + backendReversalCount
-	backendTotalAmount := backendPurchaseAmount - backendReversalAmount
 
 	// Detectar discrepancias. countDiff mide el desajuste de cantidad; un
 	// desajuste de monto por sí solo también debe contar como discrepancia
@@ -159,30 +146,93 @@ func (b *SettlementBatch) Close(terminalCount int, terminalAmount int64) error {
 		}
 	}
 
-	// Construir el summary
-	cur, _ := domain.ParseCurrency(b.currency)
-	totalMoney, _ := domain.NewMoney(backendTotalAmount, cur)
-	purchaseMoney, _ := domain.NewMoney(backendPurchaseAmount, cur)
-	var reversalMoney domain.Money
-	if backendReversalAmount > 0 {
-		reversalMoney, _ = domain.NewMoney(backendReversalAmount, cur)
-	}
-
-	summary, err := valueobject.NewBatchSummary(
-		backendTotalCount, totalMoney,
-		backendPurchaseCount, purchaseMoney,
-		backendReversalCount, reversalMoney,
-	)
-	if err != nil {
-		return fmt.Errorf("settlement_batch: calculate summary: %w", err)
-	}
-
 	b.summary = &summary
 	now := time.Now().UTC()
 	b.closedAt = &now
 
 	b.record(event.NewBatchClosed(b.id, b.terminalID, b.merchantID, summary, b.discrepancies))
 	return nil
+}
+
+// CloseWithBackendTotals cierra un lote OPEN sin totales del terminal, usando los
+// del backend. No hay conciliación posible, así que no registra discrepancias.
+func (b *SettlementBatch) CloseWithBackendTotals() error {
+	if err := b.RequestClose(); err != nil {
+		return err
+	}
+	_, count, amount, err := b.calculateSummary()
+	if err != nil {
+		return err
+	}
+	return b.Close(count, amount)
+}
+
+// Reopen devuelve un lote en disputa a OPEN para que acepte transacciones y
+// pueda volver a cerrarse. Descarta los totales del cierre anterior.
+func (b *SettlementBatch) Reopen() error {
+	if err := b.transition(valueobject.BatchStateOpen); err != nil {
+		return err
+	}
+	b.summary = nil
+	b.closedAt = nil
+	b.discrepancies = 0
+	return nil
+}
+
+// ResolveDispute cierra un lote en disputa aceptando los totales del backend,
+// recalculados a partir de las transacciones actuales del lote. Es una decisión
+// del operador: los totales del terminal dejan de compararse.
+func (b *SettlementBatch) ResolveDispute() error {
+	summary, _, _, err := b.calculateSummary()
+	if err != nil {
+		return err
+	}
+	if err := b.transition(valueobject.BatchStateClosed); err != nil {
+		return err
+	}
+	b.summary = &summary
+	b.discrepancies = 0
+	now := time.Now().UTC()
+	b.closedAt = &now
+	return nil
+}
+
+// calculateSummary calcula los totales del backend a partir de las transacciones.
+func (b *SettlementBatch) calculateSummary() (valueobject.BatchSummary, int, int64, error) {
+	var purchaseCount, reversalCount int
+	var purchaseAmount, reversalAmount int64
+
+	for _, tx := range b.transactions {
+		switch tx.Type() {
+		case valueobject.BatchTxPurchase, valueobject.BatchTxOffline:
+			purchaseCount++
+			purchaseAmount += tx.AmountCents()
+		case valueobject.BatchTxReversal:
+			reversalCount++
+			reversalAmount += tx.AmountCents()
+		}
+	}
+
+	totalCount := purchaseCount + reversalCount
+	totalAmount := purchaseAmount - reversalAmount
+
+	cur, _ := domain.ParseCurrency(b.currency)
+	totalMoney, _ := domain.NewMoney(totalAmount, cur)
+	purchaseMoney, _ := domain.NewMoney(purchaseAmount, cur)
+	var reversalMoney domain.Money
+	if reversalAmount > 0 {
+		reversalMoney, _ = domain.NewMoney(reversalAmount, cur)
+	}
+
+	summary, err := valueobject.NewBatchSummary(
+		totalCount, totalMoney,
+		purchaseCount, purchaseMoney,
+		reversalCount, reversalMoney,
+	)
+	if err != nil {
+		return valueobject.BatchSummary{}, 0, 0, fmt.Errorf("settlement_batch: calculate summary: %w", err)
+	}
+	return summary, totalCount, totalAmount, nil
 }
 
 // Submit marca el lote como enviado al procesador externo.
@@ -197,6 +247,9 @@ func (b *SettlementBatch) Submit() error {
 
 // MarkSettled marca el lote como liquidado exitosamente.
 func (b *SettlementBatch) MarkSettled() error {
+	if b.summary == nil && b.state.CanTransitionTo(valueobject.BatchStateSettled) {
+		return fmt.Errorf("settlement_batch %s: cannot settle without a summary", b.id)
+	}
 	if err := b.transition(valueobject.BatchStateSettled); err != nil {
 		return err
 	}

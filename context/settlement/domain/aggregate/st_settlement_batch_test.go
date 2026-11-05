@@ -546,3 +546,132 @@ func TestClearDomainEvents(t *testing.T) {
 		t.Errorf("DomainEvents() len = %d after ClearDomainEvents(), want 0", len(b.DomainEvents()))
 	}
 }
+
+// ─── Reopen / ResolveDispute ───────────────────────────────────────────────────
+
+func newDisputedBatch(t *testing.T) *aggregate.SettlementBatch {
+	t.Helper()
+	b := newOpenBatch(t)
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	if err := b.RequestClose(); err != nil {
+		t.Fatalf("RequestClose() error = %v", err)
+	}
+	if err := b.Close(5, 9999); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := b.MarkDisputed("terminal count/amount mismatch"); err != nil {
+		t.Fatalf("MarkDisputed() error = %v", err)
+	}
+	return b
+}
+
+func TestReopen_ClearsCloseDataAndCanCloseAgain(t *testing.T) {
+	b := newDisputedBatch(t)
+
+	if err := b.Reopen(); err != nil {
+		t.Fatalf("Reopen() error = %v", err)
+	}
+	if b.State() != valueobject.BatchStateOpen {
+		t.Errorf("State() = %v, want %v", b.State(), valueobject.BatchStateOpen)
+	}
+	if b.Summary() != nil || b.ClosedAt() != nil || b.Discrepancies() != 0 {
+		t.Errorf("summary=%v closedAt=%v discrepancies=%d, want them cleared", b.Summary(), b.ClosedAt(), b.Discrepancies())
+	}
+	if len(b.Transactions()) != 1 {
+		t.Errorf("Transactions() len = %d, want 1 (no debe perder transacciones)", len(b.Transactions()))
+	}
+
+	// Una vez abierto, acepta transacciones y vuelve a conciliar contra el terminal.
+	if err := b.AddTransaction(domain.NewTransactionID(), 500, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	if err := b.RequestClose(); err != nil {
+		t.Fatalf("RequestClose() error = %v", err)
+	}
+	if err := b.Close(2, 1500); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if b.Discrepancies() != 0 {
+		t.Errorf("Discrepancies() = %d, want 0", b.Discrepancies())
+	}
+}
+
+func TestReopen_InvalidTransition(t *testing.T) {
+	if err := newOpenBatch(t).Reopen(); err == nil {
+		t.Fatal("Reopen() error = nil on an OPEN batch, want an invalid transition error")
+	}
+}
+
+func TestResolveDispute_AcceptsBackendTotals(t *testing.T) {
+	b := newDisputedBatch(t)
+
+	if err := b.ResolveDispute(); err != nil {
+		t.Fatalf("ResolveDispute() error = %v", err)
+	}
+	if b.State() != valueobject.BatchStateClosed {
+		t.Errorf("State() = %v, want %v", b.State(), valueobject.BatchStateClosed)
+	}
+	if b.Discrepancies() != 0 {
+		t.Errorf("Discrepancies() = %d, want 0", b.Discrepancies())
+	}
+	if got := b.Summary().TotalAmount().Cents(); got != 1000 {
+		t.Errorf("TotalAmount = %d, want 1000 (totales del backend)", got)
+	}
+	if b.ClosedAt() == nil {
+		t.Error("ClosedAt() is nil, want it set")
+	}
+}
+
+func TestResolveDispute_InvalidTransition(t *testing.T) {
+	b := newOpenBatch(t)
+	if err := b.ResolveDispute(); err == nil {
+		t.Fatal("ResolveDispute() error = nil on an OPEN batch, want an invalid transition error")
+	}
+	if b.State() != valueobject.BatchStateOpen {
+		t.Errorf("State() = %v, want it unchanged", b.State())
+	}
+}
+
+// ─── CloseWithBackendTotals ───────────────────────────────────────────────────
+
+func TestCloseWithBackendTotals(t *testing.T) {
+	b := newOpenBatch(t)
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+
+	if err := b.CloseWithBackendTotals(); err != nil {
+		t.Fatalf("CloseWithBackendTotals() error = %v", err)
+	}
+	if b.State() != valueobject.BatchStateClosed {
+		t.Errorf("State() = %v, want %v", b.State(), valueobject.BatchStateClosed)
+	}
+	if b.Discrepancies() != 0 {
+		t.Errorf("Discrepancies() = %d, want 0", b.Discrepancies())
+	}
+	if got := b.Summary().TotalAmount().Cents(); got != 1000 {
+		t.Errorf("TotalAmount = %d, want 1000", got)
+	}
+}
+
+func TestCloseWithBackendTotals_InvalidTransition(t *testing.T) {
+	b := newDisputedBatch(t)
+	if err := b.CloseWithBackendTotals(); err == nil {
+		t.Fatal("CloseWithBackendTotals() error = nil on a DISPUTED batch, want an error")
+	}
+}
+
+func TestMarkSettled_WithoutSummary(t *testing.T) {
+	b := aggregate.Reconstitute(aggregate.ReconstituteParams{
+		ID: "batch-1", TerminalID: domain.NewTerminalID(), MerchantID: domain.NewMerchantID(),
+		State: valueobject.BatchStateSubmitted, Currency: "ARS",
+	})
+	if err := b.MarkSettled(); err == nil {
+		t.Fatal("MarkSettled() error = nil without a summary, want an error instead of a panic")
+	}
+	if b.State() != valueobject.BatchStateSubmitted {
+		t.Errorf("State() = %v, want it unchanged", b.State())
+	}
+}

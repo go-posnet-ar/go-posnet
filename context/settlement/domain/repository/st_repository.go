@@ -28,4 +28,8 @@ type SettlementBatchRepository interface {
 	// ListByMerchantDate lista todos los batches de un comercio en una fecha.
 	// Usado para generar el reporte de liquidación diaria.
 	ListByMerchantDate(ctx context.Context, merchantID domain.MerchantID, date time.Time) ([]*aggregate.SettlementBatch, error)
+
+	// FindStaleOpenIDs lista los batches OPEN de fechas anteriores a before.
+	// Usado por el job de cierre automático.
+	FindStaleOpenIDs(ctx context.Context, before time.Time) ([]string, error)
 }

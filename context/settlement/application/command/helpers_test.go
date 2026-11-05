@@ -28,6 +28,9 @@ type fakeBatchRepo struct {
 
 	listResult []*aggregate.SettlementBatch
 	listErr    error
+
+	staleIDs []string
+	staleErr error
 }
 
 var _ repository.SettlementBatchRepository = (*fakeBatchRepo)(nil)
@@ -61,11 +64,26 @@ func (f *fakeBatchRepo) ListByMerchantDate(context.Context, domain.MerchantID, t
 	return f.listResult, f.listErr
 }
 
+func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, error) {
+	return f.staleIDs, f.staleErr
+}
+
 // ─── fakePublisher / fakeProcessor ───────────────────────────────────────────
 
 type fakePublisher struct {
 	publishBatchClosedErr   error
 	publishBatchClosedCalls int
+
+	publishCompletedErr error
+	completed           []completedEvent
+}
+
+type completedEvent struct {
+	merchantID, date string
+	batches          int
+	gross, net       int64
+	currency         string
+	mdr              float64
 }
 
 func (f *fakePublisher) PublishBatchClosed(context.Context, *aggregate.SettlementBatch) error {
@@ -73,8 +91,9 @@ func (f *fakePublisher) PublishBatchClosed(context.Context, *aggregate.Settlemen
 	return f.publishBatchClosedErr
 }
 
-func (f *fakePublisher) PublishSettlementCompleted(context.Context, string, string, int, int64, int64, string, float64) error {
-	return nil
+func (f *fakePublisher) PublishSettlementCompleted(_ context.Context, merchantID, date string, batches int, gross, net int64, currency string, mdr float64) error {
+	f.completed = append(f.completed, completedEvent{merchantID, date, batches, gross, net, currency, mdr})
+	return f.publishCompletedErr
 }
 
 type fakeProcessor struct {

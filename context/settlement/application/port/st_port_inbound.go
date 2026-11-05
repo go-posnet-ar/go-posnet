@@ -33,6 +33,15 @@ type AdminService interface {
 	// atascado en CLOSED (ej: el envío original falló por una falla transitoria
 	// del procesador). Uso en operaciones de soporte.
 	ResubmitBatch(ctx interface{}, cmd ResubmitBatchCommand) error
+
+	// ReopenBatch devuelve un batch en disputa a OPEN para corregirlo y volver a cerrarlo.
+	ReopenBatch(ctx interface{}, cmd ReopenBatchCommand) error
+
+	// ResolveDispute cierra un batch en disputa aceptando los totales del backend.
+	ResolveDispute(ctx interface{}, cmd ResolveDisputeCommand) error
+
+	// SettleBatch confirma la liquidación de un batch SUBMITTED.
+	SettleBatch(ctx interface{}, cmd SettleBatchCommand) error
 }
 
 // ─── Commands ─────────────────────────────────────────────────────────────────
@@ -78,6 +87,26 @@ type ForceCloseCommand struct {
 
 // ResubmitBatchCommand reintenta el envío al procesador de un batch CLOSED.
 type ResubmitBatchCommand struct {
+	BatchID    string
+	OperatorID string // Para auditoría
+}
+
+// ReopenBatchCommand devuelve un batch en disputa a OPEN.
+type ReopenBatchCommand struct {
+	BatchID    string
+	OperatorID string // Para auditoría
+	Reason     string // Para auditoría
+}
+
+// ResolveDisputeCommand cierra un batch en disputa con los totales del backend.
+type ResolveDisputeCommand struct {
+	BatchID    string
+	OperatorID string // Para auditoría
+	Reason     string // Para auditoría
+}
+
+// SettleBatchCommand confirma la liquidación de un batch SUBMITTED.
+type SettleBatchCommand struct {
 	BatchID    string
 	OperatorID string // Para auditoría
 }

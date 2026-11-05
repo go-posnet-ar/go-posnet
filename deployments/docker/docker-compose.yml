@@ -213,6 +213,8 @@ services:
       HTTP_PORT: "8084"
       GRPC_PORT: "9093"
       OTEL_SERVICE_NAME: posnet-settlement
+      SETTLEMENT_PROCESSOR: mock # Sin envío real, como acquirer-mock. El default del código es "none".
+      SETTLEMENT_BATCH_CLOSE_HOUR: "3" # 03:00 UTC = 00:00 en Argentina.
     depends_on:
       postgres:
         condition: service_healthy

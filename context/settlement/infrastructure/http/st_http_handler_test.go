@@ -11,6 +11,7 @@ import (
 	"github.com/juantevez/go-posnet/context/settlement/application/command"
 	"github.com/juantevez/go-posnet/context/settlement/application/query"
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
 
@@ -342,5 +343,138 @@ func TestHandleResubmitBatch_InternalError(t *testing.T) {
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestHandleResubmitBatch_NoProcessor(t *testing.T) {
+	b := newClosedBatch(t)
+	repo := &fakeBatchRepo{findByIDResult: b}
+	h := NewHandler(query.NewBatchQueryHandler(repo), command.NewAdminHandler(repo, nil), &fakePool{})
+	mux := newTestMux(h)
+
+	req := httptest.NewRequest(http.MethodPost, "/batches/"+b.ID()+"/resubmit",
+		strings.NewReader(`{"operator_id":"op-1"}`))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	body := decodeJSON(t, rec.Body.Bytes())
+	if body["error"] != "PROCESSOR_UNAVAILABLE" {
+		t.Errorf("body[error] = %v, want %q", body["error"], "PROCESSOR_UNAVAILABLE")
+	}
+}
+
+// ─── POST /batches/{id}/reopen y /resolve-dispute ─────────────────────────────
+
+func TestHandleDisputeRoutes(t *testing.T) {
+	const validBody = `{"operator_id":"op-1","reason":"conciliado"}`
+	newDisputed := func() *aggregate.SettlementBatch {
+		return aggregate.Reconstitute(aggregate.ReconstituteParams{
+			ID: "batch-1", TerminalID: domain.NewTerminalID(), MerchantID: domain.NewMerchantID(),
+			State: valueobject.BatchStateDisputed, Currency: "ARS",
+		})
+	}
+
+	routes := []struct{ path, wantStatus string }{
+		{"/batches/batch-1/reopen", "reopened"},
+		{"/batches/batch-1/resolve-dispute", "closed"},
+	}
+
+	for _, rt := range routes {
+		tests := []struct {
+			name     string
+			repo     func() *fakeBatchRepo
+			body     string
+			wantCode int
+			wantErr  string
+		}{
+			{"invalid body", func() *fakeBatchRepo { return &fakeBatchRepo{} }, `not-json`, http.StatusBadRequest, "INVALID_BODY"},
+			{"missing reason", func() *fakeBatchRepo { return &fakeBatchRepo{} }, `{"operator_id":"op-1"}`, http.StatusBadRequest, "VALIDATION_ERROR"},
+			{"not found", func() *fakeBatchRepo { return &fakeBatchRepo{} }, validBody, http.StatusNotFound, "NOT_FOUND"},
+			{"wrong state", func() *fakeBatchRepo { return &fakeBatchRepo{findByIDResult: newClosedBatch(t)} }, validBody, http.StatusBadRequest, "VALIDATION_ERROR"},
+			{"internal", func() *fakeBatchRepo { return &fakeBatchRepo{findByIDErr: errors.New("db unreachable")} }, validBody, http.StatusInternalServerError, "INTERNAL"},
+		}
+		for _, tc := range tests {
+			t.Run(rt.path+"/"+tc.name, func(t *testing.T) {
+				mux := newTestMux(newTestHandler(tc.repo(), &fakePool{}))
+				rec := httptest.NewRecorder()
+				mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, rt.path, strings.NewReader(tc.body)))
+				if rec.Code != tc.wantCode {
+					t.Fatalf("status = %d, want %d, body = %s", rec.Code, tc.wantCode, rec.Body.String())
+				}
+				if got := decodeJSON(t, rec.Body.Bytes())["error"]; got != tc.wantErr {
+					t.Errorf("body[error] = %v, want %q", got, tc.wantErr)
+				}
+			})
+		}
+
+		t.Run(rt.path+"/success", func(t *testing.T) {
+			mux := newTestMux(newTestHandler(&fakeBatchRepo{findByIDResult: newDisputed()}, &fakePool{}))
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, rt.path, strings.NewReader(validBody)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			if got := decodeJSON(t, rec.Body.Bytes())["status"]; got != rt.wantStatus {
+				t.Errorf("body[status] = %v, want %q", got, rt.wantStatus)
+			}
+		})
+	}
+}
+
+// ─── POST /batches/{id}/settle ────────────────────────────────────────────────
+
+func TestHandleSettleBatch(t *testing.T) {
+	newSubmitted := func() *aggregate.SettlementBatch {
+		b := newBatch(t)
+		if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+			t.Fatalf("AddTransaction() error = %v", err)
+		}
+		if err := b.CloseWithBackendTotals(); err != nil {
+			t.Fatalf("CloseWithBackendTotals() error = %v", err)
+		}
+		if err := b.Submit(); err != nil {
+			t.Fatalf("Submit() error = %v", err)
+		}
+		return b
+	}
+
+	const validBody = `{"operator_id":"op-1"}`
+	tests := []struct {
+		name     string
+		repo     *fakeBatchRepo
+		body     string
+		wantCode int
+		wantErr  string
+	}{
+		{"success", &fakeBatchRepo{findByIDResult: newSubmitted()}, validBody, http.StatusOK, ""},
+		{"invalid body", &fakeBatchRepo{}, `not-json`, http.StatusBadRequest, "INVALID_BODY"},
+		{"missing operator", &fakeBatchRepo{}, `{}`, http.StatusBadRequest, "VALIDATION_ERROR"},
+		{"not found", &fakeBatchRepo{}, validBody, http.StatusNotFound, "NOT_FOUND"},
+		{"wrong state", &fakeBatchRepo{findByIDResult: newClosedBatch(t)}, validBody, http.StatusBadRequest, "VALIDATION_ERROR"},
+		{"internal", &fakeBatchRepo{findByIDErr: errors.New("db unreachable")}, validBody, http.StatusInternalServerError, "INTERNAL"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := newTestMux(newTestHandler(tc.repo, &fakePool{}))
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/batches/batch-1/settle", strings.NewReader(tc.body)))
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d, body = %s", rec.Code, tc.wantCode, rec.Body.String())
+			}
+			body := decodeJSON(t, rec.Body.Bytes())
+			if tc.wantErr == "" {
+				if body["status"] != "settled" {
+					t.Errorf("body[status] = %v, want %q", body["status"], "settled")
+				}
+				return
+			}
+			if body["error"] != tc.wantErr {
+				t.Errorf("body[error] = %v, want %q", body["error"], tc.wantErr)
+			}
+		})
 	}
 }

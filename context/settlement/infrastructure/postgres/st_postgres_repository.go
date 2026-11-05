@@ -283,6 +283,33 @@ func (r *SettlementBatchRepo) ListByMerchantDate(
 	return batches, nil
 }
 
+// FindStaleOpenIDs lista los batches OPEN de fechas anteriores a before.
+func (r *SettlementBatchRepo) FindStaleOpenIDs(ctx context.Context, before time.Time) ([]string, error) {
+	const q = `
+		SELECT id FROM settlement.settlement_batches
+		WHERE state = 'OPEN' AND batch_date < $1::date
+		ORDER BY batch_date ASC
+	`
+	rows, err := r.pool.Query(ctx, q, before.Format("2006-01-02"))
+	if err != nil {
+		return nil, fmt.Errorf("FindStaleOpenIDs: query: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("FindStaleOpenIDs: scan: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("FindStaleOpenIDs: rows: %w", err)
+	}
+	return ids, nil
+}
+
 // ─── Helpers internos ─────────────────────────────────────────────────────────
 
 // rawBatch almacena la fila escaneada antes de reconstruir el aggregate.

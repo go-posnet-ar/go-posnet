@@ -656,3 +656,162 @@ func (f *fakeBatchRepoSaveErrOnCall) Save(ctx context.Context, b *aggregate.Sett
 	}
 	return nil
 }
+
+// Sin procesador configurado, un cierre correcto no debe provocar un panic: en un
+// handler de NATS terminaría el proceso. El lote queda en CLOSED y el mensaje se confirma.
+func TestProcessBatchClose_NoProcessorKeepsBatchClosed(t *testing.T) {
+	batch := closableFoundBatch(t)
+	repo := &fakeBatchRepo{findOpenResult: batch}
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+	publisher := &fakePublisher{}
+
+	h := newHandler(pool, repo, publisher, nil)
+	if err := h.ProcessBatchClose(context.Background(), validProcessCloseCmd()); err != nil {
+		t.Fatalf("ProcessBatchClose() error = %v, want nil", err)
+	}
+
+	if repo.saveCallCount != 1 {
+		t.Errorf("Save call count = %d, want 1 (solo el cierre)", repo.saveCallCount)
+	}
+	if got := repo.lastSaved().State(); got != valueobject.BatchStateClosed {
+		t.Errorf("State() = %v, want %v", got, valueobject.BatchStateClosed)
+	}
+	if publisher.publishBatchClosedCalls != 1 {
+		t.Errorf("PublishBatchClosed calls = %d, want 1", publisher.publishBatchClosedCalls)
+	}
+}
+
+// ─── CloseStaleBatches ────────────────────────────────────────────────────────
+
+func TestCloseStaleBatches_FindError(t *testing.T) {
+	repo := &fakeBatchRepo{staleErr: errors.New("connection reset")}
+	h := newHandler(newMockPool(t), repo, &fakePublisher{}, &fakeProcessor{})
+
+	_, _, err := h.CloseStaleBatches(context.Background(), time.Now())
+	if err == nil || !strings.Contains(err.Error(), "CloseStaleBatches: find batches") {
+		t.Fatalf("error = %v, want it to mention CloseStaleBatches: find batches", err)
+	}
+}
+
+func TestCloseStaleBatches_ClosesPublishesAndSubmits(t *testing.T) {
+	batch := closableFoundBatch(t)
+	repo := &fakeBatchRepo{staleIDs: []string{batch.ID()}, findByIDResult: batch}
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+	publisher := &fakePublisher{}
+	processor := &fakeProcessor{confirmationID: "conf-1"}
+
+	closed, failed, err := newHandler(pool, repo, publisher, processor).CloseStaleBatches(context.Background(), time.Now())
+	if err != nil {
+		t.Fatalf("CloseStaleBatches() error = %v", err)
+	}
+	if closed != 1 || failed != 0 {
+		t.Errorf("closed = %d, failed = %d, want 1, 0", closed, failed)
+	}
+	if publisher.publishBatchClosedCalls != 1 {
+		t.Errorf("PublishBatchClosed calls = %d, want 1", publisher.publishBatchClosedCalls)
+	}
+	if processor.calls != 1 {
+		t.Errorf("processor.Submit calls = %d, want 1", processor.calls)
+	}
+	if got := repo.lastSaved().State(); got != valueobject.BatchStateSubmitted {
+		t.Errorf("State() = %v, want %v", got, valueobject.BatchStateSubmitted)
+	}
+	if batch.Discrepancies() != 0 {
+		t.Errorf("Discrepancies() = %d, want 0", batch.Discrepancies())
+	}
+}
+
+func TestCloseStaleBatches_NoProcessorKeepsClosed(t *testing.T) {
+	batch := closableFoundBatch(t)
+	repo := &fakeBatchRepo{staleIDs: []string{batch.ID()}, findByIDResult: batch}
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+
+	closed, failed, err := newHandler(pool, repo, &fakePublisher{}, nil).CloseStaleBatches(context.Background(), time.Now())
+	if err != nil || closed != 1 || failed != 0 {
+		t.Fatalf("closed = %d, failed = %d, err = %v, want 1, 0, nil", closed, failed, err)
+	}
+	if got := repo.lastSaved().State(); got != valueobject.BatchStateClosed {
+		t.Errorf("State() = %v, want %v", got, valueobject.BatchStateClosed)
+	}
+}
+
+func TestCloseStaleBatches_EmptyBatchIsClosedSilently(t *testing.T) {
+	batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	repo := &fakeBatchRepo{staleIDs: []string{batch.ID()}, findByIDResult: batch}
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+	publisher := &fakePublisher{}
+	processor := &fakeProcessor{}
+
+	closed, _, err := newHandler(pool, repo, publisher, processor).CloseStaleBatches(context.Background(), time.Now())
+	if err != nil || closed != 1 {
+		t.Fatalf("closed = %d, err = %v, want 1, nil", closed, err)
+	}
+	if publisher.publishBatchClosedCalls != 0 || processor.calls != 0 {
+		t.Errorf("publish calls = %d, submit calls = %d, want 0, 0", publisher.publishBatchClosedCalls, processor.calls)
+	}
+	if got := repo.lastSaved().State(); got != valueobject.BatchStateClosed {
+		t.Errorf("State() = %v, want %v", got, valueobject.BatchStateClosed)
+	}
+}
+
+// Otra instancia ya cerró el batch: no se publica ni se envía dos veces.
+func TestCloseStaleBatches_AlreadyClaimedSkips(t *testing.T) {
+	batch := closableFoundBatch(t)
+	repo := &fakeBatchRepo{staleIDs: []string{batch.ID()}, findByIDResult: batch}
+	pool := newMockPool(t)
+	expectClaimed(pool, 0)
+	publisher := &fakePublisher{}
+	processor := &fakeProcessor{}
+
+	closed, failed, err := newHandler(pool, repo, publisher, processor).CloseStaleBatches(context.Background(), time.Now())
+	if err != nil || closed != 0 || failed != 0 {
+		t.Fatalf("closed = %d, failed = %d, err = %v, want 0, 0, nil", closed, failed, err)
+	}
+	if repo.saveCallCount != 0 || publisher.publishBatchClosedCalls != 0 || processor.calls != 0 {
+		t.Errorf("save = %d, publish = %d, submit = %d, want 0, 0, 0", repo.saveCallCount, publisher.publishBatchClosedCalls, processor.calls)
+	}
+}
+
+func TestCloseStaleBatches_SkipsBatchNoLongerOpen(t *testing.T) {
+	repo := &fakeBatchRepo{staleIDs: []string{"batch-1"}, findByIDResult: nil}
+	closed, failed, err := newHandler(newMockPool(t), repo, &fakePublisher{}, &fakeProcessor{}).CloseStaleBatches(context.Background(), time.Now())
+	if err != nil || closed != 0 || failed != 0 {
+		t.Fatalf("closed = %d, failed = %d, err = %v, want 0, 0, nil", closed, failed, err)
+	}
+}
+
+func TestCloseStaleBatches_CountsFailures(t *testing.T) {
+	batch := closableFoundBatch(t)
+	repo := &fakeBatchRepo{staleIDs: []string{batch.ID()}, findByIDResult: batch, saveErr: errors.New("connection reset")}
+	pool := newMockPool(t)
+	expectClaimedThenFail(pool, 1)
+
+	closed, failed, err := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{}).CloseStaleBatches(context.Background(), time.Now())
+	if err != nil {
+		t.Fatalf("CloseStaleBatches() error = %v, want nil (un batch no frena a los demás)", err)
+	}
+	if closed != 0 || failed != 1 {
+		t.Errorf("closed = %d, failed = %d, want 0, 1", closed, failed)
+	}
+}
+
+// Si falla el envío, el lote ya quedó cerrado: no cuenta como fallo del cierre.
+func TestCloseStaleBatches_SubmitErrorIsNotAFailure(t *testing.T) {
+	batch := closableFoundBatch(t)
+	repo := &fakeBatchRepo{staleIDs: []string{batch.ID()}, findByIDResult: batch}
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+	processor := &fakeProcessor{err: errors.New("processor down")}
+
+	closed, failed, err := newHandler(pool, repo, &fakePublisher{}, processor).CloseStaleBatches(context.Background(), time.Now())
+	if err != nil || closed != 1 || failed != 0 {
+		t.Fatalf("closed = %d, failed = %d, err = %v, want 1, 0, nil", closed, failed, err)
+	}
+	if got := repo.lastSaved().State(); got != valueobject.BatchStateClosed {
+		t.Errorf("State() = %v, want %v", got, valueobject.BatchStateClosed)
+	}
+}

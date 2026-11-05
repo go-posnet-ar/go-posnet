@@ -20,8 +20,8 @@ Este runbook describe el estado **actual** del sistema, no el previsto. Revisado
 Prometheus directamente. Además, varias fallas no generan ninguna alerta (ver
 [sección 5](#5-lo-que-ninguna-alerta-detecta)).
 
-**Piezas simuladas o incompletas:** el adquirente aprueba todo, no hay procesador de liquidación y no
-hay WebSocket. Por eso, un comprobante en `SENT` no prueba que un terminal lo haya recibido. El detalle
+**Piezas simuladas o incompletas:** el adquirente aprueba todo, el procesador de liquidación es simulado
+o no está configurado, y no hay WebSocket. Por eso, un comprobante en `SENT` no prueba que un terminal lo haya recibido. El detalle
 de cada servicio está en [`docs/technical/`](../technical/).
 
 ---
@@ -55,9 +55,6 @@ alcanza Postgres: andá a la [sección 4](#4-postgres).
 
 **`readyz` no verifica NATS.** Un servicio puede responder `200` sin poder consumir ni publicar eventos,
 por eso conviene verificar NATS por separado.
-
-**Un reinicio de `posnet-settlement` cerca de un cierre de lote** suele ser el panic conocido: ver el
-[Escenario C](batch-close-failure.md#escenario-c--caída-del-servicio-al-cerrar-un-lote-correcto).
 
 ### 1.2 ¿Qué tan grave es?
 
@@ -119,6 +116,8 @@ en Authorization es normal.
 | `issuer ordered card capture` | Orden de retener la tarjeta; hoy no llega a ningún terminal |
 | `reload after conflict` | Aprobación rechazada porque el lote del día ya cerró ([Escenario D](batch-close-failure.md#escenario-d--aprobaciones-fuera-de-todo-lote)) |
 | `no open batch found for terminal` | Cierre sin efecto ([Escenario B](batch-close-failure.md#escenario-b--cierre-sin-lote-abierto)) |
+| `no settlement processor configured` | Lote sin enviar ([Escenario C](batch-close-failure.md#escenario-c--lote-en-closed-sin-enviar)) |
+| `batch closed automatically without terminal totals` | Cierre automático, sin conciliar ([Escenario F](batch-close-failure.md#escenario-f--lotes-abiertos-de-días-anteriores)) |
 | `notification delivery failed`, `failed to save notification` | Fallo de envío o de guardado de una notificación |
 | `panic: runtime error` | Salida del proceso, no JSON. Revisá `docker logs` y el contador de reinicios |
 
@@ -284,7 +283,7 @@ registro. Compará `GET /rules` con los pesos por defecto (20, 15, 25, 20 y 30).
 
 | Síntoma | Runbook |
 |---|---|
-| Lotes en `DISPUTED` o `CLOSED`, cierres sin efecto, reinicios de Settlement, aprobaciones fuera de lote o reversas sin descontar | [batch-close-failure.md](batch-close-failure.md) |
+| Lotes en `DISPUTED` o `CLOSED`, cierres sin efecto, aprobaciones fuera de lote o reversas sin descontar | [batch-close-failure.md](batch-close-failure.md) |
 | Mensajes que agotaron sus entregas, eventos perdidos o transacciones trabadas | [nats-dlq-reprocess.md](nats-dlq-reprocess.md) |
 
 ## 7. Después del incidente

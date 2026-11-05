@@ -51,8 +51,9 @@ type SettlementConfig struct {
 	// Ej: 2.5 = 2.5%. Se aplica al calcular el NetAmount en SettlementCompleted.
 	MDRPercent float64
 
-	// BatchCloseHour es la hora UTC en que se inicia el cierre automático de lotes.
-	// Ej: 23 = 23:00 UTC. Si es 0, el cierre es solo manual (vía evento NATS).
+	// BatchCloseHour es la hora UTC desde la que corre el cierre automático, que
+	// alcanza a los lotes OPEN de días UTC anteriores. Default: 3 = 00:00 en Argentina.
+	// Si es 0, el cierre es solo por pedido del terminal o de un operador.
 	BatchCloseHour int
 
 	// SubmitRetries es la cantidad de reintentos al enviar el archivo de remesa
@@ -61,7 +62,17 @@ type SettlementConfig struct {
 
 	// SubmitTimeout es el timeout para la llamada al procesador externo.
 	SubmitTimeout time.Duration
+
+	// Processor selecciona el procesador externo: ProcessorNone o ProcessorMock.
+	Processor string
 }
+
+const (
+	// ProcessorNone no envía los lotes: quedan en CLOSED. Es el valor seguro por defecto.
+	ProcessorNone = "none"
+	// ProcessorMock simula el envío y los lotes pasan a SUBMITTED. Solo para desarrollo.
+	ProcessorMock = "mock"
+)
 
 // Load carga la configuración desde variables de entorno.
 func Load() (*Config, error) {
@@ -97,9 +108,10 @@ func Load() (*Config, error) {
 
 		Settlement: SettlementConfig{
 			MDRPercent:     envFloat("SETTLEMENT_MDR_PERCENT", 2.5),
-			BatchCloseHour: envInt("SETTLEMENT_BATCH_CLOSE_HOUR", 23),
+			BatchCloseHour: envInt("SETTLEMENT_BATCH_CLOSE_HOUR", 3),
 			SubmitRetries:  envInt("SETTLEMENT_SUBMIT_RETRIES", 3),
 			SubmitTimeout:  envDuration("SETTLEMENT_SUBMIT_TIMEOUT", 30*time.Second),
+			Processor:      envStr("SETTLEMENT_PROCESSOR", ProcessorNone),
 		},
 	}
 
@@ -118,6 +130,12 @@ func (c *Config) validate() error {
 	if c.Settlement.BatchCloseHour < 0 || c.Settlement.BatchCloseHour > 23 {
 		return fmt.Errorf("config: SETTLEMENT_BATCH_CLOSE_HOUR %d out of range [0, 23]",
 			c.Settlement.BatchCloseHour)
+	}
+	switch c.Settlement.Processor {
+	case "", ProcessorNone, ProcessorMock:
+	default:
+		return fmt.Errorf("config: SETTLEMENT_PROCESSOR %q must be %q or %q",
+			c.Settlement.Processor, ProcessorNone, ProcessorMock)
 	}
 	return nil
 }

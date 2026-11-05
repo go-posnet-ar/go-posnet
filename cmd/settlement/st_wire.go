@@ -16,6 +16,7 @@ import (
 	httpinfra "github.com/juantevez/go-posnet/context/settlement/infrastructure/http"
 	natsinfra "github.com/juantevez/go-posnet/context/settlement/infrastructure/nats"
 	pginfra "github.com/juantevez/go-posnet/context/settlement/infrastructure/postgres"
+	stprocessor "github.com/juantevez/go-posnet/context/settlement/infrastructure/processor"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 	natsclient "github.com/nats-io/nats.go"
@@ -28,6 +29,9 @@ type app struct {
 	subscriber *natsinfra.Subscriber
 	grpcSrv    *grpcserver.SettlementServer
 	httpSrv    *http.Server
+
+	batchHandler   *command.BatchHandler
+	batchCloseHour int
 }
 
 // wire construye el grafo de dependencias completo del BC Settlement.
@@ -86,9 +90,8 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	eventPub := natsinfra.NewEventPublisher(natsPub)
 
 	// SettlementProcessor — adaptador hacia el procesador externo (Visa/MC).
-	// TODO: instanciar processor.NewISO8583Processor(cfg.Settlement) cuando esté implementado.
-	// Por ahora nil — submitBatch (BatchHandler) y ResubmitBatch (AdminHandler) quedan como no-op.
-	var processor service.SettlementProcessor
+	// TODO: agregar el adaptador real cuando esté implementado.
+	processor := newProcessor(cfg.Settlement.Processor)
 
 	// ── Aplicación ─────────────────────────────────────────────────────────────
 	batchHandler := command.NewBatchHandler(
@@ -105,6 +108,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	}
 	batchHandler.SetMetrics(settlementMetrics)
 	adminHandler := command.NewAdminHandler(batchRepo, processor)
+	adminHandler.ConfigureSettlement(eventPub, cfg.Settlement.MDRPercent)
 	queryHandler := query.NewBatchQueryHandler(batchRepo)
 
 	// ── Adaptadores de entrada ─────────────────────────────────────────────────
@@ -131,7 +135,21 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		subscriber: subscriber,
 		grpcSrv:    grpcSrv,
 		httpSrv:    httpSrv,
+
+		batchHandler:   batchHandler,
+		batchCloseHour: cfg.Settlement.BatchCloseHour,
 	}, nil
+}
+
+// newProcessor selecciona el procesador externo. Sin procesador (nil), los lotes
+// quedan en CLOSED: BatchHandler y AdminHandler lo manejan como ErrProcessorUnavailable.
+func newProcessor(mode string) service.SettlementProcessor {
+	if mode == config.ProcessorMock {
+		slog.Warn("settlement processor is a mock — batches are marked SUBMITTED without being sent")
+		return stprocessor.NewMockProcessor()
+	}
+	slog.Warn("no settlement processor configured — closed batches will not be submitted")
+	return nil
 }
 
 // start arranca todos los servidores en goroutines independientes.
@@ -168,34 +186,48 @@ func (a *app) start(ctx context.Context) error {
 	return nil
 }
 
-// runBatchCloser es el job periódico que inicia el cierre de lotes a la hora configurada.
-// Revisa cada minuto si llegó la hora de cierre y no se procesó aún.
+// runBatchCloser es el job periódico de cierre automático de lotes. Revisa cada
+// minuto, y también al arrancar, para no perder la corrida si el servicio estaba
+// caído a la hora de cierre. Reintenta mientras alguna corrida del día tenga fallas.
 func (a *app) runBatchCloser(ctx context.Context) {
+	if a.batchCloseHour == 0 {
+		slog.Info("automatic batch close disabled")
+		return
+	}
+
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	var lastClosedDate string
+	var lastRunDate string
+	run := func(now time.Time) {
+		utc := now.UTC()
+		today := utc.Format("2006-01-02")
+		if utc.Hour() < a.batchCloseHour || lastRunDate == today {
+			return
+		}
 
+		closed, failed, err := a.batchHandler.CloseStaleBatches(ctx, utc)
+		if err != nil {
+			slog.Error("automatic batch close failed", slog.String("error", err.Error()))
+			return
+		}
+		slog.Info("automatic batch close finished",
+			slog.String("date", today),
+			slog.Int("closed", closed),
+			slog.Int("failed", failed),
+		)
+		if failed == 0 {
+			lastRunDate = today
+		}
+	}
+
+	run(time.Now())
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			utc := now.UTC()
-			today := utc.Format("2006-01-02")
-
-			// Solo actuar a la hora de cierre configurada y una vez por día
-			if utc.Hour() != 23 || lastClosedDate == today {
-				continue
-			}
-
-			slog.Info("batch closer job triggered", slog.String("date", today))
-			lastClosedDate = today
-
-			// El cierre real ocurre cuando el terminal envía BatchCloseRequested.
-			// Este job es solo un log/alerta para detectar terminales que no cerraron.
-			// La implementación completa consultaría los batches OPEN del día
-			// y generaría alertas para los que no se cerraron manualmente.
+			run(now)
 		}
 	}
 }

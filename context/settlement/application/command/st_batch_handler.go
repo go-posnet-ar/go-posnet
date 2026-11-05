@@ -3,10 +3,12 @@ package command
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/juantevez/go-posnet/context/settlement/application/port"
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
@@ -258,13 +260,115 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 	return h.submitBatch(ctx, batch)
 }
 
+// CloseStaleBatches cierra los batches OPEN de días UTC anteriores a now, para los
+// que el terminal nunca pidió el cierre. No toca el lote del día: cerrarlo dejaría
+// afuera las ventas posteriores. Un error en un batch no frena a los demás.
+func (h *BatchHandler) CloseStaleBatches(ctx context.Context, now time.Time) (closed, failed int, err error) {
+	ctx, span := observability.StartSpan(ctx, "command.CloseStaleBatches")
+	defer span.End()
+
+	utc := now.UTC()
+	ids, err := h.batchRepo.FindStaleOpenIDs(ctx, utc)
+	if err != nil {
+		return 0, 0, fmt.Errorf("CloseStaleBatches: find batches: %w", err)
+	}
+
+	runDate := utc.Format("2006-01-02")
+	for _, id := range ids {
+		wasClosed, err := h.autoCloseBatch(ctx, id, runDate)
+		if err != nil {
+			failed++
+			observability.RecordError(ctx, err)
+			observability.FromContext(ctx).Error("automatic batch close failed",
+				slog.String("batch_id", id),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		if wasClosed {
+			closed++
+		}
+	}
+	return closed, failed, nil
+}
+
+// autoCloseBatch cierra un batch con los totales del backend. El evento sintético,
+// determinístico por batch y día, evita que dos instancias cierren el mismo batch;
+// incluir el día permite cerrar en la siguiente corrida un batch reabierto.
+func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate string) (bool, error) {
+	closeStart := time.Now()
+	log := observability.FromContext(ctx).With(slog.String("batch_id", batchID))
+
+	batch, err := h.batchRepo.FindByID(ctx, batchID)
+	if err != nil {
+		return false, fmt.Errorf("find batch: %w", err)
+	}
+	if batch == nil || batch.State() != valueobject.BatchStateOpen {
+		return false, nil
+	}
+	if err := batch.CloseWithBackendTotals(); err != nil {
+		return false, fmt.Errorf("close batch: %w", err)
+	}
+
+	eventID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("settlement-auto-close:"+batchID+":"+runDate)).String()
+	processed := false
+	err = pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
+		inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, eventID)
+		if err != nil {
+			return err
+		}
+		if !inserted {
+			return nil
+		}
+		processed = true
+		return h.batchRepo.Save(ctx, batch)
+	})
+	if err != nil {
+		return false, fmt.Errorf("persist batch: %w", err)
+	}
+	if !processed {
+		return false, nil
+	}
+	h.metrics.RecordBatchClosed(ctx, batch.Currency(), batch.State().String(), time.Since(closeStart))
+	log.Warn("batch closed automatically without terminal totals",
+		slog.String("batch_date", batch.BatchDate().Format("2006-01-02")),
+		slog.Int("tx_count", len(batch.Transactions())),
+	)
+
+	// Un lote vacío (lo crea una reversa de otra fecha) no tiene nada que informar ni enviar.
+	if len(batch.Transactions()) == 0 {
+		return true, nil
+	}
+
+	if err := h.publisher.PublishBatchClosed(ctx, batch); err != nil {
+		log.Error("failed to publish BatchClosed", slog.String("error", err.Error()))
+	}
+	// El lote ya quedó CLOSED: si el envío falla, se reintenta con ResubmitBatch.
+	if err := h.submitBatch(ctx, batch); err != nil {
+		log.Error("automatic batch submit failed", slog.String("error", err.Error()))
+	}
+	return true, nil
+}
+
 // submitBatch envía la remesa al procesador externo y, si acepta el envío,
 // transiciona el batch a SUBMITTED y persiste el cambio.
+//
+// Sin procesador configurado no es un error del mensaje: reintentarlo no cambia
+// nada, así que el batch queda en CLOSED para un reenvío manual (ResubmitBatch).
 func (h *BatchHandler) submitBatch(ctx context.Context, batch *aggregate.SettlementBatch) error {
-	confirmationID, err := h.processor.Submit(ctx, batch)
+	confirmationID, err := submitToProcessor(ctx, h.processor, batch)
+	if errors.Is(err, service.ErrProcessorUnavailable) {
+		h.metrics.RecordSubmission(ctx, submissionUnavailable)
+		observability.FromContext(ctx).Warn("no settlement processor configured — batch remains CLOSED",
+			slog.String("batch_id", batch.ID()),
+		)
+		return nil
+	}
 	if err != nil {
+		h.metrics.RecordSubmission(ctx, submissionError)
 		return fmt.Errorf("submitBatch: processor submit: %w", err)
 	}
+	h.metrics.RecordSubmission(ctx, submissionSubmitted)
 
 	if err := batch.Submit(); err != nil {
 		return fmt.Errorf("submitBatch: %w", err)
@@ -278,4 +382,14 @@ func (h *BatchHandler) submitBatch(ctx context.Context, batch *aggregate.Settlem
 		slog.String("confirmation_id", confirmationID),
 	)
 	return nil
+}
+
+// submitToProcessor envía el batch, o devuelve ErrProcessorUnavailable si no hay
+// procesador configurado. Evita un nil pointer: en un handler de NATS, un panic
+// no se recupera y termina el proceso.
+func submitToProcessor(ctx context.Context, p service.SettlementProcessor, batch *aggregate.SettlementBatch) (string, error) {
+	if p == nil {
+		return "", service.ErrProcessorUnavailable
+	}
+	return p.Submit(ctx, batch)
 }

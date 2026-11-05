@@ -46,6 +46,10 @@ func (f *fakeBatchRepo) ListByMerchantDate(context.Context, domain.MerchantID, t
 	return f.listResult, f.listErr
 }
 
+func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, error) {
+	return nil, nil
+}
+
 // panickyBatchRepo simula un bug en la capa de aplicación para probar que
 // recoverMiddleware efectivamente protege al proceso HTTP.
 type panickyBatchRepo struct{}
@@ -67,6 +71,10 @@ func (p *panickyBatchRepo) FindOrCreateOpen(context.Context, domain.TerminalID, 
 }
 
 func (p *panickyBatchRepo) ListByMerchantDate(context.Context, domain.MerchantID, time.Time) ([]*aggregate.SettlementBatch, error) {
+	return nil, nil
+}
+
+func (p *panickyBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, error) {
 	return nil, nil
 }
 

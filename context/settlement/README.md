@@ -96,7 +96,8 @@ config/
 | `POSTGRES_DSN` | — | Cadena de conexión PostgreSQL |
 | `NATS_URL` | — | URL NATS JetStream |
 | `SETTLEMENT_MDR_PERCENT` | `2.5` | Porcentaje de comisión por defecto |
-| `SETTLEMENT_BATCH_CLOSE_HOUR` | `23` | Hora UTC de cierre automático |
+| `SETTLEMENT_BATCH_CLOSE_HOUR` | `3` | Hora UTC del cierre automático (00:00 en Argentina); `0` lo desactiva |
+| `SETTLEMENT_PROCESSOR` | `none` | Procesador externo: `none` o `mock` |
 | `SETTLEMENT_SUBMIT_RETRIES` | `3` | Reintentos de envío al procesador |
 | `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | Timeout de envío |
 

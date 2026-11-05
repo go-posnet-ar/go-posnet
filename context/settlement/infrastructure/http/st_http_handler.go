@@ -9,6 +9,7 @@ import (
 	"github.com/juantevez/go-posnet/context/settlement/application/command"
 	"github.com/juantevez/go-posnet/context/settlement/application/port"
 	"github.com/juantevez/go-posnet/context/settlement/application/query"
+	"github.com/juantevez/go-posnet/context/settlement/domain/service"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
 	"github.com/juantevez/go-posnet/pkg/observability"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
@@ -37,6 +38,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET  /merchants/{merchant_id}/batches", h.handleListBatches)
 	mux.HandleFunc("POST /batches/{id}/force-close", h.handleForceClose)
 	mux.HandleFunc("POST /batches/{id}/resubmit", h.handleResubmitBatch)
+	mux.HandleFunc("POST /batches/{id}/reopen", h.handleReopenBatch)
+	mux.HandleFunc("POST /batches/{id}/resolve-dispute", h.handleResolveDispute)
+	mux.HandleFunc("POST /batches/{id}/settle", h.handleSettleBatch)
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -161,11 +165,99 @@ func (h *Handler) handleResubmitBatch(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, errResp("VALIDATION_ERROR", err.Error()))
 			return
 		}
+		if errors.Is(err, service.ErrProcessorUnavailable) {
+			writeJSON(w, http.StatusServiceUnavailable,
+				errResp("PROCESSOR_UNAVAILABLE", "no settlement processor configured; batch remains CLOSED"))
+			return
+		}
 		observability.RecordError(ctx, err)
 		writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", "internal error"))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "submitted"})
+}
+
+// disputeRequest es el body de las operaciones que resuelven una disputa.
+type disputeRequest struct {
+	OperatorID string `json:"operator_id"`
+	Reason     string `json:"reason"`
+}
+
+// POST /batches/{id}/reopen
+func (h *Handler) handleReopenBatch(w http.ResponseWriter, r *http.Request) {
+	ctx, span := observability.StartSpan(r.Context(), "http.ReopenBatch")
+	defer span.End()
+
+	var body disputeRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("INVALID_BODY", "invalid request body"))
+		return
+	}
+
+	err := h.adminHandler.ReopenBatch(ctx, port.ReopenBatchCommand{
+		BatchID:    r.PathValue("id"),
+		OperatorID: body.OperatorID,
+		Reason:     body.Reason,
+	})
+	h.writeAdminResult(w, r, err, "reopened")
+}
+
+// POST /batches/{id}/resolve-dispute
+func (h *Handler) handleResolveDispute(w http.ResponseWriter, r *http.Request) {
+	ctx, span := observability.StartSpan(r.Context(), "http.ResolveDispute")
+	defer span.End()
+
+	var body disputeRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("INVALID_BODY", "invalid request body"))
+		return
+	}
+
+	err := h.adminHandler.ResolveDispute(ctx, port.ResolveDisputeCommand{
+		BatchID:    r.PathValue("id"),
+		OperatorID: body.OperatorID,
+		Reason:     body.Reason,
+	})
+	h.writeAdminResult(w, r, err, "closed")
+}
+
+// POST /batches/{id}/settle
+func (h *Handler) handleSettleBatch(w http.ResponseWriter, r *http.Request) {
+	ctx, span := observability.StartSpan(r.Context(), "http.SettleBatch")
+	defer span.End()
+
+	var body struct {
+		OperatorID string `json:"operator_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("INVALID_BODY", "invalid request body"))
+		return
+	}
+
+	err := h.adminHandler.SettleBatch(ctx, port.SettleBatchCommand{
+		BatchID:    r.PathValue("id"),
+		OperatorID: body.OperatorID,
+	})
+	h.writeAdminResult(w, r, err, "settled")
+}
+
+func (h *Handler) writeAdminResult(w http.ResponseWriter, r *http.Request, err error, status string) {
+	if err == nil {
+		writeJSON(w, http.StatusOK, map[string]string{"status": status})
+		return
+	}
+	var notFound *pkgerrors.NotFoundError
+	if errors.As(err, &notFound) {
+		writeJSON(w, http.StatusNotFound, errResp("NOT_FOUND", "batch not found"))
+		return
+	}
+	var validationErr *pkgerrors.ValidationError
+	if errors.As(err, &validationErr) {
+		writeJSON(w, http.StatusBadRequest, errResp("VALIDATION_ERROR", err.Error()))
+		return
+	}
+	observability.RecordError(r.Context(), err)
+	writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", "internal error"))
 }
 
 func writeJSON(w http.ResponseWriter, code int, body any) {

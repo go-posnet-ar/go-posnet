@@ -17,7 +17,7 @@ var optionalEnvKeys = []string{
 	"NATS_NKEY_PATH", "NATS_TLS_CERT", "NATS_TLS_KEY", "NATS_TLS_CA",
 	"OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION", "OTEL_EXPORTER_OTLP_ENDPOINT", "ENVIRONMENT",
 	"SETTLEMENT_MDR_PERCENT", "SETTLEMENT_BATCH_CLOSE_HOUR",
-	"SETTLEMENT_SUBMIT_RETRIES", "SETTLEMENT_SUBMIT_TIMEOUT",
+	"SETTLEMENT_SUBMIT_RETRIES", "SETTLEMENT_SUBMIT_TIMEOUT", "SETTLEMENT_PROCESSOR",
 }
 
 func clearOptionalEnv(t *testing.T) {
@@ -309,14 +309,38 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.Settlement.MDRPercent != 2.5 {
 		t.Errorf("Settlement.MDRPercent = %v, want 2.5", cfg.Settlement.MDRPercent)
 	}
-	if cfg.Settlement.BatchCloseHour != 23 {
-		t.Errorf("Settlement.BatchCloseHour = %d, want 23", cfg.Settlement.BatchCloseHour)
+	if cfg.Settlement.BatchCloseHour != 3 {
+		t.Errorf("Settlement.BatchCloseHour = %d, want 3", cfg.Settlement.BatchCloseHour)
 	}
 	if cfg.Settlement.SubmitRetries != 3 {
 		t.Errorf("Settlement.SubmitRetries = %d, want 3", cfg.Settlement.SubmitRetries)
 	}
 	if cfg.Settlement.SubmitTimeout != 30*time.Second {
 		t.Errorf("Settlement.SubmitTimeout = %v, want 30s", cfg.Settlement.SubmitTimeout)
+	}
+	if cfg.Settlement.Processor != ProcessorNone {
+		t.Errorf("Settlement.Processor = %q, want %q", cfg.Settlement.Processor, ProcessorNone)
+	}
+}
+
+func TestValidate_Processor(t *testing.T) {
+	tests := []struct {
+		processor string
+		wantErr   bool
+	}{
+		{ProcessorNone, false},
+		{ProcessorMock, false},
+		{"visa", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.processor, func(t *testing.T) {
+			c := &Config{Settlement: SettlementConfig{MDRPercent: 2.5, BatchCloseHour: 23, Processor: tc.processor}}
+			err := c.validate()
+			if (err != nil) != tc.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
 	}
 }
 

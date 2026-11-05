@@ -18,7 +18,7 @@ func TestBatchState_IsTerminal(t *testing.T) {
 		{valueobject.BatchStateClosed, false},
 		{valueobject.BatchStateSubmitted, false},
 		{valueobject.BatchStateSettled, true},
-		{valueobject.BatchStateDisputed, true},
+		{valueobject.BatchStateDisputed, false},
 	}
 
 	for _, tc := range tests {
@@ -52,6 +52,8 @@ var allowedTransitions = map[valueobject.BatchState]map[valueobject.BatchState]b
 	},
 	valueobject.BatchStateDisputed: {
 		valueobject.BatchStateSubmitted: true,
+		valueobject.BatchStateOpen:      true,
+		valueobject.BatchStateClosed:    true,
 	},
 	valueobject.BatchStateSettled: {},
 }

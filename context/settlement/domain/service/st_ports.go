@@ -3,9 +3,14 @@ package service
 
 import (
 	"context"
+	"errors"
 
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
 )
+
+// ErrProcessorUnavailable indica que no hay un procesador externo configurado.
+// El lote no se envió y permanece en CLOSED hasta que un operador lo reenvíe.
+var ErrProcessorUnavailable = errors.New("settlement processor unavailable")
 
 // EventPublisher es el puerto de salida hacia NATS JetStream.
 type EventPublisher interface {

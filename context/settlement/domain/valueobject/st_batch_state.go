@@ -16,9 +16,10 @@ const (
 	BatchStateDisputed     BatchState = "DISPUTED"      // En disputa — discrepancias detectadas
 )
 
-// IsTerminal indica si el estado es final.
+// IsTerminal indica si el estado es final. DISPUTED no lo es: un operador puede
+// reabrir el lote o aceptar los totales del backend (ver AdminHandler).
 func (s BatchState) IsTerminal() bool {
-	return s == BatchStateSettled || s == BatchStateDisputed
+	return s == BatchStateSettled
 }
 
 // CanTransitionTo valida si la transición al nuevo estado es válida.
@@ -28,7 +29,7 @@ func (s BatchState) CanTransitionTo(next BatchState) bool {
 		BatchStatePendingClose: {BatchStateClosed, BatchStateDisputed},
 		BatchStateClosed:       {BatchStateSubmitted, BatchStateDisputed}, // Close() detecta discrepancias y marca disputa de inmediato
 		BatchStateSubmitted:    {BatchStateSettled, BatchStateDisputed},
-		BatchStateDisputed:     {BatchStateSubmitted}, // puede resubmitearse tras resolver
+		BatchStateDisputed:     {BatchStateSubmitted, BatchStateOpen, BatchStateClosed}, // Reopen / ResolveDispute
 	}
 	for _, a := range allowed[s] {
 		if a == next {

@@ -47,6 +47,10 @@ func (f *fakeBatchRepo) ListByMerchantDate(_ context.Context, merchantID domain.
 	return f.listResult, f.listErr
 }
 
+func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, error) {
+	return nil, nil
+}
+
 // ─── builders ────────────────────────────────────────────────────────────────
 
 func newBatch(t *testing.T) *aggregate.SettlementBatch {
