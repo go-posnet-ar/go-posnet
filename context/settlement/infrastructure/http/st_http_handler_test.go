@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -104,7 +105,7 @@ func TestHandleGetBatch_NotFound(t *testing.T) {
 	repo := &fakeBatchRepo{findByIDResult: nil}
 	mux := newTestMux(newTestHandler(repo, &fakePool{}))
 
-	req := httptest.NewRequest(http.MethodGet, "/batches/batch-999", nil)
+	req := httptest.NewRequest(http.MethodGet, "/batches/22222222-2222-4222-8222-222222222222", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -121,7 +122,7 @@ func TestHandleGetBatch_InternalError(t *testing.T) {
 	repo := &fakeBatchRepo{findByIDErr: errors.New("db unreachable")}
 	mux := newTestMux(newTestHandler(repo, &fakePool{}))
 
-	req := httptest.NewRequest(http.MethodGet, "/batches/batch-1", nil)
+	req := httptest.NewRequest(http.MethodGet, "/batches/11111111-1111-4111-8111-111111111111", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -207,7 +208,7 @@ func TestHandleForceClose_Success(t *testing.T) {
 func TestHandleForceClose_InvalidBody(t *testing.T) {
 	mux := newTestMux(newTestHandler(&fakeBatchRepo{}, &fakePool{}))
 
-	req := httptest.NewRequest(http.MethodPost, "/batches/batch-1/force-close", strings.NewReader(`not-json`))
+	req := httptest.NewRequest(http.MethodPost, "/batches/11111111-1111-4111-8111-111111111111/force-close", strings.NewReader(`not-json`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -224,7 +225,7 @@ func TestHandleForceClose_NotFound(t *testing.T) {
 	repo := &fakeBatchRepo{findByIDResult: nil}
 	mux := newTestMux(newTestHandler(repo, &fakePool{}))
 
-	req := httptest.NewRequest(http.MethodPost, "/batches/batch-999/force-close",
+	req := httptest.NewRequest(http.MethodPost, "/batches/22222222-2222-4222-8222-222222222222/force-close",
 		strings.NewReader(`{"operator_id":"op-1"}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -238,7 +239,7 @@ func TestHandleForceClose_ValidationError(t *testing.T) {
 	mux := newTestMux(newTestHandler(&fakeBatchRepo{}, &fakePool{}))
 
 	// operator_id vacío — el path {id} sigue teniendo un valor no vacío.
-	req := httptest.NewRequest(http.MethodPost, "/batches/batch-1/force-close", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/batches/11111111-1111-4111-8111-111111111111/force-close", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -255,7 +256,7 @@ func TestHandleForceClose_InternalError(t *testing.T) {
 	repo := &fakeBatchRepo{findByIDErr: errors.New("db unreachable")}
 	mux := newTestMux(newTestHandler(repo, &fakePool{}))
 
-	req := httptest.NewRequest(http.MethodPost, "/batches/batch-1/force-close",
+	req := httptest.NewRequest(http.MethodPost, "/batches/11111111-1111-4111-8111-111111111111/force-close",
 		strings.NewReader(`{"operator_id":"op-1"}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -289,7 +290,7 @@ func TestHandleResubmitBatch_Success(t *testing.T) {
 func TestHandleResubmitBatch_InvalidBody(t *testing.T) {
 	mux := newTestMux(newTestHandler(&fakeBatchRepo{}, &fakePool{}))
 
-	req := httptest.NewRequest(http.MethodPost, "/batches/batch-1/resubmit", strings.NewReader(`not-json`))
+	req := httptest.NewRequest(http.MethodPost, "/batches/11111111-1111-4111-8111-111111111111/resubmit", strings.NewReader(`not-json`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -306,7 +307,7 @@ func TestHandleResubmitBatch_NotFound(t *testing.T) {
 	repo := &fakeBatchRepo{findByIDResult: nil}
 	mux := newTestMux(newTestHandler(repo, &fakePool{}))
 
-	req := httptest.NewRequest(http.MethodPost, "/batches/batch-999/resubmit",
+	req := httptest.NewRequest(http.MethodPost, "/batches/22222222-2222-4222-8222-222222222222/resubmit",
 		strings.NewReader(`{"operator_id":"op-1"}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -320,7 +321,7 @@ func TestHandleResubmitBatch_ValidationError(t *testing.T) {
 	mux := newTestMux(newTestHandler(&fakeBatchRepo{}, &fakePool{}))
 
 	// operator_id vacío — el path {id} sigue teniendo un valor no vacío.
-	req := httptest.NewRequest(http.MethodPost, "/batches/batch-1/resubmit", strings.NewReader(`{}`))
+	req := httptest.NewRequest(http.MethodPost, "/batches/11111111-1111-4111-8111-111111111111/resubmit", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -337,7 +338,7 @@ func TestHandleResubmitBatch_InternalError(t *testing.T) {
 	repo := &fakeBatchRepo{findByIDErr: errors.New("db unreachable")}
 	mux := newTestMux(newTestHandler(repo, &fakePool{}))
 
-	req := httptest.NewRequest(http.MethodPost, "/batches/batch-1/resubmit",
+	req := httptest.NewRequest(http.MethodPost, "/batches/11111111-1111-4111-8111-111111111111/resubmit",
 		strings.NewReader(`{"operator_id":"op-1"}`))
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -373,14 +374,14 @@ func TestHandleDisputeRoutes(t *testing.T) {
 	const validBody = `{"operator_id":"op-1","reason":"conciliado"}`
 	newDisputed := func() *aggregate.SettlementBatch {
 		return aggregate.Reconstitute(aggregate.ReconstituteParams{
-			ID: "batch-1", TerminalID: domain.NewTerminalID(), MerchantID: domain.NewMerchantID(),
+			ID: "11111111-1111-4111-8111-111111111111", TerminalID: domain.NewTerminalID(), MerchantID: domain.NewMerchantID(),
 			State: valueobject.BatchStateDisputed, Currency: "ARS",
 		})
 	}
 
 	routes := []struct{ path, wantStatus string }{
-		{"/batches/batch-1/reopen", "reopened"},
-		{"/batches/batch-1/resolve-dispute", "closed"},
+		{"/batches/11111111-1111-4111-8111-111111111111/reopen", "reopened"},
+		{"/batches/11111111-1111-4111-8111-111111111111/resolve-dispute", "closed"},
 	}
 
 	for _, rt := range routes {
@@ -462,7 +463,7 @@ func TestHandleSettleBatch(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mux := newTestMux(newTestHandler(tc.repo, &fakePool{}))
 			rec := httptest.NewRecorder()
-			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/batches/batch-1/settle", strings.NewReader(tc.body)))
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/batches/11111111-1111-4111-8111-111111111111/settle", strings.NewReader(tc.body)))
 			if rec.Code != tc.wantCode {
 				t.Fatalf("status = %d, want %d, body = %s", rec.Code, tc.wantCode, rec.Body.String())
 			}
@@ -498,9 +499,9 @@ func TestAdminRoutes_StaleBatchReturnsConflict(t *testing.T) {
 		path  string
 		batch *aggregate.SettlementBatch
 	}{
-		{"/batches/b/force-close", newBatch(t)},
-		{"/batches/b/resubmit", newClosedBatch(t)},
-		{"/batches/b/settle", newSubmitted()},
+		{"/batches/11111111-1111-4111-8111-111111111111/force-close", newBatch(t)},
+		{"/batches/11111111-1111-4111-8111-111111111111/resubmit", newClosedBatch(t)},
+		{"/batches/11111111-1111-4111-8111-111111111111/settle", newSubmitted()},
 	}
 	for _, tc := range tests {
 		t.Run(tc.path, func(t *testing.T) {
@@ -512,5 +513,60 @@ func TestAdminRoutes_StaleBatchReturnsConflict(t *testing.T) {
 				t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusConflict, rec.Body.String())
 			}
 		})
+	}
+}
+
+// ─── IDs inválidos y errores de estado ────────────────────────────────────────
+
+func TestRoutes_InvalidBatchIDReturnsBadRequest(t *testing.T) {
+	routes := []struct{ method, suffix string }{
+		{http.MethodGet, ""},
+		{http.MethodPost, "/force-close"},
+		{http.MethodPost, "/resubmit"},
+		{http.MethodPost, "/reopen"},
+		{http.MethodPost, "/resolve-dispute"},
+		{http.MethodPost, "/settle"},
+	}
+	ids := []string{
+		"no-es-un-uuid",
+		"123",
+		"11111111-1111-4111-8111-11111111111", // falta un carácter
+		"11111111111141118111111111111111",    // sin guiones
+		"urn:uuid:11111111-1111-4111-8111-111111111111",
+		"{11111111-1111-4111-8111-111111111111}",
+	}
+
+	for _, rt := range routes {
+		for _, id := range ids {
+			t.Run(rt.method+rt.suffix+"/"+id, func(t *testing.T) {
+				// Un repositorio que panickea prueba que el pedido no llega a la base.
+				h := NewHandler(query.NewBatchQueryHandler(&panickyBatchRepo{}), command.NewAdminHandler(&panickyBatchRepo{}, nil), &fakePool{})
+				rec := httptest.NewRecorder()
+				newTestMux(h).ServeHTTP(rec, httptest.NewRequest(rt.method, "/batches/"+url.PathEscape(id)+rt.suffix,
+					strings.NewReader(`{"operator_id":"op-1","reason":"r"}`)))
+				if rec.Code != http.StatusBadRequest {
+					t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+				}
+				if got := decodeJSON(t, rec.Body.Bytes())["error"]; got != "INVALID_ID" {
+					t.Errorf("body[error] = %v, want INVALID_ID", got)
+				}
+			})
+		}
+	}
+}
+
+func TestHandleForceClose_WrongStateReturnsBadRequest(t *testing.T) {
+	repo := &fakeBatchRepo{findByIDResult: newClosedBatch(t)}
+	mux := newTestMux(newTestHandler(repo, &fakePool{}))
+
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/batches/11111111-1111-4111-8111-111111111111/force-close",
+		strings.NewReader(`{"operator_id":"op-1"}`)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	if got := decodeJSON(t, rec.Body.Bytes())["error"]; got != "VALIDATION_ERROR" {
+		t.Errorf("body[error] = %v, want VALIDATION_ERROR", got)
 	}
 }

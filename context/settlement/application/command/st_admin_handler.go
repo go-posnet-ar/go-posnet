@@ -20,7 +20,7 @@ import (
 type AdminHandler struct {
 	batchRepo  repository.SettlementBatchRepository
 	processor  service.SettlementProcessor
-	publisher  service.EventPublisher // opcional; nil = no publica SettlementCompleted
+	publisher  service.EventPublisher // opcional; nil = no publica eventos
 	mdrPercent float64
 }
 
@@ -28,14 +28,16 @@ func NewAdminHandler(batchRepo repository.SettlementBatchRepository, processor s
 	return &AdminHandler{batchRepo: batchRepo, processor: processor}
 }
 
-// ConfigureSettlement inyecta lo necesario para publicar SettlementCompleted
-// (desde el wiring).
+// ConfigureSettlement inyecta lo necesario para publicar BatchClosed y
+// SettlementCompleted (desde el wiring).
 func (h *AdminHandler) ConfigureSettlement(publisher service.EventPublisher, mdrPercent float64) {
 	h.publisher = publisher
 	h.mdrPercent = mdrPercent
 }
 
-// ForceClose fuerza el cierre de un batch desde operaciones de soporte.
+// ForceClose fuerza el cierre de un batch desde operaciones de soporte, con los
+// totales del backend: no hay totales del terminal contra los que conciliar. No envía
+// el batch al procesador: queda en CLOSED, listo para ResubmitBatch.
 func (h *AdminHandler) ForceClose(ctx context.Context, cmd port.ForceCloseCommand) error {
 	ctx, span := observability.StartSpan(ctx, "command.ForceClose")
 	defer span.End()
@@ -55,15 +57,33 @@ func (h *AdminHandler) ForceClose(ctx context.Context, cmd port.ForceCloseComman
 		return pkgerrors.NewNotFoundError("SettlementBatch", cmd.BatchID)
 	}
 
-	if err := batch.RequestClose(); err != nil {
-		return fmt.Errorf("ForceClose: request close: %w", err)
+	if batch.State() != valueobject.BatchStateOpen {
+		return pkgerrors.NewValidationError(
+			fmt.Sprintf("batch must be OPEN to force-close, current state is %s", batch.State()),
+		)
 	}
-	// Force close con totales del backend (0 del terminal — operación manual)
-	if err := batch.Close(0, 0); err != nil {
+	if err := batch.CloseWithBackendTotals(); err != nil {
 		return fmt.Errorf("ForceClose: close: %w", err)
 	}
+	if err := h.batchRepo.Save(ctx, batch); err != nil {
+		return fmt.Errorf("ForceClose: save: %w", err)
+	}
 
-	return h.batchRepo.Save(ctx, batch)
+	log := observability.FromContext(ctx).With(slog.String("batch_id", batch.ID()))
+	log.Warn("batch force-closed by operator",
+		slog.String("operator_id", cmd.OperatorID),
+		slog.Int("tx_count", len(batch.Transactions())),
+		slog.Int64("total_amount", batch.Summary().TotalAmount().Cents()),
+	)
+
+	// Un lote vacío no tiene nada que informar, igual que en el cierre automático.
+	if h.publisher != nil && len(batch.Transactions()) > 0 {
+		// El cierre ya está guardado: si esto falla, se registra y no se revierte.
+		if err := h.publisher.PublishBatchClosed(ctx, batch); err != nil {
+			log.Error("failed to publish BatchClosed", slog.String("error", err.Error()))
+		}
+	}
+	return nil
 }
 
 // ResubmitBatch reintenta el envío al procesador externo de un batch que quedó

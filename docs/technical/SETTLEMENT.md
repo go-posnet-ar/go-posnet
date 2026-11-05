@@ -30,7 +30,8 @@ lotes.
 | Publicación de `batch-closed` y `settlement.completed` | Implementado | Directa a NATS, sin outbox. Nadie consume `settlement.completed` |
 | Consulta de lotes | Implementado | HTTP, sin autenticación |
 | Envío al procesador | **Simulado** | `none` no envía; `mock` acepta sin enviar nada |
-| Cierre forzado por soporte | **Parcial** | Registra discrepancias falsas y no publica eventos |
+| Cierre forzado por soporte | Implementado | Con los totales del backend, sin conciliación |
+| Autenticación de escrituras | Implementado | Un token compartido; las lecturas siguen abiertas |
 | Archivo de remesa | **Pendiente** | Requiere la especificación del procesador |
 
 Las consecuencias de estos pendientes están en [§11](#11-brechas-conocidas).
@@ -301,8 +302,12 @@ administración responden `409`, y hay que repetirlas.
 
 ## 6. API HTTP
 
-Puerto `HTTP_PORT`: 8083 por defecto en el código y **8084 en Docker Compose**. **No hay autenticación**,
-ni siquiera en las operaciones de escritura.
+Puerto `HTTP_PORT`: 8083 por defecto en el código y **8084 en Docker Compose**.
+
+**Las escrituras exigen un token,** enviado como `Authorization: Bearer <SETTLEMENT_ADMIN_API_KEY>`. Sin token
+o con uno incorrecto, responden `401`. **Sin clave configurada, responden `503`** con `ADMIN_API_DISABLED`: las
+escrituras quedan deshabilitadas, no abiertas. La regla aplica a todo lo que no sea `GET` o `HEAD`, así que una
+ruta nueva queda protegida por defecto. Las lecturas, `/metrics` y los health checks no piden token.
 
 | Método y ruta | Uso | Éxito | Errores |
 |---|---|---|---|
@@ -317,7 +322,7 @@ ni siquiera en las operaciones de escritura.
 | `POST /batches/{id}/resolve-dispute` | Aceptar los totales del backend | `200` | `400`, `404`, `409`, `500` |
 | `POST /batches/{id}/settle` | Confirmar la liquidación | `200` | `400`, `404`, `409`, `500` |
 
-Un ID que no sea un UUID responde `500`, no `400`. Los errores tienen la forma
+Todas las escrituras pueden responder además `401` o `503`, como se explicó arriba. Un `{id}` que no sea un UUID responde `400` con `INVALID_ID`. Los errores tienen la forma
 `{"error": "CODIGO", "message": "..."}`.
 
 ### Consultar un lote
@@ -353,14 +358,16 @@ pero sin completar `SubmittedAt` ni `SettledAt`. Puede haber varios lotes de un 
 { "operator_id": "soporte-juan" }
 ```
 
-Responde `{"status": "closed"}`. Tiene varias limitaciones:
+Responde `{"status": "closed"}`. El lote queda en `CLOSED` con los **totales del backend**, sin discrepancias y
+**sin conciliar**, porque no hay totales del terminal. Después:
 
-- Solo funciona sobre lotes `OPEN`. En cualquier otro estado responde `500`, no `400`.
-- Cierra comparando contra 0, por lo que **cualquier lote con transacciones queda con discrepancias
-  falsas**, aunque su estado sea `CLOSED`.
-- No publica `batch-closed` ni intenta el envío. Por las discrepancias falsas, el lote pasa a `DISPUTED`
-  en el primer `resubmit`, y sale con `resolve-dispute`.
-- `operator_id` es obligatorio, pero **no se guarda ni se registra en ningún log**.
+- Publica `batch-closed`, salvo que el lote esté vacío. Si falla, queda en el log y el cierre se mantiene.
+- No envía el lote: hay que usar `resubmit`.
+- Registra `operator_id` en los logs, en nivel `WARN`.
+
+Solo funciona sobre lotes `OPEN`: en cualquier otro estado responde `400`. Los lotes cerrados así
+antes de esta corrección conservan sus discrepancias falsas: en el primer `resubmit` pasan a `DISPUTED`, y
+salen con `resolve-dispute`.
 
 ### Enviar al procesador
 
@@ -458,10 +465,14 @@ hace nada, `migrations/settlement/` está vacío y
 | `batch_transactions` | Transacciones del lote | PK `id`; único `(transaction_id, tx_type)`; FK `batch_id` |
 | `processed_events` | Idempotencia | PK `event_id` |
 
-Diferencia entre ambos archivos: `st_schema.sql` define tres índices
-(`idx_settlement_batches_merchant_date`, `idx_settlement_batches_state` e `idx_batch_transactions_batch`)
-que `01-init.sql` no crea. **`loadTransactions` recorre `batch_transactions` por `batch_id` en cada
-aprobación, sin índice.**
+| Índice | Para qué sirve |
+|---|---|
+| `idx_batch_transactions_batch` | Cargar las transacciones de un lote, en cada venta |
+| `idx_settlement_batches_merchant_date` | Listar los lotes de un comercio y comprobar la liquidación diaria |
+| `idx_settlement_batches_state` | Buscar lotes pendientes, como en el cierre automático |
+
+Con 2.000 lotes y 400.000 transacciones, cargar un lote pasó de recorrer toda la tabla en 97 ms a usar el
+índice en 7 ms, en una medición puntual.
 
 ### Aplicar la migración
 
@@ -470,10 +481,15 @@ solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
 
 ```bash
 psql "$POSTGRES_DSN" -f migrations/settlement/000001_batch_integrity.up.sql
+psql "$POSTGRES_DSN" -f migrations/settlement/000002_batch_indexes.up.sql
 ```
 
-Es idempotente y no toca los datos. Se probó sobre una base con el schema anterior: el resultado coincide
-con el de una base nueva.
+Ambas son idempotentes y no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
+coincide con el de una base nueva.
+
+`000002` crea los índices con `CONCURRENTLY`, sin bloquear las escrituras, y por eso no puede correr dentro de
+una transacción: no usar `psql -1`. Si se interrumpe, puede dejar un índice inválido: hay que borrarlo y volver
+a ejecutarla. Se puede aplicar después del despliegue, porque el servicio no depende de ella para funcionar.
 
 `000001_batch_integrity.down.sql` la revierte, pero **falla sin cambiar nada** si ya hay varios lotes por
 terminal y fecha o filas `REVERSAL`, porque el schema anterior no los admite. Resolver esos datos es una
@@ -541,6 +557,7 @@ conciliar, y `no settlement processor configured` los lotes que quedaron sin env
 | `SETTLEMENT_BATCH_CLOSE_HOUR` | `3` | Sí; hora UTC del cierre automático, y `0` lo desactiva. Fuera de 0–23, el servicio no arranca |
 | `SETTLEMENT_PROCESSOR` | `none` | Sí; `none` o `mock`. Docker Compose usa `mock`. Con otro valor, el servicio no arranca |
 | `SETTLEMENT_BUSINESS_TIMEZONE` | `America/Argentina/Buenos_Aires` | Sí; zona IANA del día de negocio. Si es inválida, el servicio no arranca |
+| `SETTLEMENT_ADMIN_API_KEY` | Vacía | Sí; token de las escrituras. Vacía, quedan deshabilitadas. Con menos de 32 caracteres, el servicio no arranca. Generarla con `openssl rand -hex 32` |
 | `SETTLEMENT_SUBMIT_RETRIES` | `3` | **No**: no hay procesador real |
 | `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | **No**: no hay procesador real |
 | `GRPC_PORT` | `9093` | **No**: el puerto está fijo en 9093 |
@@ -585,10 +602,11 @@ curl -s localhost:8081/batch-close -H 'Content-Type: application/json' -d '{
 ```bash
 BATCH=$(curl -s "localhost:8084/merchants/$MERCHANT/batches?date=$(date -u +%F)" | jq -r '.batches[0].ID')
 OP='"operator_id":"prueba"'
+AUTH="Authorization: Bearer $SETTLEMENT_ADMIN_API_KEY"
 
-curl -s -X POST localhost:8084/batches/$BATCH/resolve-dispute -d "{$OP,\"reason\":\"prueba\"}"
-curl -s -X POST localhost:8084/batches/$BATCH/resubmit -d "{$OP}"
-curl -s -X POST localhost:8084/batches/$BATCH/settle -d "{$OP}"
+curl -s -X POST localhost:8084/batches/$BATCH/resolve-dispute -H "$AUTH" -d "{$OP,\"reason\":\"prueba\"}"
+curl -s -X POST localhost:8084/batches/$BATCH/resubmit -H "$AUTH" -d "{$OP}"
+curl -s -X POST localhost:8084/batches/$BATCH/settle -H "$AUTH" -d "{$OP}"
 ```
 
 ### Tests
@@ -630,19 +648,20 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | `settlement.completed` sin outbox | Si falla la publicación, nada la reintenta y el lote ya está `SETTLED` | `publishCompletedIfDone` |
 | Evento adicional por lotes tardíos | Un lote abierto después de la liquidación diaria genera otro evento con el total acumulado | `publishCompletedIfDone` |
 | El cierre automático no concilia | Los lotes se envían con los totales del backend, sin comparar con el terminal | `CloseStaleBatches` |
+| `force-close` no concilia | El operador asume que los totales del backend son correctos | `ForceClose` |
 | Doble envío posible | Si el procesador acepta y falla el guardado, el lote queda `CLOSED`, y `resubmit` lo enviaría otra vez | `submitBatch`, `ResubmitBatch` |
 | `resolve-dispute` no notifica | Si los totales cambian, Notification solo conoce los del primer cierre | `ResolveDispute` |
 | Auditoría solo en logs | `operator_id` y `reason` no se guardan en la base | `AdminHandler` |
 | Lotes vacíos en `CLOSED` | Los lotes vacíos que cierra el job quedan en `CLOSED` y aparecen en las consultas de lotes pendientes | `autoCloseBatch` |
 
-### Cierre forzado y seguridad
+### Seguridad
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| Operaciones sin autenticación | Con acceso de red, cualquiera puede cerrar el lote de cualquier terminal; un cierre hecho así también hace perder las aprobaciones posteriores | `st_http_router.go` |
-| `force-close` compara contra 0 | Todo lote con transacciones queda con discrepancias falsas, y debe pasar por `resolve-dispute` antes de enviarse | `ForceClose` |
-| `force-close` no registra el operador | `operator_id` es obligatorio, pero no se guarda ni se registra | `ForceClose` |
-| `force-close` no notifica | No se publica `batch-closed`, así que Notification no se entera | `ForceClose` |
+| Token único, sin identidad | `operator_id` lo declara quien llama: el log no prueba quién hizo la operación, y cualquiera con el token puede hacerlas todas | `adminAuthMiddleware` |
+| Lecturas sin autenticación | Con acceso de red, cualquiera puede consultar lotes y montos de los comercios | `adminAuthMiddleware` |
+| Sin rotación ni límite de intentos | Cambiar el token requiere reiniciar el servicio, y no hay freno a los intentos fallidos | `adminAuthMiddleware` |
+| El token viaja sin cifrar | El servicio no usa TLS: el token debe pasar por una red de confianza o un proxy con TLS | `st_wire.go` |
 
 ### Operación y datos
 
@@ -651,12 +670,11 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Sin alertas de lotes | Los lotes trabados o en disputa solo se descubren consultando la base | Prometheus |
 | Las disputas no se ven en las métricas | `state` siempre vale `CLOSED` en `posnet_settlement_batches_total` | `ProcessBatchClose` |
 | Sin alerta para lotes sin enviar | `posnet_settlement_submissions_total{result="unavailable"}` existe, pero ninguna regla la usa | Prometheus |
-| Faltan índices y hay costo creciente por aprobación | Cada evento recorre las transacciones del lote sin índice | `01-init.sql`, `Save`, `loadTransactions` |
+| Costo creciente por aprobación | Cada venta carga y reinserta todas las transacciones del lote. Los índices evitan recorrer toda la tabla, pero el costo sigue creciendo con el tamaño del lote | `Save`, `loadTransactions` |
 | `batch-closed` se publica sin outbox | Si falla, Notification no se entera y nada lo reintenta | `ProcessBatchClose` |
 | Un cierre sin lote no recibe respuesta | Terminal Gateway ya respondió `202`, y Settlement solo deja un `WARN` | `ProcessBatchClose` |
 | Sin backoff en NATS | Los errores persistentes, como una base caída, consumen las 5 entregas de inmediato. Los conflictos de versión sí tienen reintento interno | `nak` |
-| Sin migraciones reales | Los cambios de schema no se aplican a bases existentes, y `01-init.sql` y `st_schema.sql` difieren | `pkg/pgutil/migrate.go` |
+| Sin migraciones automáticas | Los cambios de schema hay que aplicarlos a mano en las bases existentes | `pkg/pgutil/migrate.go` |
 | gRPC placeholder y sin apagado ordenado | Abre un puerto que no ofrece nada y que ignora `GRPC_PORT` | `st_grpc_server.go`, `st_wire.go` |
 | `/readyz` no verifica NATS | Una instancia sin NATS sigue figurando como lista | `st_http_handler.go` |
-| Errores de estado como `500` | `force-close` sobre un lote cerrado o un ID inválido devuelven `500` en lugar de `400` | `st_http_handler.go` |
 | Código sin uso | `port.BatchService` y `port.AdminService` no se implementan; tampoco se usan `mdrPercent`, `BatchTxOffline` ni los eventos de dominio internos | `st_port_inbound.go`, `st_batch_handler.go`, `st_settlement_batch.go` |

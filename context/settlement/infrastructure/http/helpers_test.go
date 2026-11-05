@@ -117,7 +117,7 @@ func newBatch(t *testing.T) *aggregate.SettlementBatch {
 func newClosedBatch(t *testing.T) *aggregate.SettlementBatch {
 	t.Helper()
 	return aggregate.Reconstitute(aggregate.ReconstituteParams{
-		ID:         "batch-1",
+		ID:         "11111111-1111-4111-8111-111111111111",
 		TerminalID: domain.NewTerminalID(),
 		MerchantID: domain.NewMerchantID(),
 		BatchDate:  time.Now(),

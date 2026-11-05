@@ -14,6 +14,7 @@ func NewRouter(
 	queryHandler *query.BatchQueryHandler,
 	adminHandler *command.AdminHandler,
 	pool pgutil.PgxPool,
+	adminAPIKey string,
 ) http.Handler {
 	mux := http.NewServeMux()
 
@@ -22,5 +23,5 @@ func NewRouter(
 
 	mux.Handle("GET /metrics", observability.MetricsHandler())
 
-	return observability.HTTPMiddleware(recoverMiddleware(mux))
+	return observability.HTTPMiddleware(recoverMiddleware(adminAuthMiddleware(adminAPIKey, mux)))
 }

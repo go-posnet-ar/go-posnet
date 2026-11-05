@@ -44,7 +44,7 @@ CREATE INDEX idx_settlement_batches_merchant_date
 
 CREATE INDEX idx_settlement_batches_state
     ON settlement.settlement_batches(state)
-    WHERE state IN ('OPEN', 'PENDING_CLOSE', 'CLOSED', 'SUBMITTED');
+    WHERE state IN ('OPEN', 'PENDING_CLOSE', 'CLOSED', 'SUBMITTED', 'DISPUTED');
 
 -- ─── batch_transactions ───────────────────────────────────────────────────────
 

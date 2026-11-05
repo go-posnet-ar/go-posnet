@@ -57,7 +57,7 @@ func TestForceClose_NotFound(t *testing.T) {
 	}
 }
 
-func TestForceClose_RequestCloseError(t *testing.T) {
+func TestForceClose_NotOpenIsValidationError(t *testing.T) {
 	// Un batch que no está OPEN no puede transicionar a PENDING_CLOSE.
 	b := aggregate.Reconstitute(aggregate.ReconstituteParams{
 		ID:         "batch-1",
@@ -72,8 +72,12 @@ func TestForceClose_RequestCloseError(t *testing.T) {
 	h := command.NewAdminHandler(repo, &fakeProcessor{})
 
 	err := h.ForceClose(context.Background(), port.ForceCloseCommand{BatchID: "batch-1", OperatorID: "op-1"})
-	if err == nil || !strings.Contains(err.Error(), "ForceClose: request close") {
-		t.Fatalf("error = %v, want it to mention ForceClose: request close", err)
+	var ve *pkgerrors.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("error type = %T, want *pkgerrors.ValidationError", err)
+	}
+	if repo.saveCallCount != 0 {
+		t.Errorf("Save call count = %d, want 0", repo.saveCallCount)
 	}
 }
 
@@ -342,6 +346,113 @@ func TestDisputeOperations(t *testing.T) {
 	}
 }
 
+// ─── ForceClose: totales, notificación ────────────────────────────────────────
+
+func TestForceClose_UsesBackendTotalsWithoutFalseDiscrepancies(t *testing.T) {
+	b := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	if err := b.AddTransaction(domain.NewTransactionID(), 500, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	h := command.NewAdminHandler(&fakeBatchRepo{findByIDResult: b}, &fakeProcessor{})
+
+	if err := h.ForceClose(context.Background(), port.ForceCloseCommand{BatchID: b.ID(), OperatorID: "op-1"}); err != nil {
+		t.Fatalf("ForceClose() error = %v", err)
+	}
+	if b.Discrepancies() != 0 {
+		t.Errorf("Discrepancies() = %d, want 0", b.Discrepancies())
+	}
+	if got := b.Summary().TotalAmount().Cents(); got != 1500 {
+		t.Errorf("TotalAmount = %d, want 1500", got)
+	}
+}
+
+func TestForceClose_CanBeSubmittedDirectly(t *testing.T) {
+	b := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	repo := &fakeBatchRepo{findByIDResult: b}
+	h := command.NewAdminHandler(repo, &fakeProcessor{confirmationID: "c"})
+
+	if err := h.ForceClose(context.Background(), port.ForceCloseCommand{BatchID: b.ID(), OperatorID: "op-1"}); err != nil {
+		t.Fatalf("ForceClose() error = %v", err)
+	}
+	if err := h.ResubmitBatch(context.Background(), port.ResubmitBatchCommand{BatchID: b.ID(), OperatorID: "op-1"}); err != nil {
+		t.Fatalf("ResubmitBatch() error = %v", err)
+	}
+	if b.State() != valueobject.BatchStateSubmitted {
+		t.Errorf("State() = %v, want %v", b.State(), valueobject.BatchStateSubmitted)
+	}
+}
+
+func TestForceClose_PublishesBatchClosed(t *testing.T) {
+	b := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	publisher := &fakePublisher{}
+	h := command.NewAdminHandler(&fakeBatchRepo{findByIDResult: b}, &fakeProcessor{})
+	h.ConfigureSettlement(publisher, 2.5)
+
+	if err := h.ForceClose(context.Background(), port.ForceCloseCommand{BatchID: b.ID(), OperatorID: "op-1"}); err != nil {
+		t.Fatalf("ForceClose() error = %v", err)
+	}
+	if publisher.publishBatchClosedCalls != 1 {
+		t.Errorf("PublishBatchClosed calls = %d, want 1", publisher.publishBatchClosedCalls)
+	}
+}
+
+func TestForceClose_EmptyBatchDoesNotPublish(t *testing.T) {
+	b := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	publisher := &fakePublisher{}
+	h := command.NewAdminHandler(&fakeBatchRepo{findByIDResult: b}, &fakeProcessor{})
+	h.ConfigureSettlement(publisher, 2.5)
+
+	if err := h.ForceClose(context.Background(), port.ForceCloseCommand{BatchID: b.ID(), OperatorID: "op-1"}); err != nil {
+		t.Fatalf("ForceClose() error = %v", err)
+	}
+	if publisher.publishBatchClosedCalls != 0 {
+		t.Errorf("PublishBatchClosed calls = %d, want 0", publisher.publishBatchClosedCalls)
+	}
+}
+
+// El cierre ya está guardado: un fallo al publicar no lo revierte ni devuelve error.
+func TestForceClose_PublishErrorIsNonFatal(t *testing.T) {
+	b := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	h := command.NewAdminHandler(&fakeBatchRepo{findByIDResult: b}, &fakeProcessor{})
+	h.ConfigureSettlement(&fakePublisher{publishBatchClosedErr: errors.New("nats unavailable")}, 2.5)
+
+	if err := h.ForceClose(context.Background(), port.ForceCloseCommand{BatchID: b.ID(), OperatorID: "op-1"}); err != nil {
+		t.Fatalf("ForceClose() error = %v, want nil", err)
+	}
+	if b.State() != valueobject.BatchStateClosed {
+		t.Errorf("State() = %v, want %v", b.State(), valueobject.BatchStateClosed)
+	}
+}
+
+func TestForceClose_SaveErrorDoesNotPublish(t *testing.T) {
+	b := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	publisher := &fakePublisher{}
+	h := command.NewAdminHandler(&fakeBatchRepo{findByIDResult: b, saveErr: errors.New("connection reset")}, &fakeProcessor{})
+	h.ConfigureSettlement(publisher, 2.5)
+
+	if err := h.ForceClose(context.Background(), port.ForceCloseCommand{BatchID: b.ID(), OperatorID: "op-1"}); err == nil {
+		t.Fatal("ForceClose() error = nil, want the Save error")
+	}
+	if publisher.publishBatchClosedCalls != 0 {
+		t.Errorf("PublishBatchClosed calls = %d, want 0", publisher.publishBatchClosedCalls)
+	}
+}
+
 func TestResubmitBatch_WithDiscrepanciesMovesToDisputed(t *testing.T) {
 	b := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
 	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
@@ -350,7 +461,7 @@ func TestResubmitBatch_WithDiscrepanciesMovesToDisputed(t *testing.T) {
 	if err := b.RequestClose(); err != nil {
 		t.Fatalf("RequestClose() error = %v", err)
 	}
-	if err := b.Close(0, 0); err != nil { // como ForceClose
+	if err := b.Close(0, 0); err != nil { // lote con discrepancias, ej: un force-close anterior
 		t.Fatalf("Close() error = %v", err)
 	}
 

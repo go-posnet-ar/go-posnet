@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/google/uuid"
 	"github.com/juantevez/go-posnet/context/settlement/application/command"
 	"github.com/juantevez/go-posnet/context/settlement/application/port"
 	"github.com/juantevez/go-posnet/context/settlement/application/query"
@@ -15,6 +16,10 @@ import (
 	"github.com/juantevez/go-posnet/pkg/observability"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 )
+
+// canonicalUUIDLength es la longitud de un UUID con guiones. uuid.Validate también
+// acepta otras formas, como "urn:uuid:...", que Postgres no convierte.
+const canonicalUUIDLength = 36
 
 // Handler contiene todos los handlers HTTP del BC Settlement.
 type Handler struct {
@@ -35,13 +40,26 @@ func NewHandler(
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET  /healthz", h.handleHealth)
 	mux.HandleFunc("GET  /readyz", h.handleReady)
-	mux.HandleFunc("GET  /batches/{id}", h.handleGetBatch)
+	mux.HandleFunc("GET  /batches/{id}", requireBatchID(h.handleGetBatch))
 	mux.HandleFunc("GET  /merchants/{merchant_id}/batches", h.handleListBatches)
-	mux.HandleFunc("POST /batches/{id}/force-close", h.handleForceClose)
-	mux.HandleFunc("POST /batches/{id}/resubmit", h.handleResubmitBatch)
-	mux.HandleFunc("POST /batches/{id}/reopen", h.handleReopenBatch)
-	mux.HandleFunc("POST /batches/{id}/resolve-dispute", h.handleResolveDispute)
-	mux.HandleFunc("POST /batches/{id}/settle", h.handleSettleBatch)
+	mux.HandleFunc("POST /batches/{id}/force-close", requireBatchID(h.handleForceClose))
+	mux.HandleFunc("POST /batches/{id}/resubmit", requireBatchID(h.handleResubmitBatch))
+	mux.HandleFunc("POST /batches/{id}/reopen", requireBatchID(h.handleReopenBatch))
+	mux.HandleFunc("POST /batches/{id}/resolve-dispute", requireBatchID(h.handleResolveDispute))
+	mux.HandleFunc("POST /batches/{id}/settle", requireBatchID(h.handleSettleBatch))
+}
+
+// requireBatchID rechaza un {id} que no sea un UUID canónico. Sin esto llega a
+// Postgres, que falla al convertirlo a UUID, y el cliente recibe un 500 por un dato suyo.
+func requireBatchID(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.PathValue("id")
+		if len(id) != canonicalUUIDLength || uuid.Validate(id) != nil {
+			writeJSON(w, http.StatusBadRequest, errResp("INVALID_ID", "batch id must be a UUID"))
+			return
+		}
+		next(w, r)
+	}
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {

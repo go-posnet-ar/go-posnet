@@ -183,6 +183,13 @@ CREATE TABLE IF NOT EXISTS settlement.batch_transactions (
 -- La reversa usa el transaction_id de la compra: la unicidad incluye el tipo.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_batch_transactions_tx_type
     ON settlement.batch_transactions (transaction_id, tx_type);
+CREATE INDEX IF NOT EXISTS idx_batch_transactions_batch
+    ON settlement.batch_transactions (batch_id);
+CREATE INDEX IF NOT EXISTS idx_settlement_batches_merchant_date
+    ON settlement.settlement_batches (merchant_id, batch_date DESC);
+CREATE INDEX IF NOT EXISTS idx_settlement_batches_state
+    ON settlement.settlement_batches (state)
+    WHERE state IN ('OPEN', 'PENDING_CLOSE', 'CLOSED', 'SUBMITTED', 'DISPUTED');
 CREATE TABLE IF NOT EXISTS settlement.processed_events (
     event_id     UUID        PRIMARY KEY,
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

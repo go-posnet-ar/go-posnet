@@ -99,6 +99,7 @@ config/
 | `SETTLEMENT_BATCH_CLOSE_HOUR` | `3` | Hora UTC del cierre automático (00:00 en Argentina); `0` lo desactiva |
 | `SETTLEMENT_PROCESSOR` | `none` | Procesador externo: `none` o `mock` |
 | `SETTLEMENT_BUSINESS_TIMEZONE` | `America/Argentina/Buenos_Aires` | Zona horaria del día de negocio |
+| `SETTLEMENT_ADMIN_API_KEY` | — | Token de las operaciones de escritura (mínimo 32 caracteres). Vacío, quedan deshabilitadas |
 | `SETTLEMENT_SUBMIT_RETRIES` | `3` | Reintentos de envío al procesador |
 | `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | Timeout de envío |
 

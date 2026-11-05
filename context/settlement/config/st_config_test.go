@@ -17,7 +17,7 @@ var optionalEnvKeys = []string{
 	"NATS_NKEY_PATH", "NATS_TLS_CERT", "NATS_TLS_KEY", "NATS_TLS_CA",
 	"OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION", "OTEL_EXPORTER_OTLP_ENDPOINT", "ENVIRONMENT",
 	"SETTLEMENT_MDR_PERCENT", "SETTLEMENT_BATCH_CLOSE_HOUR",
-	"SETTLEMENT_SUBMIT_RETRIES", "SETTLEMENT_SUBMIT_TIMEOUT", "SETTLEMENT_PROCESSOR", "SETTLEMENT_BUSINESS_TIMEZONE",
+	"SETTLEMENT_SUBMIT_RETRIES", "SETTLEMENT_SUBMIT_TIMEOUT", "SETTLEMENT_PROCESSOR", "SETTLEMENT_BUSINESS_TIMEZONE", "SETTLEMENT_ADMIN_API_KEY",
 }
 
 func clearOptionalEnv(t *testing.T) {
@@ -396,5 +396,31 @@ func TestValidate_BusinessTimezone(t *testing.T) {
 	c := &Config{Settlement: SettlementConfig{MDRPercent: 2.5, BatchCloseHour: 3, BusinessTimezone: "Marte/Olympus"}}
 	if err := c.validate(); err == nil || !strings.Contains(err.Error(), "SETTLEMENT_BUSINESS_TIMEZONE") {
 		t.Errorf("validate() error = %v, want it to mention SETTLEMENT_BUSINESS_TIMEZONE", err)
+	}
+}
+
+func TestValidate_AdminAPIKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		wantErr bool
+	}{
+		{"sin clave: deshabilitado", "", false},
+		{"corta", "demasiado-corta", true},
+		{"justo el minimo", strings.Repeat("k", minAdminAPIKeyLength), false},
+		{"un caracter menos", strings.Repeat("k", minAdminAPIKeyLength-1), true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{Settlement: SettlementConfig{MDRPercent: 2.5, BatchCloseHour: 3, AdminAPIKey: tc.key}}
+			err := c.validate()
+			if (err != nil) != tc.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			// El mensaje no debe filtrar el valor de la clave.
+			if err != nil && tc.key != "" && strings.Contains(err.Error(), tc.key) {
+				t.Errorf("el error incluye la clave: %v", err)
+			}
+		})
 	}
 }

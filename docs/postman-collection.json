@@ -9,6 +9,7 @@
     { "key": "base_url_tg",   "value": "http://localhost:8081" },
     { "key": "base_url_fd",   "value": "http://localhost:8083" },
     { "key": "base_url_st",   "value": "http://localhost:8084" },
+    { "key": "st_admin_api_key", "value": "" },
     { "key": "base_url_nt",   "value": "http://localhost:8085" },
     { "key": "transaction_id", "value": "" },
     { "key": "terminal_id",    "value": "a1b2c3d4-e5f6-7890-abcd-ef1234567890" },
@@ -226,7 +227,10 @@
           "request": {
             "method": "POST",
             "url": "{{base_url_st}}/batches/{{batch_id}}/force-close",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{st_admin_api_key}}" }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"operator_id\": \"ops-user-001\"\n}"

@@ -69,7 +69,14 @@ type SettlementConfig struct {
 
 	// BusinessTimezone es la zona IANA que define a qué día pertenece una transacción.
 	BusinessTimezone string
+
+	// AdminAPIKey es el token que exigen las operaciones de escritura de la API HTTP.
+	// Vacío = esas operaciones quedan deshabilitadas.
+	AdminAPIKey string
 }
+
+// minAdminAPIKeyLength rechaza tokens triviales al arrancar.
+const minAdminAPIKeyLength = 32
 
 const (
 	// ProcessorNone no envía los lotes: quedan en CLOSED. Es el valor seguro por defecto.
@@ -118,6 +125,7 @@ func Load() (*Config, error) {
 			Processor:      envStr("SETTLEMENT_PROCESSOR", ProcessorNone),
 
 			BusinessTimezone: envStr("SETTLEMENT_BUSINESS_TIMEZONE", "America/Argentina/Buenos_Aires"),
+			AdminAPIKey:      envStr("SETTLEMENT_ADMIN_API_KEY", ""),
 		},
 	}
 
@@ -142,6 +150,9 @@ func (c *Config) validate() error {
 	default:
 		return fmt.Errorf("config: SETTLEMENT_PROCESSOR %q must be %q or %q",
 			c.Settlement.Processor, ProcessorNone, ProcessorMock)
+	}
+	if key := c.Settlement.AdminAPIKey; key != "" && len(key) < minAdminAPIKeyLength {
+		return fmt.Errorf("config: SETTLEMENT_ADMIN_API_KEY must have at least %d characters", minAdminAPIKeyLength)
 	}
 	if _, err := time.LoadLocation(c.Settlement.BusinessTimezone); err != nil {
 		return fmt.Errorf("config: SETTLEMENT_BUSINESS_TIMEZONE %q is invalid: %w", c.Settlement.BusinessTimezone, err)

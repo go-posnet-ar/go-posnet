@@ -11,6 +11,18 @@ El ciclo del lote tiene salidas por API para cada estado, pero **no hay un proce
 
 La liquidación (`SETTLED`) la confirma un operador con `settle`.
 
+**Las operaciones de escritura exigen token.** Los `curl` de este runbook asumen esta variable, con el mismo
+valor que `SETTLEMENT_ADMIN_API_KEY` en el servicio:
+
+```bash
+export AUTH="Authorization: Bearer <token>"
+```
+
+| Respuesta | Qué significa |
+|---|---|
+| `401 UNAUTHORIZED` | Falta el token o es incorrecto. Queda `rejected admin request` en el log |
+| `503 ADMIN_API_DISABLED` | El servicio no tiene `SETTLEMENT_ADMIN_API_KEY`. Hay que configurarla y reiniciarlo |
+
 **Si Settlement falla justo después de un despliegue con errores sobre `version`,** falta aplicar la
 [migración](../technical/SETTLEMENT.md#aplicar-la-migración).
 
@@ -87,7 +99,7 @@ marking as disputed` o `resubmit blocked by discrepancies`.
 | El terminal no reinició sus contadores | Un cierre anterior ese día, con el mismo total acumulado |
 | El terminal contó solo las compras | La diferencia de cantidad coincide con las reversas del lote |
 | Totales enviados incorrectamente por el terminal | El backend coincide con `pn_authorization.transactions` |
-| El lote pasó por `force-close` | Discrepancias falsas: el cierre forzado compara contra 0 |
+| Un `force-close` anterior a la corrección | Discrepancias falsas: comparaba contra 0. Los actuales no generan discrepancias |
 
 Una compra o su reversa no pueden contarse dos veces: `(transaction_id, tx_type)` es único.
 
@@ -123,10 +135,10 @@ logs: dejá también el motivo en el ticket.
 | **Faltan transacciones o el terminal debe reenviar sus totales** | `reopen` | Queda en `OPEN` y vuelve a aceptar transacciones. Republicar lo que falte (Escenario D) y pedir un nuevo cierre |
 
 ```bash
-curl -X POST http://<host>:8084/batches/<batch_id>/resolve-dispute \
+curl -X POST http://<host>:8084/batches/<batch_id>/resolve-dispute -H "$AUTH" \
   -d '{"operator_id":"<tu_usuario>","reason":"<motivo o ticket>"}'
 
-curl -X POST http://<host>:8084/batches/<batch_id>/reopen \
+curl -X POST http://<host>:8084/batches/<batch_id>/reopen -H "$AUTH" \
   -d '{"operator_id":"<tu_usuario>","reason":"<motivo o ticket>"}'
 ```
 
@@ -181,13 +193,14 @@ FROM settlement.settlement_batches WHERE id = '<batch_id>';
 |---|---|
 | `no settlement processor configured` | `SETTLEMENT_PROCESSOR=none`. También aumenta `posnet_settlement_submissions_total{result="unavailable"}` |
 | `submitBatch: processor submit` | Falló el procesador. La reentrega no reintenta el envío, porque ya no hay un lote `OPEN` |
-| `discrepancies` mayor que 0 | Viene de `force-close`, o falló el guardado de `DISPUTED` durante el cierre |
+| `discrepancies` mayor que 0 | Viene de un `force-close` anterior a la corrección, o falló el guardado de `DISPUTED` durante el cierre |
+| Pasó por `force-close` | Un cierre forzado no envía el lote: hay que hacer `resubmit` |
 | Lote sin transacciones | Lote vacío cerrado por el job. No requiere acción |
 
 **Resolución:**
 
 ```bash
-curl -X POST http://<host>:8084/batches/<batch_id>/resubmit -d '{"operator_id":"<tu_usuario>"}'
+curl -X POST http://<host>:8084/batches/<batch_id>/resubmit -H "$AUTH" -d '{"operator_id":"<tu_usuario>"}'
 ```
 
 | Respuesta | Qué significa | Qué hacer |
@@ -308,7 +321,7 @@ docker logs posnet-settlement 2>&1 | grep -E 'automatic batch close'
 | `automatic batch close failed` | Error de cierre: el job reintenta cada minuto |
 | Se reabrió hoy con `reopen` | El job ya lo marcó en la corrida de hoy: lo cierra al día siguiente |
 
-**Si no querés esperar:** `POST /batches/{id}/force-close`, con sus limitaciones (ver abajo).
+**Si no querés esperar:** `POST /batches/{id}/force-close` (ver abajo). Después hay que enviarlo con `resubmit`.
 
 ---
 
@@ -320,7 +333,7 @@ liquidación. Con `mock`, además, el lote nunca se envió.
 Una vez confirmada por fuera del sistema:
 
 ```bash
-curl -X POST http://<host>:8084/batches/<batch_id>/settle -d '{"operator_id":"<tu_usuario>"}'
+curl -X POST http://<host>:8084/batches/<batch_id>/settle -H "$AUTH" -d '{"operator_id":"<tu_usuario>"}'
 ```
 
 Responde `200` y pasa a `SETTLED`, que es un estado final. Sobre otro estado responde `400`.
@@ -347,22 +360,22 @@ Si falla la publicación, queda `failed to publish SettlementCompleted` en el lo
 |---|---|---|
 | `GET /batches/{id}` | Cualquiera | Estado y totales. Un lote `OPEN` muestra totales en 0. Los campos están en PascalCase (`State`, `TotalCount`) |
 | `GET /merchants/{merchant_id}/batches?date=YYYY-MM-DD` | Cualquiera | Lotes del comercio, que pueden ser varios por terminal; `date` es obligatorio |
-| `POST /batches/{id}/force-close` | Solo `OPEN`; otros, `500` | Pasa a `CLOSED` |
+| `POST /batches/{id}/force-close` | Solo `OPEN`; otros, `400` | Pasa a `CLOSED` |
 | `POST /batches/{id}/resubmit` | Solo `CLOSED`; otros, `400` | Pasa a `SUBMITTED`, o a `DISPUTED` si tiene discrepancias. Sin procesador, `503` |
 | `POST /batches/{id}/reopen` | Solo `DISPUTED`; otros, `400` | Pasa a `OPEN` |
 | `POST /batches/{id}/resolve-dispute` | Solo `DISPUTED`; otros, `400` | Pasa a `CLOSED`, con los totales del backend |
 | `POST /batches/{id}/settle` | Solo `SUBMITTED`; otros, `400` | Pasa a `SETTLED` |
 
-Todos los `POST` exigen `operator_id`; `reopen` y `resolve-dispute`, también `reason`. **Ninguno tiene
-autenticación**, y esos datos solo quedan en los logs. Un `409` indica que otro proceso modificó el lote: hay
-que consultarlo y repetir.
+Todos los `POST` exigen el token y `operator_id`; `reopen` y `resolve-dispute`, también `reason`. Esos datos
+solo quedan en los logs, y `operator_id` lo declara quien llama: **anotá también en el ticket quién hizo la
+operación**. Un `409` indica que otro proceso modificó el lote: hay
+que consultarlo y repetir. Un `{id}` que no sea un UUID responde `400 INVALID_ID`.
 
-**Limitaciones de `force-close`:**
+**Sobre `force-close`:**
 
-- Compara contra 0: **todo lote con transacciones queda con discrepancias falsas**. En el primer
-  `resubmit` pasa a `DISPUTED`, y sale con `resolve-dispute`.
-- No publica `batch-closed`, así que Notification no se entera.
-- No guarda ni registra `operator_id`: anotá en el ticket quién lo ejecutó y por qué.
+- Cierra con los totales del backend, **sin conciliar**: asumís que son correctos.
+- Publica `batch-closed`, salvo que el lote esté vacío.
+- No envía el lote: hay que hacer `resubmit`.
 - Las ventas posteriores del terminal abren un lote nuevo, que hay que volver a cerrar.
 
 ### Lotes que necesitan atención

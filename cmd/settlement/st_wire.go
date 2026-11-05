@@ -125,7 +125,10 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	grpcSrv := grpcserver.NewSettlementServer()
 
 	// HTTP Server — healthz, readyz, metrics, gestión de batches (operaciones)
-	router := httpinfra.NewRouter(queryHandler, adminHandler, pool)
+	if cfg.Settlement.AdminAPIKey == "" {
+		slog.Warn("SETTLEMENT_ADMIN_API_KEY is not configured — admin write operations are disabled")
+	}
+	router := httpinfra.NewRouter(queryHandler, adminHandler, pool, cfg.Settlement.AdminAPIKey)
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,
