@@ -23,10 +23,10 @@ flujo se completa, siempre termina aprobada.
 | Reversas | Implementado | Contra el mock |
 | Consulta de estado | Implementado | HTTP y gRPC, sin autenticación |
 | Métricas, trazas, alertas y SLO | Implementado | Ver [§10](#10-observabilidad) |
-| Adquirente real (ISO 8583 sobre TCP/TLS) | **Mock** | `MockAcquirerGateway` siempre aprueba |
+| Adquirente real (ISO 8583 sobre TCP/TLS) | **Mock** | `MockAcquirerGateway` aprueba, salvo con [escenarios de prueba](#probar-los-fallos-del-adquirente) |
 | Blocklist de tarjetas | **Parcial** | El código está, pero ningún flujo real la activa |
 | Bypass por timeout de fraude | **Pendiente** | `BypassFraudCheck` no se invoca |
-| Conciliación de `INDETERMINATE` | **Pendiente** | Ningún proceso lee ese estado |
+| Conciliación de `INDETERMINATE` | **Parcial** | Las revierte y rechaza. No consulta el resultado al host |
 | `ListTerminalTransactions` (gRPC) | **Pendiente** | Devuelve `Unimplemented` |
 
 Las consecuencias de estos pendientes están en [§12](#12-brechas-conocidas).
@@ -109,7 +109,7 @@ RECEIVED ──────► FRAUD_CHECKING ──────► PROCESSING �
 ```
 
 `APPROVED` admite una sola transición, a `REVERSED`. `REJECTED` y `REVERSED` son finales.
-`INDETERMINATE` tampoco es final, pero hoy solo puede salir de ese estado mediante una reversa.
+`INDETERMINATE` tampoco es final: el [conciliador](#56-conciliación) la revierte en el adquirente y la pasa a `REJECTED`.
 
 **No todos los estados llegan a la base de datos:**
 
@@ -117,12 +117,16 @@ RECEIVED ──────► FRAUD_CHECKING ──────► PROCESSING �
 |---|---|---|
 | `RECEIVED` | No | La transacción se guarda recién después de pasar a `FRAUD_CHECKING` |
 | `FRAUD_CHECKING` | Sí | Primer estado visible en una consulta |
-| `PROCESSING` | No | Solo existe en memoria mientras se llama al adquirente |
+| `PROCESSING` | Sí | Antes de llamar al adquirente, junto con el evento de score. `processing_started_at` indica desde cuándo |
 | `APPROVED`, `REJECTED`, `REVERSED` | Sí | — |
-| `INDETERMINATE` | Sí | El error al guardarlo se ignora |
+| `INDETERMINATE` | Sí | Si no se puede guardar, sigue en `PROCESSING` y el conciliador la toma igual |
 
-Una transacción en `FRAUD_CHECKING` puede, por lo tanto, estar esperando el score o haber quedado
-trabada durante la llamada al adquirente.
+Una transacción en `FRAUD_CHECKING` está esperando el score. Una en `PROCESSING`, esperando al adquirente: si sigue
+así más de `ACQUIRER_STUCK_AFTER`, quedó trabada.
+
+Las transiciones de la Saga se guardan con `SaveIfState`, **solo si la fila sigue en el estado esperado**. De dos
+procesos que intentan la misma transición, gana uno: dos scores de una venta no la autorizan dos veces, y una
+respuesta tardía del adquirente no pisa lo que ya resolvió el conciliador.
 
 ### 4.3 Rechazos
 
@@ -151,7 +155,8 @@ TG             Authorization                     Fraud Detection      Adquirente
 │                      ├───────────────────────────────►│                  │
 │                      │ fraud.score-calculated         │                  │
 │                      │◄───────────────────────────────┤                  │
-│                      │ marca evento procesado         │                  │
+│                      │ TX: marca evento procesado     │                  │
+│                      │ guarda en PROCESSING           │                  │
 │                      │ Authorize                      │                  │
 │                      ├──────────────────────────────────────────────────►│
 │                      │◄──────────────────────────────────────────────────┤
@@ -188,14 +193,23 @@ No hay un caso de uso para desbloquear una tarjeta: hoy solo se puede hacer borr
 
 ### 5.4 Reversa
 
-Al recibir `reversal-requested`:
+Al recibir `reversal-requested`, en una sola transacción de base marca el evento, bloquea la fila, **valida el estado** y
+guarda el pedido en `reversal_requested_at`. Recién entonces, si corresponde, llama al adquirente:
 
-1. Marca el evento como procesado.
-2. Busca la transacción y llama a `acquirer.Reverse`.
-3. Pasa a `REVERSED`, guarda y publica `reversal-completed`.
+| Estado | Resultado |
+|---|---|
+| `APPROVED` | Llama a `acquirer.Reverse`, pasa a `REVERSED` y publica `reversal-completed` |
+| `FRAUD_CHECKING`, `PROCESSING` | La venta sigue en curso, y no se llama al adquirente. Si termina aprobada, el conciliador la revierte. Si termina rechazada, no hay nada más que hacer |
+| `INDETERMINATE` | No hace nada: el conciliador ya la revierte |
+| `REJECTED`, `REVERSED` | No hay nada que revertir. Queda un `WARN` y `posnet_reversals_ignored_total` |
 
-Si el adquirente falla, el mensaje se confirma, la transacción no cambia y solo queda un error en el
-log. Se requiere intervención manual.
+**Un pedido de reversa no se pierde.** Si el adquirente falla o el proceso cae, la transacción sigue en `APPROVED` con el
+pedido guardado, y el [conciliador](#56-conciliación) la reintenta hasta completarla. Mientras tanto, `GET
+/transactions/{id}` informa `ReversalRequestedAt`. Si no se puede guardar el pedido, nada queda marcado y el evento se
+reintenta.
+
+La transacción sigue vigente hasta pasar a `REVERSED`: recién entonces se publica `reversal-completed`, y Settlement la
+descuenta. **Terminal Gateway no se entera:** ya respondió `202` e ignora este evento.
 
 ### 5.5 Qué pasa cuando falla cada paso
 
@@ -205,13 +219,46 @@ log. Se requiere intervención manual.
 | Error de base de datos antes de marcar el evento | `Nak` y reintento | **Sí** |
 | Falla la publicación de `fraud.check-requested` | Se registra y se confirma; queda en `FRAUD_CHECKING` | No |
 | Fraud Detection nunca responde | Queda en `FRAUD_CHECKING`; no hay timeout | No |
-| Error después de marcar el score como procesado | `Nak`, pero la reentrega se descarta como duplicado | No |
-| Error del adquirente | Pasa a `INDETERMINATE`; no se publica ningún evento | No |
-| Falla el guardado tras responder el adquirente | `Nak`, y la reentrega se descarta; el resultado solo queda en logs | No |
+| Error de base de datos antes de guardar `PROCESSING` | Nada queda guardado: `Nak` y reintento, sin haber llamado al adquirente | **Sí** |
+| Llega otro score de una transacción que ya no lo espera | Se ignora con un `WARN` y se confirma | No hace falta |
+| Caída durante la llamada al adquirente | Queda en `PROCESSING`; la toma el conciliador | **Sí**: la revierte y la rechaza |
+| Error del adquirente | Pasa a `INDETERMINATE`; la toma el conciliador | **Sí**: la revierte y la rechaza |
+| Falla el guardado tras responder el adquirente | Queda en `PROCESSING`; la toma el conciliador | **Sí**: la revierte, aunque el emisor la haya aprobado |
+| La reversa del conciliador falla | Sigue en `INDETERMINATE`; alerta `TransaccionesSinResolver` | **Sí**, cuando el adquirente responda |
 | Falla la publicación del resultado | Se registra y se confirma; la base queda correcta, pero nadie se entera | No |
 
-En todos los casos sin resultado publicado, Terminal Gateway mantiene la sesión en `PROCESSING` hasta
+En los casos sin resultado publicado, Terminal Gateway mantiene la sesión en `PROCESSING` hasta
 que su job de limpieza la borra.
+
+### Llamadas al adquirente
+
+No ocupan el handler de NATS. La transacción ya está guardada, así que el mensaje se confirma enseguida, y la llamada corre
+en un worker, con hasta `ACQUIRER_MAX_CONCURRENT` simultáneas y un timeout de `ACQUIRER_TIMEOUT_SECONDS` cada una, que no
+depende del `AckWait` de NATS. Un adquirente lento no frena la cola hasta que se ocupan todos los workers. Ahí, el consumo
+espera, en lugar de acumular llamadas sin límite.
+
+### 5.6 Conciliación
+
+Sin una respuesta guardada, no se puede saber si el emisor aprobó la operación. Cada `ACQUIRER_RECONCILE_EVERY` (30 s) y
+al arrancar, `ReconcileUnresolved` toma hasta 50 transacciones, de la más antigua a la más nueva: las
+`INDETERMINATE` y las que siguen en `PROCESSING` después de `ACQUIRER_STUCK_AFTER` (2 min).
+
+1. Si está en `PROCESSING`, la pasa a `INDETERMINATE`. Desde ahí, una respuesta tardía ya no se puede guardar.
+2. **Envía la reversa al adquirente,** la práctica de ISO 8583 ante un timeout. Si falla, reintenta en la corrida
+   siguiente, sin frenar a las demás.
+3. La pasa a `REJECTED`, con código y origen `TIMEOUT`, y publica `auth.rejected`, con `is_retryable` en `true`: el
+   cliente recibe una respuesta y puede volver a intentar sin riesgo de un cobro doble.
+
+**No publica `reversal-completed`:** la venta nunca se informó como aprobada, así que Settlement no tiene nada que
+descontar, y abriría una revisión `PURCHASE_NOT_FOUND`.
+
+**También reintenta los pedidos de reversa** de transacciones en `APPROVED`, una vez pasado `ACQUIRER_TIMEOUT_SECONDS`:
+antes, la primera reversa puede seguir en curso. Estas sí publican `reversal-completed`, porque Settlement ya registró la
+venta.
+
+Varias instancias pueden tomar la misma transacción. La reversa repetida no debe tener efecto, y solo una instancia
+informa el resultado. **El adaptador real del adquirente debe responder éxito** si el host no conoce la operación o si
+ya estaba revertida: una caída antes de enviar la autorización también termina en reversa.
 
 ## 6. API HTTP
 
@@ -220,7 +267,7 @@ Puerto `HTTP_PORT` (8080 por defecto). **No hay autenticación.**
 | Método y ruta | Uso | Éxito | Errores |
 |---|---|---|---|
 | `GET /healthz` | Liveness | `200` | — |
-| `GET /readyz` | Readiness; solo verifica Postgres | `200` | `503` |
+| `GET /readyz` | Readiness; verifica Postgres y las tablas y columnas requeridas. `reason`: `database unavailable` o `database schema incomplete`, y el log nombra lo que falta | `200` | `503` |
 | `GET /metrics` | Métricas Prometheus | `200` | — |
 | `GET /transactions/{id}` | Estado de una transacción | `200` | `400`, `404`, `500` |
 
@@ -236,9 +283,12 @@ Puerto `HTTP_PORT` (8080 por defecto). **No hay autenticación.**
   "AmountCents": 150000,
   "Currency": "ARS",
   "AuthorizedAt": "2026-11-05T15:00:04Z",
-  "RejectedAt": ""
+  "RejectedAt": "",
+  "ReversalRequestedAt": ""
 }
 ```
+
+`ReversalRequestedAt` indica un pedido de reversa sin completar.
 
 Los errores tienen la forma `{"error": "CODIGO", "message": "..."}`.
 
@@ -318,6 +368,22 @@ usa el schema `authorization` y no incluye la blocklist.
 | `processed_events` | Idempotencia de eventos | PK `event_id` |
 | `blocked_cards` | Blocklist | PK `card_token`; sin FK, para sobrevivir a purgas de transacciones |
 
+### Aplicar la migración de conciliación
+
+**Una base existente necesita `000002` y `000003` antes de desplegar esta versión del servicio.** Sin ellas, **fallan
+todas las ventas** y, al agotar los reintentos, sus eventos se pierden. `/readyz` responde `503` y Docker marca el contenedor
+`unhealthy`, pero eso no frena el consumo de eventos. Se pueden aplicar con el servicio anterior en marcha:
+
+```bash
+psql "$POSTGRES_DSN" -f migrations/pn_authorization/000002_processing_started_at.up.sql
+psql "$POSTGRES_DSN" -f migrations/pn_authorization/000003_reversal_requested_at.up.sql
+```
+
+Son idempotentes. **Al arrancar, el conciliador revierte en el adquirente las `INDETERMINATE` que ya existan:** si hay un
+adquirente real conectado, revisalas antes. `000002_processing_started_at.down.sql` la revierte: falla sin cambiar nada si
+hay transacciones en `PROCESSING` o `INDETERMINATE`, y exige volver antes a la versión anterior del servicio.
+`000003_reversal_requested_at.down.sql` exige lo mismo, y falla si hay reversas pendientes.
+
 ### Aplicar la migración de blocklist
 
 **Una base creada antes de este cambio necesita la migración manualmente.** Sin la columna
@@ -335,15 +401,16 @@ entorno con datos reales, exportarlos antes de ejecutarlo.
 
 - **Publicación:** *at-most-once* en la práctica. No hay outbox: si NATS falla después de guardar, el
   evento se pierde. La reentrega no ayuda, porque el mensaje se confirma igual.
-- **Idempotencia:** el `event_id` se registra en `processed_events`. En `ApplyFraudScore` y
-  `ProcessReversal`, ese registro se confirma **antes** de hacer el trabajo, para evitar llamar dos
-  veces al adquirente. El costo es que un fallo posterior no se reintenta (ver
-  [§12](#12-brechas-conocidas)).
+- **Idempotencia:** el `event_id` se registra en `processed_events`. En `ApplyFraudScore` y `ProcessReversal`, ese
+  registro se confirma junto con el nuevo estado o el pedido, y **antes** de llamar al adquirente: un fallo previo se
+  reintenta, y una reentrega no vuelve a llamarlo. Lo que falle después lo resuelve el
+  [conciliador](#56-conciliación).
 
 ### Apagado
 
-Ante `SIGINT` o `SIGTERM`: detiene HTTP (hasta 10 s), drena y cierra NATS, y cierra el pool de
-Postgres. El servidor gRPC no se detiene de forma ordenada.
+Ante `SIGINT` o `SIGTERM`: detiene HTTP (hasta 10 s) y el conciliador, drena y cierra NATS, espera las llamadas al
+adquirente en curso, hasta su timeout más 5 s, y cierra el pool de Postgres. Lo que no termine a tiempo lo retoma el
+conciliador. El servidor gRPC no se detiene de forma ordenada.
 
 ## 10. Observabilidad
 
@@ -357,9 +424,11 @@ Postgres. El servidor gRPC no se detiene de forma ordenada.
 | `posnet_acquirer_errors_total` | Counter | `reason` |
 | `posnet_acquirer_request_duration_seconds` | Histogram | `result` |
 | `posnet_saga_duration_seconds` | Histogram | `outcome` |
+| `posnet_authorization_unresolved_transactions` | Gauge | `state`: `INDETERMINATE`, `PROCESSING` trabadas o `REVERSAL_PENDING`. Consulta la base en cada scrape |
+| `posnet_reversals_ignored_total` | Counter | `state`: pedidos de reversa sin nada que revertir |
 
-`posnet_saga_duration_seconds` solo registra sagas que terminan en aprobación o rechazo. Las trabadas
-y las `INDETERMINATE` no aparecen en esta métrica.
+`posnet_saga_duration_seconds` solo registra sagas que terminan en aprobación o rechazo: las trabadas no aparecen.
+Una reversa del conciliador cuenta como rechazo, con `source="TIMEOUT"`.
 
 También se exponen métricas del pool de Postgres, de mensajes NATS y de duplicados descartados
 (`posnet_idempotency_duplicates_total`).
@@ -377,6 +446,7 @@ Reglas en [`deployments/docker/prometheus/rules/`](../../deployments/docker/prom
 |---|---|---|
 | `SagaCompletaDetenida` | Crítica | Entran transacciones y ninguna se aprueba durante 2 min |
 | `ErrorRateAlta` | Crítica | Rechazos por encima del 10 % de las recibidas durante 5 min |
+| `TransaccionesSinResolver` | Warning | Transacciones sin resultado conocido o reversas sin completar durante 5 min: las reversas están fallando |
 | `LatenciaSagaAlta` | Warning | p95 de la Saga por encima de 3 s durante 5 min |
 | `DuplicadosNATSAltos` | Warning | Duplicados por encima de 0,05/s durante 5 min |
 
@@ -409,8 +479,12 @@ métrica cuenta las publicaciones fallidas.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel-collector:4317` | Sí |
 | `ENVIRONMENT` | `development` | Sí |
 | `GRPC_PORT` | `9090` | **No**: el puerto está fijo en 9090 |
+| `ACQUIRER_RECONCILE_EVERY` | `30s` | Sí; cada cuánto corre el conciliador, y `0` lo desactiva. Docker Compose usa `2s`. Si es negativo, el servicio no arranca |
+| `ACQUIRER_STUCK_AFTER` | `2m` | Sí; Docker Compose usa `10s`. Cuánto puede seguir una transacción en `PROCESSING`. Si no supera `ACQUIRER_TIMEOUT_SECONDS`, el servicio no arranca: revertiría llamadas en curso |
 | `ACQUIRER_HOST`, `ACQUIRER_PORT` | `localhost`, `9100` | **No**: se usa el mock |
-| `ACQUIRER_TIMEOUT_SECONDS` | `30` | **No**: se usa el mock |
+| `ACQUIRER_TIMEOUT_SECONDS` | `30` | Sí; timeout de cada llamada al adquirente. Docker Compose usa `3` |
+| `ACQUIRER_MAX_CONCURRENT` | `20` | Sí; llamadas simultáneas al adquirente. Si es menor que 1, el servicio no arranca |
+| `ACQUIRER_MOCK_SCENARIOS` | `false` | Sí; el mock responde [según el monto](#probar-los-fallos-del-adquirente). Docker Compose lo activa. Con `ENVIRONMENT=production`, el servicio no arranca |
 | `ACQUIRER_TLS_CERT`, `ACQUIRER_TLS_KEY`, `ACQUIRER_TLS_CA` | Vacías | **No**: se usa el mock |
 | `MIGRATIONS_DIR` | `migrations/authorization` | **No**: `Migrate` no hace nada, y esa carpeta no existe |
 
@@ -445,6 +519,19 @@ luego consultar con el mismo ID:
 curl -s localhost:8080/transactions/$ID | jq
 ```
 
+### Probar los fallos del adquirente
+
+Con `ACQUIRER_MOCK_SCENARIOS=true`, activado en Docker Compose, estos montos no se aprueban. Con cualquier otro, el mock
+aprueba. La colección de Postman los usa en la carpeta "Adquirente".
+
+| `amount_cents` | El mock | Resultado |
+|---|---|---|
+| `770051` | Responde `51` | `REJECTED`, de origen `ACQUIRER` |
+| `770041` | Responde `41` | `REJECTED`, y ordena retener la tarjeta |
+| `770091` | Devuelve un error | `INDETERMINATE`, y el conciliador la rechaza con `TIMEOUT` |
+| `770098` | No responde hasta el timeout | Igual que el anterior, unos segundos después |
+| `770092` | Aprueba, y falla las dos primeras reversas | `APPROVED`, y `REVERSED` cuando el conciliador reintenta |
+
 ### Tests
 
 ```bash
@@ -467,24 +554,23 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 ### Resolver antes de conectar un adquirente real
 
-Hoy el mock oculta estas fallas: nunca devuelve errores ni rechazos.
+Sin un adquirente real, estas fallas no ocurren: el mock solo falla con [los montos de prueba](#probar-los-fallos-del-adquirente).
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| El evento de score se marca como procesado antes de hacer el trabajo | Tras cualquier error o reinicio posterior, la reentrega se descarta. `MaxDeliver: 5` no protege este tramo. Un pago aprobado por el emisor puede quedar sin registro ni evento | `ApplyFraudScore`, `callAcquirer` |
-| `PROCESSING` no se guarda antes de llamar al adquirente | Una caída durante la llamada deja `FRAUD_CHECKING`, sin rastro de que se haya enviado la autorización | `callAcquirer` |
-| `INDETERMINATE` no publica eventos ni tiene conciliación | Los comentarios mencionan una conciliación nocturna que no existe. El cliente no recibe respuesta y el resultado real queda sin resolver | `callAcquirer` |
-| Se llama a `Reverse` antes de validar el estado | Se puede revertir en el adquirente una transacción rechazada o en curso; recién después falla la transición | `ProcessReversal` |
-| Una reversa fallida no se informa | La transacción sigue `APPROVED`, solo queda un log, y Terminal Gateway ya respondió `202` | `ProcessReversal` |
-| El guardado del `INDETERMINATE` ignora errores | `_ = h.repo.Save(...)`: si falla, el estado se pierde sin registro de ese fallo | `callAcquirer` |
-| La llamada corre dentro del handler de NATS | Cada subscriber procesa de a un mensaje; un adquirente lento frena toda la cola. Además, el timeout previsto (30 s) iguala al `AckWait` (30 s) | `subscriber.go`, `callAcquirer` |
+| El conciliador no consulta el resultado | Revierte toda operación sin respuesta, también las que el emisor aprobó: el cliente ve un rechazo y puede reintentar. El protocolo del host puede ofrecer algo mejor | `ReconcileUnresolved` |
+| Respuesta tardía al cliente | Sin respuesta del adquirente, el cliente espera hasta `ACQUIRER_STUCK_AFTER` más una corrida. Si Terminal Gateway ya borró la sesión, el rechazo no encuentra a quién avisar | `ReconcileUnresolved`, `DeleteExpired` |
+| Terminal Gateway no conoce el resultado de una reversa | Ya respondió `202` e ignora `reversal-completed`: el terminal no sabe si se completó ni si se ignoró. Se consulta con `GET /transactions/{id}`. Resolverlo requiere cambiar Terminal Gateway | `tg_nats_subscriber.go` |
+| Una reversa que nunca se completa no tiene límite | Se reintenta cada corrida, sin un máximo ni una espera creciente, hasta que el host responda. Solo avisa la alerta | `ReconcileUnresolved` |
+| Workers ocupados frenan todo el consumo | Con un adquirente caído, las llamadas ocupan los workers hasta su timeout, y las demás esperan. Sin un corte, el host caído suma demora a cada venta | `runAcquirerCall` |
+| Sin migración, el servicio sigue consumiendo | `/readyz` y Docker lo avisan, pero los eventos fallan y, al agotar los reintentos, se pierden | `wire` |
 
 ### Saga
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
 | No existe el bypass ni el timeout de fraude | El log dice `fraud bypass will apply` y la documentación del evento menciona 500 ms, pero `BypassFraudCheck` no se invoca. Si Fraud Detection no responde, la transacción queda trabada para siempre | `AuthorizeTransaction` |
-| Resultados publicados sin outbox | Si falla la publicación de una aprobación, Settlement no la liquida y el cajero no la ve, aunque figure `APPROVED` | `callAcquirer`, `publishRejection` |
+| Resultados publicados sin outbox | Si falla la publicación de una aprobación, Settlement no la liquida y el cajero no la ve, aunque figure `APPROVED` | `callAcquirer`, `publishRejection`, `reconcile` |
 | Una transacción inválida no recibe respuesta | Terminal Gateway no valida `card_network` ni `card_last4`: `/pay` responde `202`, Authorization descarta el mensaje y la sesión queda en `PROCESSING` hasta su limpieza | `AuthorizeTransaction` |
 | Un segundo evento con el mismo `transaction_id` reinicia la transacción | `Save` es un UPSERT: un `event_id` distinto la devuelve a `FRAUD_CHECKING` y puede cobrarse otra vez. Hoy Terminal Gateway no genera este caso, pero Authorization no se defiende | `AuthorizeTransaction`, `TransactionRepo.Save` |
 | `Save` queda fuera de la transacción de idempotencia | Usa el pool en lugar de `dbTx`, aunque el comentario diga lo contrario. Si falla el commit, queda guardado sin el evento marcado y la reentrega reprocesa | `AuthorizeTransaction`, `rejectBlockedCard` |

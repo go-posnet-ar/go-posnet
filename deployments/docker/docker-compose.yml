@@ -128,13 +128,20 @@ services:
       HTTP_PORT: "8080"
       GRPC_PORT: "9090"
       OTEL_SERVICE_NAME: posnet-authorization
+      # Solo para desarrollo: el mock responde según el monto, y los fallos se resuelven rápido
+      # para poder probarlos. Ver AUTHORIZATION.md, "Probar los fallos del adquirente".
+      ACQUIRER_MOCK_SCENARIOS: "true"
+      ACQUIRER_TIMEOUT_SECONDS: "3"
+      ACQUIRER_STUCK_AFTER: "10s"
+      ACQUIRER_RECONCILE_EVERY: "2s"
     depends_on:
       postgres:
         condition: service_healthy
       nats:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/healthz || exit 1"]
+      # /readyz: Docker lo marca unhealthy si falta una migración o se pierde Postgres.
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8080/readyz || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5

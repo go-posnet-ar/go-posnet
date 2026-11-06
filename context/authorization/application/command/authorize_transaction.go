@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -35,6 +36,66 @@ type AuthorizationHandler struct {
 	pool         pgutil.PgxPool
 	metrics      *Metrics                         // opcional; nil = sin instrumentación (tests)
 	blockedCards repository.BlockedCardRepository // opcional; nil = blocklist deshabilitada
+
+	// Llamadas al adquirente fuera del handler de NATS. Sin slots, corren en el handler (tests).
+	acquirerTimeout time.Duration
+	acquirerSlots   chan struct{}
+	acquirerCalls   sync.WaitGroup
+}
+
+// defaultAcquirerTimeout limita las llamadas si no se configura otro valor.
+const defaultAcquirerTimeout = 30 * time.Second
+
+// ConfigureAcquirerCalls hace que las llamadas al adquirente no ocupen el handler de NATS, con
+// el límite de simultáneas y el timeout de cada una. Un adquirente lento frena solo sus
+// llamadas: el mensaje se confirma enseguida, porque la transacción ya está guardada y, si el
+// proceso cae, la retoma el conciliador.
+func (h *AuthorizationHandler) ConfigureAcquirerCalls(maxConcurrent int, timeout time.Duration) {
+	h.acquirerSlots = make(chan struct{}, maxConcurrent)
+	h.acquirerTimeout = timeout
+}
+
+// WaitAcquirerCalls espera las llamadas en curso, hasta que venza ctx. Lo que no termine a
+// tiempo queda para el conciliador.
+func (h *AuthorizationHandler) WaitAcquirerCalls(ctx context.Context) {
+	done := make(chan struct{})
+	go func() {
+		h.acquirerCalls.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+}
+
+// runAcquirerCall ejecuta fn en un worker. Si están todos ocupados, espera: esa demora frena
+// el consumo de eventos, en lugar de acumular llamadas sin límite.
+func (h *AuthorizationHandler) runAcquirerCall(ctx context.Context, log *slog.Logger, fn func(context.Context) error) error {
+	if h.acquirerSlots == nil {
+		return fn(ctx)
+	}
+	h.acquirerSlots <- struct{}{}
+	h.acquirerCalls.Add(1)
+	go func() {
+		defer h.acquirerCalls.Done()
+		defer func() { <-h.acquirerSlots }()
+		// El handler ya terminó: conserva la traza, pero no su cancelación.
+		if err := fn(context.WithoutCancel(ctx)); err != nil {
+			observability.RecordError(ctx, err)
+			log.Error("acquirer call failed — the reconciler will retry", slog.String("error", err.Error()))
+		}
+	}()
+	return nil
+}
+
+// withAcquirerTimeout limita una llamada al adquirente.
+func (h *AuthorizationHandler) withAcquirerTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := h.acquirerTimeout
+	if timeout <= 0 {
+		timeout = defaultAcquirerTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // SetBlockedCards inyecta la blocklist de tarjetas. Se llama desde el wiring
@@ -213,51 +274,75 @@ func (h *AuthorizationHandler) ApplyFraudScore(ctx context.Context, cmd port.App
 		slog.String("fraud_decision", cmd.Decision),
 	)
 
-	var claimed bool
-	if err := pgutil.WithReadCommitted(ctx, h.pool, func(dbTx pgx.Tx) error {
-		var e error
-		claimed, e = h.idempotency.TryMarkAsProcessed(ctx, dbTx, cmd.EventID)
-		return e
-	}); err != nil {
-		return fmt.Errorf("ApplyFraudScore: claim event: %w", err)
-	}
-	if !claimed {
-		log.Info("fraud score event already processed — skipping")
-		return nil
-	}
-
 	txID, err := domain.ParseTransactionID(cmd.TransactionID)
 	if err != nil {
 		return pkgerrors.NewValidationError("invalid transaction_id: " + err.Error())
 	}
-
-	tx, err := h.repo.FindByID(ctx, txID)
-	if err != nil {
-		return fmt.Errorf("ApplyFraudScore: find transaction: %w", err)
-	}
-
 	fraudDecision, err := valueobject.NewFraudDecision(cmd.Score, cmd.Decision, cmd.RulesHit)
 	if err != nil {
 		return pkgerrors.NewValidationError("invalid fraud decision: " + err.Error())
 	}
 
-	if err := tx.ApplyFraudDecision(fraudDecision); err != nil {
-		return fmt.Errorf("ApplyFraudScore: apply decision: %w", err)
+	// El evento se marca junto con el nuevo estado: si algo falla, no queda ninguno de los dos
+	// y la reentrega reprocesa. La condición sobre el estado garantiza que, aunque lleguen
+	// dos scores de la misma transacción, solo uno llegue al adquirente.
+	var (
+		tx       *aggregate.Transaction
+		advanced bool
+	)
+	err = pgutil.WithReadCommitted(ctx, h.pool, func(dbTx pgx.Tx) error {
+		claimed, err := h.idempotency.TryMarkAsProcessed(ctx, dbTx, cmd.EventID)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			log.Info("fraud score event already processed — skipping")
+			return nil
+		}
+		if tx, err = h.repo.FindByIDForUpdateTx(ctx, dbTx, txID); err != nil {
+			return fmt.Errorf("find transaction: %w", err)
+		}
+		if tx.State() != valueobject.StateFraudChecking {
+			log.Warn("fraud score ignored — transaction is no longer waiting for it", slog.String("state", tx.State().String()))
+			return nil
+		}
+		if err := tx.ApplyFraudDecision(fraudDecision); err != nil {
+			return fmt.Errorf("apply decision: %w", err)
+		}
+		saved, err := h.repo.SaveIfStateTx(ctx, dbTx, tx, valueobject.StateFraudChecking)
+		if err != nil {
+			return fmt.Errorf("persist decision: %w", err)
+		}
+		if !saved {
+			log.Warn("fraud score ignored — another score moved the transaction first")
+			return nil
+		}
+		advanced = true
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("ApplyFraudScore: claim event: %w", err)
+	}
+	if !advanced {
+		return nil
 	}
 
 	// Si el fraud rechazó → publicar rechazo y terminar
 	if tx.State() == valueobject.StateRejected {
-		return h.persistAndPublishRejection(ctx, tx, log)
+		h.publishRejection(ctx, tx, log)
+		return nil
 	}
 
 	// Fraud aprobó → llamar al adquirente
-	return h.callAcquirer(ctx, tx, log)
+	return h.runAcquirerCall(ctx, log, func(ctx context.Context) error {
+		return h.callAcquirer(ctx, tx, log)
+	})
 }
 
-// callAcquirer envía la transacción al host adquirente y procesa la respuesta.
-// El evento ya fue reclamado por TryMarkAsProcessed en ApplyFraudScore, por lo
-// que cualquier error del adquirente se convierte en INDETERMINATE: NATS no
-// redeliverirá y la conciliación nocturna resuelve el resultado.
+// callAcquirer envía la transacción al host adquirente y procesa la respuesta. La
+// transacción ya está guardada en PROCESSING y el evento, marcado: una reentrega no vuelve a
+// llamar al adquirente. Sin una respuesta guardada, ReconcileUnresolved revierte la
+// operación, porque no se sabe si el emisor la aprobó.
 func (h *AuthorizationHandler) callAcquirer(
 	ctx context.Context,
 	tx *aggregate.Transaction,
@@ -267,7 +352,9 @@ func (h *AuthorizationHandler) callAcquirer(
 	defer span.End()
 
 	acquirerStart := time.Now()
-	response, err := h.acquirer.Authorize(ctx, tx)
+	callCtx, cancel := h.withAcquirerTimeout(ctx)
+	defer cancel()
+	response, err := h.acquirer.Authorize(callCtx, tx)
 	if err != nil {
 		h.metrics.RecordAcquirerDuration(ctx, time.Since(acquirerStart), "error")
 		h.metrics.RecordAcquirerError(ctx)
@@ -276,7 +363,12 @@ func (h *AuthorizationHandler) callAcquirer(
 		if markErr := tx.MarkIndeterminate(); markErr != nil {
 			return fmt.Errorf("callAcquirer: mark indeterminate: %w", markErr)
 		}
-		_ = h.repo.Save(ctx, tx)
+		// Si no se puede guardar, sigue en PROCESSING y el conciliador la toma igual.
+		if _, saveErr := h.repo.SaveIfState(ctx, tx, valueobject.StateProcessing); saveErr != nil {
+			observability.RecordError(ctx, saveErr)
+			log.Error("could not save INDETERMINATE — the reconciler will take the transaction from PROCESSING",
+				slog.String("error", saveErr.Error()))
+		}
 		return nil
 	}
 	if response.IsApproved() {
@@ -307,9 +399,17 @@ func (h *AuthorizationHandler) callAcquirer(
 		h.blockCard(ctx, tx, rc, log)
 	}
 
-	if err = h.repo.Save(ctx, tx); err != nil {
+	saved, err := h.repo.SaveIfState(ctx, tx, valueobject.StateProcessing)
+	if err != nil {
 		observability.RecordError(ctx, err)
 		return fmt.Errorf("callAcquirer: persist result: %w", err)
+	}
+	if !saved {
+		// La respuesta llegó después de que el conciliador tomara la transacción. No se
+		// informa: el resultado para el cliente es el del conciliador, que la revierte.
+		log.Error("acquirer response arrived after the reconciler took the transaction — ignoring it",
+			slog.String("response_state", tx.State().String()))
+		return nil
 	}
 
 	// Publicar resultado a NATS (fuera de la transacción Postgres)
@@ -425,20 +525,6 @@ func (h *AuthorizationHandler) rejectBlockedCard(
 	return nil
 }
 
-// persistAndPublishRejection persiste el rechazo y publica el evento.
-// El evento ya fue reclamado por TryMarkAsProcessed en ApplyFraudScore.
-func (h *AuthorizationHandler) persistAndPublishRejection(
-	ctx context.Context,
-	tx *aggregate.Transaction,
-	log *slog.Logger,
-) error {
-	if err := h.repo.Save(ctx, tx); err != nil {
-		return fmt.Errorf("persistAndPublishRejection: %w", err)
-	}
-	h.publishRejection(ctx, tx, log)
-	return nil
-}
-
 // publishRejection registra las métricas del rechazo y lo publica a NATS.
 // Separado de la persistencia porque los rechazos que ya se guardaron dentro
 // de una transacción de base solo necesitan esta mitad.
@@ -455,7 +541,15 @@ func (h *AuthorizationHandler) publishRejection(
 	}
 }
 
-// ProcessReversal procesa la anulación de una transacción aprobada.
+// ProcessReversal procesa un pedido de anulación. El estado se valida antes de llamar al
+// adquirente, y el pedido queda guardado junto con el evento: si la reversa falla o el proceso
+// cae, el conciliador la reintenta.
+//
+//   - APPROVED: se revierte.
+//   - FRAUD_CHECKING o PROCESSING: la venta sigue en curso. Se guarda el pedido, y el
+//     conciliador la revierte si termina aprobada.
+//   - INDETERMINATE: el conciliador ya la revierte. No hace falta nada más.
+//   - REJECTED o REVERSED: no hay nada que revertir.
 func (h *AuthorizationHandler) ProcessReversal(ctx context.Context, cmd port.ProcessReversalCommand) error {
 	ctx, span := observability.StartSpan(ctx, "command.ProcessReversal")
 	defer span.End()
@@ -465,50 +559,83 @@ func (h *AuthorizationHandler) ProcessReversal(ctx context.Context, cmd port.Pro
 		slog.String("event_id", cmd.EventID),
 	)
 
-	var claimed bool
-	if err := pgutil.WithReadCommitted(ctx, h.pool, func(dbTx pgx.Tx) error {
-		var e error
-		claimed, e = h.idempotency.TryMarkAsProcessed(ctx, dbTx, cmd.EventID)
-		return e
-	}); err != nil {
-		return fmt.Errorf("ProcessReversal: claim event: %w", err)
-	}
-	if !claimed {
-		log.Info("reversal event already processed — skipping")
-		return nil
-	}
-
 	txID, err := domain.ParseTransactionID(cmd.OriginalTransactionID)
 	if err != nil {
 		return pkgerrors.NewValidationError("invalid original_transaction_id")
 	}
 
-	tx, err := h.repo.FindByID(ctx, txID)
+	var (
+		tx      *aggregate.Transaction
+		reverse bool
+	)
+	err = pgutil.WithReadCommitted(ctx, h.pool, func(dbTx pgx.Tx) error {
+		claimed, err := h.idempotency.TryMarkAsProcessed(ctx, dbTx, cmd.EventID)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			log.Info("reversal event already processed — skipping")
+			return nil
+		}
+		if tx, err = h.repo.FindByIDForUpdateTx(ctx, dbTx, txID); err != nil {
+			return fmt.Errorf("find transaction: %w", err)
+		}
+		switch tx.State() {
+		case valueobject.StateApproved:
+			reverse = true
+		case valueobject.StateFraudChecking, valueobject.StateProcessing:
+			log.Warn("reversal requested while the sale is in progress — it will be reversed if approved",
+				slog.String("state", tx.State().String()))
+		case valueobject.StateIndeterminate:
+			log.Info("reversal requested — the reconciler is already reversing this transaction")
+			return nil
+		default:
+			h.metrics.RecordReversalIgnored(ctx, tx.State().String())
+			log.Warn("reversal ignored — nothing to reverse", slog.String("state", tx.State().String()))
+			return nil
+		}
+		return h.repo.MarkReversalRequestedTx(ctx, dbTx, txID)
+	})
 	if err != nil {
-		return fmt.Errorf("ProcessReversal: find transaction: %w", err)
+		return fmt.Errorf("ProcessReversal: claim event: %w", err)
 	}
-
-	// Enviar reversal al adquirente
-	if err := h.acquirer.Reverse(ctx, tx); err != nil {
-		// El evento ya fue reclamado — NATS no va a redeliveriar.
-		// Loguear y dejar para conciliación manual.
-		log.Error("acquirer reversal failed — leaving for reconciliation",
-			slog.String("error", err.Error()))
+	if !reverse {
 		return nil
 	}
 
+	return h.runAcquirerCall(ctx, log, func(ctx context.Context) error {
+		_, err := h.completeReversal(ctx, tx, log)
+		if err != nil {
+			// Queda en APPROVED con el pedido guardado: el conciliador la reintenta.
+			log.Warn("reversal failed — the reconciler will retry", slog.String("error", err.Error()))
+		}
+		return nil
+	})
+}
+
+// completeReversal revierte en el adquirente una transacción aprobada e informa el resultado.
+// Devuelve false si otro proceso la completó antes.
+func (h *AuthorizationHandler) completeReversal(ctx context.Context, tx *aggregate.Transaction, log *slog.Logger) (bool, error) {
+	callCtx, cancel := h.withAcquirerTimeout(ctx)
+	defer cancel()
+	if err := h.acquirer.Reverse(callCtx, tx); err != nil {
+		h.metrics.RecordAcquirerError(ctx)
+		return false, fmt.Errorf("acquirer reversal: %w", err)
+	}
 	if err := tx.Reverse(); err != nil {
-		return fmt.Errorf("ProcessReversal: reverse aggregate: %w", err)
+		return false, fmt.Errorf("reverse aggregate: %w", err)
 	}
-
-	if err := h.repo.Save(ctx, tx); err != nil {
-		return fmt.Errorf("ProcessReversal: persist: %w", err)
+	// Si esto falla, se repite la reversa, que no tiene efecto.
+	saved, err := h.repo.SaveIfState(ctx, tx, valueobject.StateApproved)
+	if err != nil {
+		return false, fmt.Errorf("persist: %w", err)
 	}
-
-	if err := h.publisher.PublishReversalCompleted(ctx, txID, tx); err != nil {
+	if !saved {
+		return false, nil
+	}
+	if err := h.publisher.PublishReversalCompleted(ctx, tx.ID(), tx); err != nil {
 		log.Error("failed to publish reversal completed", slog.String("error", err.Error()))
 	}
-
 	log.Info("reversal completed successfully")
-	return nil
+	return true, nil
 }

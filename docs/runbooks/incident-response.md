@@ -7,7 +7,7 @@ Este runbook describe el estado **actual** del sistema, no el previsto. Revisado
 
 | Herramienta | Dónde (Docker Compose) | Estado |
 |---|---|---|
-| Health checks | `/healthz` y `/readyz` de cada servicio | Funcionan; `readyz` verifica Postgres, y en Settlement también las tablas requeridas y NATS |
+| Health checks | `/healthz` y `/readyz` de cada servicio | Funcionan; `readyz` verifica Postgres; en Authorization, también el schema; en Settlement, también las tablas requeridas y NATS |
 | Logs JSON | `docker logs posnet-<servicio>` | Funcionan; primera herramienta para un caso puntual |
 | Métricas | Prometheus en `localhost:9099`, `/metrics` de cada servicio | Funcionan |
 | Dashboards | Grafana en `localhost:3000` | Saga, detalle por servicio, SLO, runtime e infraestructura |
@@ -43,7 +43,7 @@ Detection 8082, Settlement 8083 y Notification 8084.
 
 ```bash
 curl -s http://localhost:<port>/healthz   # 200 si el proceso está vivo
-curl -s http://localhost:<port>/readyz    # hace ping a Postgres (en Settlement, también tablas y NATS)
+curl -s http://localhost:<port>/readyz    # hace ping a Postgres (en Authorization, también el schema; en Settlement, también tablas y NATS)
 curl -s http://localhost:8222/healthz     # estado del servidor NATS
 
 docker ps --filter name=posnet- --format '{{.Names}}\t{{.Status}}'
@@ -55,8 +55,9 @@ alcanza Postgres: andá a la [sección 4](#4-postgres).
 
 En Settlement, `503` con `{"reason": "database schema incomplete"}` indica que falta aplicar una
 [migración](../technical/SETTLEMENT.md#aplicar-la-migración); el log `required tables are missing` nombra la tabla.
-Settlement es el único servicio cuyo `healthcheck` de Docker usa `readyz`: un contenedor `posnet-settlement` en
-`unhealthy` puede indicar eso o una caída de Postgres o NATS, aunque el proceso esté vivo.
+Authorization responde lo mismo, y su log `required schema is missing` nombra lo que falta. Authorization y Settlement son
+los únicos servicios cuyo `healthcheck` de Docker usa `readyz`: un contenedor `unhealthy` puede indicar eso o una caída de
+Postgres (en Settlement, también de NATS), aunque el proceso esté vivo. **Eso no frena el consumo de eventos.**
 
 **`readyz` no verifica NATS, salvo en Settlement,** donde responde `503` con `{"reason": "nats unavailable"}`.
 Los demás servicios pueden responder `200` sin poder consumir ni publicar eventos, por eso conviene
@@ -123,7 +124,11 @@ en Authorization es normal.
 | `fraud score event already processed — skipping` | **Si viene después de un error, la Saga se perdió:** la reentrega se descartó (ver [Reprocesamiento](nats-dlq-reprocess.md#3-confirmar-la-causa-y-entender-processed_events)) |
 | `reversal event already processed — skipping` | Lo mismo, para una reversa |
 | `failed to publish` | **Evento perdido.** Se registró el error y se confirmó el mensaje: nadie lo reintenta |
-| `acquirer error — marking transaction as indeterminate` | La transacción queda en `INDETERMINATE`, sin evento |
+| `acquirer error — marking transaction as indeterminate` | La transacción queda en `INDETERMINATE`. El conciliador la revierte y la rechaza |
+| `transaction not reconciled — retrying in the next run` | La reversa falló. La transacción sigue sin resultado y se reintenta sola |
+| `reversal not completed — retrying in the next run` | Falló una reversa pedida. La venta sigue vigente, y se reintenta sola |
+| `reversal ignored — nothing to reverse` | Se pidió la reversa de una transacción rechazada o ya revertida. No se llamó al adquirente |
+| `acquirer response arrived after the reconciler took the transaction` | Respuesta tardía: se ignora, y vale el rechazo del conciliador. Si `response_state` es `APPROVED`, verificá que el host haya procesado la reversa |
 | `acquirer reversal failed` | La reversa no se hizo y el mensaje se confirmó: requiere intervención manual |
 | `rule engine failed — using neutral score` | La transacción pasó como `REVIEW`, sin caso de fraude guardado |
 | `issuer ordered card capture` | Orden de retener la tarjeta; hoy no llega a ningún terminal |
@@ -228,7 +233,7 @@ síntoma parece otro.
 SELECT t.id, t.state, t.terminal_id, t.amount_cents, t.created_at, fc.decision AS fraud_decision
 FROM pn_authorization.transactions t
 LEFT JOIN fraud_detection.fraud_cases fc ON fc.transaction_id = t.id
-WHERE t.state IN ('FRAUD_CHECKING', 'INDETERMINATE')
+WHERE t.state IN ('FRAUD_CHECKING', 'PROCESSING', 'INDETERMINATE')
   AND t.created_at < NOW() - INTERVAL '5 minutes'
 ORDER BY t.created_at;
 ```
@@ -237,10 +242,18 @@ ORDER BY t.created_at;
 |---|---|---|
 | `FRAUD_CHECKING`, sin caso de fraude | El pedido se perdió, Fraud Detection no lo procesó, o falló su motor | [Reprocesar](nats-dlq-reprocess.md) desde `check-requested` |
 | `FRAUD_CHECKING`, con caso de fraude | El score se perdió o falló su procesamiento | [Reprocesar](nats-dlq-reprocess.md) según la tabla de `processed_events` |
-| `INDETERMINATE` | Error del adquirente; no hay conciliación automática ni evento. Con el mock actual no debería ocurrir | Conciliar con el adquirente, de forma manual |
+| `PROCESSING` o `INDETERMINATE` por más de 3 minutos | El conciliador no puede resolverla: alerta `TransaccionesSinResolver`. La reversa está fallando, o el conciliador está desactivado o sin la migración `000002` | Revisar el adquirente y los logs `transaction not reconciled`. Se resuelve sola cuando el host responda. **No la cierres a mano sin confirmar con el adquirente:** el emisor pudo haberla aprobado |
+
+```sql
+-- Reversas pedidas sin completar: la venta sigue vigente
+SELECT id, terminal_id, amount_cents, reversal_requested_at
+FROM pn_authorization.transactions
+WHERE state = 'APPROVED' AND reversal_requested_at IS NOT NULL
+ORDER BY reversal_requested_at;
+```
 
 **No hay timeout ni bypass de fraude**, aunque los logs y comentarios los mencionen: una transacción
-trabada no se resuelve sola. Para el cliente, Terminal Gateway borra la sesión vencida, y `GET
+trabada en `FRAUD_CHECKING` no se resuelve sola. Para el cliente, Terminal Gateway borra la sesión vencida, y `GET
 /api/sessions/{id}/status` pasa a responder `404`.
 
 ### Aprobaciones fuera de todo lote

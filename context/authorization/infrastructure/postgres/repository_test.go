@@ -11,6 +11,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/pashagolub/pgxmock/v4"
 
+	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/authorization/domain/repository"
 	"github.com/juantevez/go-posnet/context/authorization/domain/valueobject"
 	"github.com/juantevez/go-posnet/context/authorization/infrastructure/postgres"
 	"github.com/juantevez/go-posnet/pkg/domain"
@@ -351,5 +353,247 @@ func TestExistsByID_Error(t *testing.T) {
 	_, err := repo.ExistsByID(context.Background(), domain.NewTransactionID())
 	if err == nil || !strings.Contains(err.Error(), "TransactionRepo.ExistsByID") {
 		t.Fatalf("error = %v, want it to contain %q", err, "TransactionRepo.ExistsByID")
+	}
+}
+
+// ─── SaveIfState ──────────────────────────────────────────────────────────────
+
+func TestSaveIfState(t *testing.T) {
+	cases := map[string]struct {
+		rows int64
+		want bool
+	}{
+		"sigue en el estado esperado": {1, true},
+		"otro proceso la movió":       {0, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			pool := newMockPool(t)
+			tx := newApprovedTransaction(t)
+			pool.ExpectExec("WHERE id = .* AND state = ").
+				WithArgs(append([]any{tx.ID().String(), "PROCESSING", "APPROVED"}, anyArgs(7)...)...).
+				WillReturnResult(pgxmock.NewResult("UPDATE", tc.rows))
+
+			got, err := postgres.NewTransactionRepo(pool).SaveIfState(context.Background(), tx, valueobject.StateProcessing)
+			if err != nil || got != tc.want {
+				t.Errorf("SaveIfState() = %v, %v, want %v", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestSaveIfState_ExecError(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectExec("WHERE id = ").WithArgs(anyArgs(10)...).WillReturnError(errors.New("db down"))
+
+	if _, err := postgres.NewTransactionRepo(pool).SaveIfState(context.Background(), newApprovedTransaction(t), valueobject.StateProcessing); err == nil {
+		t.Fatal("SaveIfState() error = nil, want error")
+	}
+}
+
+func TestSaveIfStateTx_UsesCallerTransaction(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectBegin()
+	dbTx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	pool.ExpectExec("WHERE id = ").WithArgs(anyArgs(10)...).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+	got, err := postgres.NewTransactionRepo(pool).SaveIfStateTx(context.Background(), dbTx, newApprovedTransaction(t), valueobject.StateFraudChecking)
+	if err != nil || !got {
+		t.Errorf("SaveIfStateTx() = %v, %v", got, err)
+	}
+}
+
+func TestFindUnresolved(t *testing.T) {
+	pool := newMockPool(t)
+	before := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	f := newRowFixture(t)
+	f.state = "INDETERMINATE"
+	pool.ExpectQuery("state = 'INDETERMINATE'").WithArgs(before, 10).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(f.id))
+	pool.ExpectQuery("WHERE id = ").WithArgs(f.id).WillReturnRows(f.rows())
+
+	got, err := postgres.NewTransactionRepo(pool).FindUnresolved(context.Background(), before, 10)
+	if err != nil {
+		t.Fatalf("FindUnresolved() error = %v", err)
+	}
+	if len(got) != 1 || got[0].State() != valueobject.StateIndeterminate {
+		t.Errorf("got = %+v", got)
+	}
+}
+
+func TestFindUnresolved_QueryError(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectQuery("state = 'INDETERMINATE'").WithArgs(anyArgs(2)...).WillReturnError(errors.New("db down"))
+
+	if _, err := postgres.NewTransactionRepo(pool).FindUnresolved(context.Background(), time.Now(), 10); err == nil {
+		t.Fatal("FindUnresolved() error = nil, want error")
+	}
+}
+
+func TestCountUnresolved(t *testing.T) {
+	pool := newMockPool(t)
+	before := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	reversals := before.Add(time.Minute)
+	pool.ExpectQuery("COUNT").WithArgs(before, reversals).
+		WillReturnRows(pgxmock.NewRows([]string{"i", "p", "r"}).AddRow(int64(2), int64(3), int64(4)))
+
+	got, err := postgres.NewTransactionRepo(pool).CountUnresolved(context.Background(), before, reversals)
+	want := repository.UnresolvedCounts{Indeterminate: 2, Processing: 3, ReversalPending: 4}
+	if err != nil || got != want {
+		t.Errorf("CountUnresolved() = %+v, %v, want %+v", got, err, want)
+	}
+}
+
+func TestFindPendingReversals(t *testing.T) {
+	pool := newMockPool(t)
+	before := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	f := newRowFixture(t)
+	f.state = "APPROVED"
+	requested := before.Add(-time.Minute)
+	f.reversalRequestedAt = &requested
+	pool.ExpectQuery("reversal_requested_at < ").WithArgs(before, 10).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(f.id))
+	pool.ExpectQuery("WHERE id = ").WithArgs(f.id).WillReturnRows(f.rows())
+
+	got, err := postgres.NewTransactionRepo(pool).FindPendingReversals(context.Background(), before, 10)
+	if err != nil {
+		t.Fatalf("FindPendingReversals() error = %v", err)
+	}
+	if len(got) != 1 || got[0].ReversalRequestedAt() == nil || !got[0].ReversalRequestedAt().Equal(requested) {
+		t.Errorf("got = %+v", got)
+	}
+}
+
+func TestMarkReversalRequestedTx_KeepsFirstRequest(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectBegin()
+	dbTx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	id := domain.NewTransactionID()
+	pool.ExpectExec("COALESCE\\(reversal_requested_at, now\\(\\)\\)").WithArgs(id.String()).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+	if err := postgres.NewTransactionRepo(pool).MarkReversalRequestedTx(context.Background(), dbTx, id); err != nil {
+		t.Fatalf("MarkReversalRequestedTx() error = %v", err)
+	}
+}
+
+func TestMissingSchema(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectQuery("information_schema.columns").WithArgs(anyArgs(2)...).
+		WillReturnRows(pgxmock.NewRows([]string{"item"}).AddRow("pn_authorization.transactions.reversal_requested_at"))
+
+	got, err := postgres.NewTransactionRepo(pool).MissingSchema(context.Background())
+	if err != nil || len(got) != 1 {
+		t.Errorf("MissingSchema() = %v, %v", got, err)
+	}
+}
+
+func TestMissingSchema_QueryError(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectQuery("information_schema.columns").WithArgs(anyArgs(2)...).WillReturnError(errors.New("db down"))
+
+	if _, err := postgres.NewTransactionRepo(pool).MissingSchema(context.Background()); err == nil {
+		t.Fatal("MissingSchema() error = nil, want error")
+	}
+}
+
+// Sin escenarios, el mock aprueba cualquier monto, también los reservados.
+func TestMockAcquirer_ScenariosAreOptIn(t *testing.T) {
+	tx := mockTx(t, postgres.MockAmountError)
+	resp, err := postgres.NewMockAcquirerGateway(false).Authorize(context.Background(), tx)
+	if err != nil || !resp.IsApproved() {
+		t.Errorf("Authorize() = %+v, %v, want approved", resp, err)
+	}
+}
+
+func TestMockAcquirer_Scenarios(t *testing.T) {
+	m := postgres.NewMockAcquirerGateway(true)
+	ctx := context.Background()
+
+	if resp, err := m.Authorize(ctx, mockTx(t, 12345)); err != nil || !resp.IsApproved() {
+		t.Errorf("normal amount = %+v, %v", resp, err)
+	}
+	if resp, err := m.Authorize(ctx, mockTx(t, postgres.MockAmountDecline)); err != nil || resp.ResponseCode != valueobject.ISO_INSUFFICIENT_FUNDS {
+		t.Errorf("decline = %+v, %v", resp, err)
+	}
+	if resp, err := m.Authorize(ctx, mockTx(t, postgres.MockAmountCaptureCard)); err != nil || resp.ResponseCode != valueobject.ISO_LOST_CARD {
+		t.Errorf("capture = %+v, %v", resp, err)
+	}
+	if _, err := m.Authorize(ctx, mockTx(t, postgres.MockAmountError)); err == nil {
+		t.Error("error scenario returned no error")
+	}
+
+	hangCtx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if _, err := m.Authorize(hangCtx, mockTx(t, postgres.MockAmountHang)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("hang = %v, want it to end with the context", err)
+	}
+
+	tx := mockTx(t, postgres.MockAmountReverseFails)
+	for i := range 2 {
+		if err := m.Reverse(ctx, tx); err == nil {
+			t.Errorf("reverse %d should fail", i)
+		}
+	}
+	if err := m.Reverse(ctx, tx); err != nil {
+		t.Errorf("third reverse = %v, want success", err)
+	}
+}
+
+func mockTx(t *testing.T, cents int64) *aggregate.Transaction {
+	t.Helper()
+	tx, err := aggregate.NewTransaction(
+		domain.NewTransactionID(), domain.NewTerminalID(), domain.NewMerchantID(),
+		mustMoney(t, cents), mustSTAN(t, 1), mustPAN(t), valueobject.EntryModeChip, domain.CardToken{}, "", nil,
+	)
+	if err != nil {
+		t.Fatalf("NewTransaction() error = %v", err)
+	}
+	return tx
+}
+
+// La lectura usa la conexión de la transacción y bloquea la fila.
+func TestFindByIDForUpdateTx(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectBegin()
+	dbTx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	f := newRowFixture(t)
+	f.state = "FRAUD_CHECKING"
+	pool.ExpectQuery("FOR UPDATE").WithArgs(f.id).WillReturnRows(f.rows())
+
+	id, err := domain.ParseTransactionID(f.id)
+	if err != nil {
+		t.Fatalf("ParseTransactionID() error = %v", err)
+	}
+	got, err := postgres.NewTransactionRepo(pool).FindByIDForUpdateTx(context.Background(), dbTx, id)
+	if err != nil || got.State() != valueobject.StateFraudChecking {
+		t.Errorf("FindByIDForUpdateTx() = %v, %v", got, err)
+	}
+}
+
+// Una fila ilegible no impide resolver las demás.
+func TestFindUnresolved_SkipsUnreadableRow(t *testing.T) {
+	pool := newMockPool(t)
+	bad, good := newRowFixture(t), newRowFixture(t)
+	bad.state, good.state = "INDETERMINATE", "INDETERMINATE"
+	pool.ExpectQuery("state = 'INDETERMINATE'").WithArgs(anyArgs(2)...).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(bad.id).AddRow(good.id))
+	pool.ExpectQuery("WHERE id = ").WithArgs(bad.id).WillReturnError(errors.New("cannot scan NULL"))
+	pool.ExpectQuery("WHERE id = ").WithArgs(good.id).WillReturnRows(good.rows())
+
+	got, err := postgres.NewTransactionRepo(pool).FindUnresolved(context.Background(), time.Now(), 10)
+	if err != nil {
+		t.Fatalf("FindUnresolved() error = %v", err)
+	}
+	if len(got) != 1 || got[0].ID().String() != good.id {
+		t.Errorf("got = %+v, want only the readable row", got)
 	}
 }

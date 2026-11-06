@@ -49,10 +49,15 @@ const (
 	ISO_SYSTEM_MALFUNCTION  = "96"
 )
 
+// codeTimeout es el código de una transacción sin respuesta del adquirente, ya revertida.
+const codeTimeout = "TIMEOUT"
+
 // retryableCodes son códigos donde tiene sentido reintentar la transacción.
 var retryableCodes = map[string]bool{
 	ISO_ISSUER_UNAVAILABLE: true,
 	ISO_SYSTEM_MALFUNCTION: true,
+	// El conciliador ya revirtió la operación: reintentar no cobra dos veces.
+	codeTimeout: true,
 }
 
 // isoDescriptions mapea código → descripción legible para logs y comprobantes.
@@ -77,6 +82,7 @@ var isoDescriptions = map[string]string{
 	ISO_SYSTEM_MALFUNCTION:  "System Malfunction",
 
 	domain.CodeCardBlocked: "Card Blocked - Pick Up",
+	codeTimeout:            "No Response From Acquirer - Reversed",
 }
 
 // NewRejectionFromISO crea un RejectionCode a partir de un código ISO 8583.
@@ -94,7 +100,7 @@ func NewRejectionFromFraud() RejectionCode {
 
 // NewRejectionFromTimeout crea un RejectionCode para timeouts del adquirente.
 func NewRejectionFromTimeout() RejectionCode {
-	return RejectionCode{code: "TIMEOUT", source: SourceTimeout}
+	return RejectionCode{code: codeTimeout, source: SourceTimeout}
 }
 
 // NewRejectionFromBlocklist crea un RejectionCode para tarjetas bloqueadas.

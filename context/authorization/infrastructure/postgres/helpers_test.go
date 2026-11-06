@@ -137,7 +137,7 @@ var txColumns = []string{
 	"fraud_score", "fraud_decision", "fraud_rules_hit",
 	"emv_data_b64", "iso8583_raw",
 	"created_at", "authorized_at", "rejected_at",
-	"card_token",
+	"card_token", "reversal_requested_at",
 }
 
 // rowFixture arma los valores de una fila de pn_authorization.transactions.
@@ -162,6 +162,7 @@ type rowFixture struct {
 	createdAt                        time.Time
 	authorizedAt, rejectedAt         *time.Time
 	cardToken                        *string
+	reversalRequestedAt              *time.Time
 }
 
 func newRowFixture(t *testing.T) rowFixture {
@@ -192,6 +193,6 @@ func (f rowFixture) rows() *pgxmock.Rows {
 		f.fraudScore, f.fraudDecision, f.fraudRulesHit,
 		f.emvDataB64, f.iso8583Raw,
 		f.createdAt, f.authorizedAt, f.rejectedAt,
-		f.cardToken,
+		f.cardToken, f.reversalRequestedAt,
 	)
 }

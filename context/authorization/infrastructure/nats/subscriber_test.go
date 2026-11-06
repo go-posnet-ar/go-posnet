@@ -258,7 +258,6 @@ func TestHandleFraudScoreCalculated_HandlerValidationError(t *testing.T) {
 	// El claim de idempotencia ocurre antes de validar el TransactionID, así
 	// que igual hace falta el pool mockeado.
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
 
 	repo := &fakeRepo{}
 	h := command.NewAuthorizationHandler(repo, &fakeAcquirer{}, &fakeDomainPublisher{}, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool)
@@ -338,7 +337,6 @@ func TestHandleReversalRequested_Success(t *testing.T) {
 
 func TestHandleReversalRequested_HandlerValidationError(t *testing.T) {
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
 
 	repo := &fakeRepo{}
 	h := command.NewAuthorizationHandler(repo, &fakeAcquirer{}, &fakeDomainPublisher{}, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool)

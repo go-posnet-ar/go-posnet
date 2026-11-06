@@ -41,6 +41,17 @@ CREATE TABLE IF NOT EXISTS pn_authorization.transactions (
 ALTER TABLE pn_authorization.transactions
     ADD COLUMN IF NOT EXISTS card_token CHAR(64);
 
+ALTER TABLE pn_authorization.transactions
+    ADD COLUMN IF NOT EXISTS processing_started_at TIMESTAMPTZ;
+ALTER TABLE pn_authorization.transactions
+    ADD COLUMN IF NOT EXISTS reversal_requested_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_auth_txn_reversal_pending
+    ON pn_authorization.transactions (reversal_requested_at)
+    WHERE state = 'APPROVED' AND reversal_requested_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_auth_txn_unresolved
+    ON pn_authorization.transactions (created_at)
+    WHERE state IN ('PROCESSING', 'INDETERMINATE');
+
 CREATE INDEX IF NOT EXISTS idx_auth_txn_card_token
     ON pn_authorization.transactions(card_token)
     WHERE card_token IS NOT NULL;

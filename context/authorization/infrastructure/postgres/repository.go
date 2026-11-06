@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/authorization/domain/repository"
 	"github.com/juantevez/go-posnet/context/authorization/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
@@ -23,6 +25,12 @@ import (
 type pgxPool interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// execer es lo que comparten el pool y una transacción para ejecutar un comando.
+type execer interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 }
 
 // TransactionRepo implementa repository.TransactionRepository usando pgx/v5.
@@ -132,6 +140,208 @@ func (r *TransactionRepo) Save(ctx context.Context, tx *aggregate.Transaction) e
 	return nil
 }
 
+// SaveIfState guarda el estado y el resultado solo si en la base sigue en expected.
+func (r *TransactionRepo) SaveIfState(ctx context.Context, tx *aggregate.Transaction, expected valueobject.TransactionState) (bool, error) {
+	return saveIfState(ctx, r.pool, tx, expected)
+}
+
+// SaveIfStateTx hace lo mismo que SaveIfState dentro de una transacción existente.
+func (r *TransactionRepo) SaveIfStateTx(ctx context.Context, dbTx pgx.Tx, tx *aggregate.Transaction, expected valueobject.TransactionState) (bool, error) {
+	return saveIfState(ctx, dbTx, tx, expected)
+}
+
+// saveIfState es la única forma segura de avanzar la Saga: la condición sobre el estado la
+// evalúa Postgres, así que de dos procesos que intentan la misma transición gana uno solo.
+func saveIfState(ctx context.Context, db execer, tx *aggregate.Transaction, expected valueobject.TransactionState) (bool, error) {
+	const query = `
+		UPDATE pn_authorization.transactions SET
+			state            = $3::text,
+			auth_code        = $4,
+			rejection_code   = $5,
+			rejection_source = $6,
+			fraud_score      = $7,
+			fraud_decision   = $8,
+			authorized_at    = $9,
+			rejected_at      = $10,
+			processing_started_at = CASE WHEN $3::text = 'PROCESSING' THEN now() ELSE processing_started_at END
+		WHERE id = $1 AND state = $2
+	`
+	var authCode *string
+	if tx.AuthCode() != nil {
+		s := tx.AuthCode().String()
+		authCode = &s
+	}
+	var rejCode, rejSource *string
+	if tx.RejectionCode() != nil {
+		c := tx.RejectionCode().Code()
+		s := string(tx.RejectionCode().Source())
+		rejCode = &c
+		rejSource = &s
+	}
+	var fraudScore *int
+	var fraudDecision *string
+	if !tx.FraudDecision().IsZero() {
+		fs := tx.FraudDecision().Score
+		fd := tx.FraudDecision().Decision
+		fraudScore = &fs
+		fraudDecision = &fd
+	}
+
+	tag, err := db.Exec(ctx, query,
+		tx.ID().String(), expected.String(), tx.State().String(),
+		authCode, rejCode, rejSource, fraudScore, fraudDecision,
+		tx.AuthorizedAt(), tx.RejectedAt(),
+	)
+	if err != nil {
+		return false, fmt.Errorf("TransactionRepo.SaveIfState: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// FindUnresolved devuelve las transacciones que el conciliador debe resolver. COALESCE cubre
+// una fila en PROCESSING sin fecha: no debería existir, pero no puede quedar sin resolver.
+//
+// Lista los IDs y carga cada una por separado, porque un error de Scan cierra el cursor de pgx:
+// si no, una fila ilegible frenaría a todas. CountUnresolved la sigue contando, así que la
+// alerta avisa de que no se resolvió.
+func (r *TransactionRepo) FindUnresolved(ctx context.Context, processingBefore time.Time, limit int) ([]*aggregate.Transaction, error) {
+	const query = `
+		SELECT id::text
+		FROM pn_authorization.transactions
+		WHERE state = 'INDETERMINATE'
+		   OR (state = 'PROCESSING' AND COALESCE(processing_started_at, created_at) < $1)
+		ORDER BY created_at
+		LIMIT $2
+	`
+	return r.loadByIDs(ctx, query, processingBefore, limit)
+}
+
+// FindPendingReversals devuelve las transacciones con un pedido de reversa sin completar.
+func (r *TransactionRepo) FindPendingReversals(ctx context.Context, requestedBefore time.Time, limit int) ([]*aggregate.Transaction, error) {
+	const query = `
+		SELECT id::text
+		FROM pn_authorization.transactions
+		WHERE state = 'APPROVED' AND reversal_requested_at < $1
+		ORDER BY reversal_requested_at
+		LIMIT $2
+	`
+	return r.loadByIDs(ctx, query, requestedBefore, limit)
+}
+
+// loadByIDs ejecuta una consulta de IDs y carga cada transacción. Ver FindUnresolved.
+func (r *TransactionRepo) loadByIDs(ctx context.Context, query string, args ...any) ([]*aggregate.Transaction, error) {
+	rows, err := r.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("TransactionRepo.loadByIDs: query: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("TransactionRepo.loadByIDs: scan: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("TransactionRepo.loadByIDs: rows: %w", err)
+	}
+	rows.Close()
+
+	txs := make([]*aggregate.Transaction, 0, len(ids))
+	for _, id := range ids {
+		txID, err := domain.ParseTransactionID(id)
+		if err != nil {
+			slog.ErrorContext(ctx, "unreadable transaction skipped by the reconciler", slog.String("transaction_id", id), slog.String("error", err.Error()))
+			continue
+		}
+		tx, err := r.FindByID(ctx, txID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("TransactionRepo.loadByIDs: %w", ctx.Err())
+			}
+			slog.ErrorContext(ctx, "unreadable transaction skipped by the reconciler", slog.String("transaction_id", id), slog.String("error", err.Error()))
+			continue
+		}
+		txs = append(txs, tx)
+	}
+	return txs, nil
+}
+
+// MarkReversalRequestedTx guarda el pedido de reversa, conservando la fecha del primero.
+func (r *TransactionRepo) MarkReversalRequestedTx(ctx context.Context, dbTx pgx.Tx, id domain.TransactionID) error {
+	const query = `
+		UPDATE pn_authorization.transactions
+		SET reversal_requested_at = COALESCE(reversal_requested_at, now())
+		WHERE id = $1
+	`
+	if _, err := dbTx.Exec(ctx, query, id.String()); err != nil {
+		return fmt.Errorf("TransactionRepo.MarkReversalRequestedTx: %w", err)
+	}
+	return nil
+}
+
+// CountUnresolved cuenta las transacciones sin resolver, por motivo.
+func (r *TransactionRepo) CountUnresolved(ctx context.Context, processingBefore, reversalsBefore time.Time) (repository.UnresolvedCounts, error) {
+	const query = `
+		SELECT
+			COUNT(*) FILTER (WHERE state = 'INDETERMINATE'),
+			COUNT(*) FILTER (WHERE state = 'PROCESSING' AND COALESCE(processing_started_at, created_at) < $1),
+			COUNT(*) FILTER (WHERE state = 'APPROVED' AND reversal_requested_at < $2)
+		FROM pn_authorization.transactions
+		WHERE state IN ('INDETERMINATE', 'PROCESSING')
+		   OR (state = 'APPROVED' AND reversal_requested_at IS NOT NULL)
+	`
+	var c repository.UnresolvedCounts
+	if err := r.pool.QueryRow(ctx, query, processingBefore, reversalsBefore).Scan(&c.Indeterminate, &c.Processing, &c.ReversalPending); err != nil {
+		return repository.UnresolvedCounts{}, fmt.Errorf("TransactionRepo.CountUnresolved: %w", err)
+	}
+	return c, nil
+}
+
+// requiredTables y requiredColumns son lo que el servicio necesita para operar. Las
+// migraciones se aplican a mano, y olvidar una no da otro aviso: /readyz lo informa.
+var (
+	requiredTables = []string{
+		"pn_authorization.transactions",
+		"pn_authorization.processed_events",
+		"pn_authorization.blocked_cards",
+	}
+	requiredColumns = []string{"card_token", "processing_started_at", "reversal_requested_at"}
+)
+
+// MissingSchema devuelve las tablas y columnas requeridas que no existen.
+func (r *TransactionRepo) MissingSchema(ctx context.Context) ([]string, error) {
+	const query = `
+		SELECT t FROM unnest($1::text[]) AS t WHERE to_regclass(t) IS NULL
+		UNION ALL
+		SELECT 'pn_authorization.transactions.' || c FROM unnest($2::text[]) AS c
+		WHERE NOT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'pn_authorization' AND table_name = 'transactions' AND column_name = c
+		)
+	`
+	rows, err := r.pool.Query(ctx, query, requiredTables, requiredColumns)
+	if err != nil {
+		return nil, fmt.Errorf("TransactionRepo.MissingSchema: %w", err)
+	}
+	defer rows.Close()
+
+	var missing []string
+	for rows.Next() {
+		var item string
+		if err := rows.Scan(&item); err != nil {
+			return nil, fmt.Errorf("TransactionRepo.MissingSchema: scan: %w", err)
+		}
+		missing = append(missing, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("TransactionRepo.MissingSchema: rows: %w", err)
+	}
+	return missing, nil
+}
+
 // FindByID recupera una Transaction por su ID.
 func (r *TransactionRepo) FindByID(ctx context.Context, id domain.TransactionID) (*aggregate.Transaction, error) {
 	const query = `
@@ -143,13 +353,33 @@ func (r *TransactionRepo) FindByID(ctx context.Context, id domain.TransactionID)
 			fraud_score, fraud_decision, fraud_rules_hit,
 			emv_data_b64, iso8583_raw,
 			created_at, authorized_at, rejected_at,
-			card_token
+			card_token, reversal_requested_at
 		FROM pn_authorization.transactions
 		WHERE id = $1
 	`
 
 	row := r.pool.QueryRow(ctx, query, id.String())
 	return scanTransaction(row)
+}
+
+// FindByIDForUpdateTx usa la conexión de dbTx: pedir otra al pool con una transacción abierta
+// bloquea el servicio cuando todas las conexiones están esperando una más.
+func (r *TransactionRepo) FindByIDForUpdateTx(ctx context.Context, dbTx pgx.Tx, id domain.TransactionID) (*aggregate.Transaction, error) {
+	const query = `
+		SELECT
+			id, terminal_id, merchant_id,
+			state, amount_cents, currency,
+			pan_last4, card_network, entry_mode,
+			stan, auth_code, rejection_code, rejection_source,
+			fraud_score, fraud_decision, fraud_rules_hit,
+			emv_data_b64, iso8583_raw,
+			created_at, authorized_at, rejected_at,
+			card_token, reversal_requested_at
+		FROM pn_authorization.transactions
+		WHERE id = $1
+		FOR UPDATE
+	`
+	return scanTransaction(dbTx.QueryRow(ctx, query, id.String()))
 }
 
 // FindBySTAN recupera una transacción por STAN y terminal en un día dado.
@@ -168,7 +398,7 @@ func (r *TransactionRepo) FindBySTAN(
 			fraud_score, fraud_decision, fraud_rules_hit,
 			emv_data_b64, iso8583_raw,
 			created_at, authorized_at, rejected_at,
-			card_token
+			card_token, reversal_requested_at
 		FROM pn_authorization.transactions
 		WHERE terminal_id = $1
 		  AND stan = $2
@@ -242,6 +472,8 @@ type txRow struct {
 	AuthorizedAt    *time.Time
 	RejectedAt      *time.Time
 	CardToken       *string
+
+	ReversalRequestedAt *time.Time
 }
 
 func scanTransaction(row pgx.Row) (*aggregate.Transaction, error) {
@@ -254,7 +486,7 @@ func scanTransaction(row pgx.Row) (*aggregate.Transaction, error) {
 		&r.FraudScore, &r.FraudDecision, &r.FraudRulesHit,
 		&r.EMVDataB64, &r.ISO8583Raw,
 		&r.CreatedAt, &r.AuthorizedAt, &r.RejectedAt,
-		&r.CardToken,
+		&r.CardToken, &r.ReversalRequestedAt,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -317,5 +549,7 @@ func scanTransaction(row pgx.Row) (*aggregate.Transaction, error) {
 		ReceivedAt:      r.CreatedAt,
 		AuthorizedAt:    r.AuthorizedAt,
 		RejectedAt:      r.RejectedAt,
+
+		ReversalRequestedAt: r.ReversalRequestedAt,
 	}), nil
 }

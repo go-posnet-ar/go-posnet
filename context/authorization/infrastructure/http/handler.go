@@ -4,6 +4,7 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -21,6 +22,8 @@ import (
 type Handler struct {
 	queryService port.QueryService
 	pool         pgutil.PgxPool
+	// missingSchema informa las tablas y columnas que faltan en la base; nil = sin verificar.
+	missingSchema func(ctx context.Context) ([]string, error)
 }
 
 func NewHandler(queryService port.QueryService, pool pgutil.PgxPool) *Handler {
@@ -48,6 +51,24 @@ func (h *Handler) handleReady(w http.ResponseWriter, r *http.Request) {
 			"reason": "database unavailable",
 		})
 		return
+	}
+	if h.missingSchema != nil {
+		missing, err := h.missingSchema(r.Context())
+		if err != nil {
+			slog.Error("readiness: could not check the schema", slog.String("error", err.Error()))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"status": "not ready", "reason": "database unavailable",
+			})
+			return
+		}
+		// Los nombres van al log: este endpoint no pide token.
+		if len(missing) > 0 {
+			slog.Error("readiness: required schema is missing — apply the migrations", slog.Any("missing", missing))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"status": "not ready", "reason": "database schema incomplete",
+			})
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }

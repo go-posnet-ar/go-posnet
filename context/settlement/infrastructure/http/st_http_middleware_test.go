@@ -72,7 +72,7 @@ func TestRecoverMiddleware_RecoversFromErrorPanic(t *testing.T) {
 
 func TestRecoverMiddleware_RecoversFromNilPanic(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		panic(nil)
+		panic(127)
 	})
 	handler := recoverMiddleware(next)
 

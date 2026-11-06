@@ -310,3 +310,58 @@ func TestLoad_PanicsWithoutNATSURL(t *testing.T) {
 	}()
 	_, _ = Load()
 }
+
+func TestLoad_ReconcilerConfig(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "postgres://x")
+	t.Setenv("NATS_URL", "nats://x")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Acquirer.ReconcileEvery != 30*time.Second || cfg.Acquirer.StuckAfter != 2*time.Minute {
+		t.Errorf("defaults = %v, %v", cfg.Acquirer.ReconcileEvery, cfg.Acquirer.StuckAfter)
+	}
+
+	// Con un límite menor que el timeout, revertiría llamadas en curso.
+	t.Setenv("ACQUIRER_STUCK_AFTER", "30s")
+	if _, err := Load(); err == nil {
+		t.Error("Load() error = nil with ACQUIRER_STUCK_AFTER equal to the timeout")
+	}
+
+	t.Setenv("ACQUIRER_STUCK_AFTER", "2m")
+	t.Setenv("ACQUIRER_RECONCILE_EVERY", "-1s")
+	if _, err := Load(); err == nil {
+		t.Error("Load() error = nil with a negative ACQUIRER_RECONCILE_EVERY")
+	}
+}
+
+func TestLoad_AcquirerCallsConfig(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "postgres://x")
+	t.Setenv("NATS_URL", "nats://x")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Acquirer.MaxConcurrent != 20 || cfg.Acquirer.MockScenarios {
+		t.Errorf("defaults = %d, %v", cfg.Acquirer.MaxConcurrent, cfg.Acquirer.MockScenarios)
+	}
+
+	t.Setenv("ACQUIRER_MAX_CONCURRENT", "0")
+	if _, err := Load(); err == nil {
+		t.Error("Load() error = nil with ACQUIRER_MAX_CONCURRENT=0")
+	}
+	t.Setenv("ACQUIRER_MAX_CONCURRENT", "20")
+
+	// Montos que no se aprueban, en producción: nunca.
+	t.Setenv("ACQUIRER_MOCK_SCENARIOS", "true")
+	t.Setenv("ENVIRONMENT", "production")
+	if _, err := Load(); err == nil {
+		t.Error("Load() error = nil with mock scenarios in production")
+	}
+	t.Setenv("ENVIRONMENT", "development")
+	if cfg, err := Load(); err != nil || !cfg.Acquirer.MockScenarios {
+		t.Errorf("Load() = %+v, %v", cfg, err)
+	}
+}

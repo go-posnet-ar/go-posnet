@@ -36,3 +36,13 @@ func expectClaimed(pool pgxmock.PgxPoolIface, rowsAffected int64) {
 	pool.ExpectCommit()
 	pool.ExpectRollback()
 }
+
+// expectClaimedThenRollback simula un claim exitoso seguido de un error en la misma
+// transacción: el evento no queda marcado y la reentrega puede reprocesarlo.
+func expectClaimedThenRollback(pool pgxmock.PgxPoolIface) {
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectExec("INSERT INTO " + idempotencySchema + ".processed_events").
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectRollback()
+}

@@ -55,6 +55,9 @@ type Transaction struct {
 	authorizedAt *time.Time
 	rejectedAt   *time.Time
 
+	// reversalRequestedAt indica desde cuándo hay un pedido de reversa sin completar.
+	reversalRequestedAt *time.Time
+
 	// Eventos de dominio pendientes de publicar
 	// Se limpian después de que el adaptador los publica a NATS.
 	domainEvents []event.DomainEvent
@@ -227,6 +230,9 @@ func (t *Transaction) ISO8583Raw() []byte                       { return t.iso85
 func (t *Transaction) ReceivedAt() time.Time                    { return t.receivedAt }
 func (t *Transaction) AuthorizedAt() *time.Time                 { return t.authorizedAt }
 func (t *Transaction) RejectedAt() *time.Time                   { return t.rejectedAt }
+
+// ReversalRequestedAt indica desde cuándo se pidió la reversa. Nil si no se pidió.
+func (t *Transaction) ReversalRequestedAt() *time.Time { return t.reversalRequestedAt }
 
 func (t *Transaction) AuthCode() *domain.AuthCode {
 	return t.authCode

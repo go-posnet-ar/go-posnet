@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/juantevez/go-posnet/context/authorization/application/port"
@@ -14,13 +15,14 @@ import (
 // Rutas expuestas:
 //
 //	GET  /healthz              → liveness probe
-//	GET  /readyz               → readiness probe (verifica Postgres)
+//	GET  /readyz               → readiness probe (verifica Postgres y el schema)
 //	GET  /metrics              → métricas Prometheus
 //	GET  /transactions/{id}    → estado de una transacción (operaciones)
-func NewRouter(queryService port.QueryService, pool pgutil.PgxPool) http.Handler {
+func NewRouter(queryService port.QueryService, pool pgutil.PgxPool, missingSchema func(ctx context.Context) ([]string, error)) http.Handler {
 	mux := http.NewServeMux()
 
 	h := NewHandler(queryService, pool)
+	h.missingSchema = missingSchema
 	h.RegisterRoutes(mux)
 
 	// Registrar endpoint de métricas Prometheus.

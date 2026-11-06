@@ -4214,6 +4214,886 @@
       ]
     },
     {
+      "name": "🔌 Adquirente — Fallos y reversas",
+      "description": "Requiere ACQUIRER_MOCK_SCENARIOS=true, activado en Docker Compose.",
+      "item": [
+        {
+          "name": "Rechazo del emisor",
+          "item": [
+            {
+              "name": "AQ-01 Crear sesión de 770051",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('tx_amount', 770051);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-02 Pagar",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-03 Esperar el rechazo",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.state === 'REJECTED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La sesión termina en REJECTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "  pm.test('Código 51', function () { pm.expect(json.rejection_code).to.eql('51'); });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status"
+              }
+            },
+            {
+              "name": "AQ-04 Verificar en Authorization",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'REJECTED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"Authorization en REJECTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "  pm.test('Código 51', function () { pm.expect(json.RejectionCode).to.eql('51'); });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_auth}}/transactions/{{transaction_id}}"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Rechazo con retención de tarjeta",
+          "item": [
+            {
+              "name": "AQ-10 Crear sesión de 770041",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('tx_amount', 770041);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-11 Pagar",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-12 Esperar el rechazo",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.state === 'REJECTED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La sesión termina en REJECTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "  pm.test('Código 41', function () { pm.expect(json.rejection_code).to.eql('41'); });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Error del adquirente: lo resuelve el conciliador",
+          "description": "El cliente recibe un rechazo por TIMEOUT cuando el conciliador revierte la operación.",
+          "item": [
+            {
+              "name": "AQ-20 Crear sesión de 770091",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('tx_amount', 770091);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-21 Pagar",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-22 Esperar el rechazo del conciliador",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.state === 'REJECTED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La sesión termina en REJECTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "  pm.test('Código TIMEOUT', function () { pm.expect(json.rejection_code).to.eql('TIMEOUT'); });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status"
+              }
+            },
+            {
+              "name": "AQ-23 Verificar en Authorization",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'REJECTED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"Authorization en REJECTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "  pm.test('Código TIMEOUT', function () { pm.expect(json.RejectionCode).to.eql('TIMEOUT'); });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_auth}}/transactions/{{transaction_id}}"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Adquirente sin respuesta: vence el timeout",
+          "item": [
+            {
+              "name": "AQ-30 Crear sesión de 770098",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('tx_amount', 770098);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-31 Pagar",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-32 Esperar el rechazo del conciliador",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.state === 'REJECTED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La sesión termina en REJECTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "  pm.test('Código TIMEOUT', function () { pm.expect(json.rejection_code).to.eql('TIMEOUT'); });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reversa de una venta rechazada: se ignora",
+          "item": [
+            {
+              "name": "AQ-40 Crear sesión de 770051",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('tx_amount', 770051);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-41 Pagar",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-42 Esperar el rechazo",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.state === 'REJECTED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La sesión termina en REJECTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "  pm.test('Código 51', function () { pm.expect(json.rejection_code).to.eql('51'); });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status"
+              }
+            },
+            {
+              "name": "AQ-43 Pedir la reversa",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/sessions/{{transaction_id}}/reversal",
+                "header": [
+                  {
+                    "key": "X-Terminal-ID",
+                    "value": "{{terminal_id}}"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "AQ-44 Sigue REJECTED",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "setTimeout(function () {}, 1500);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('Sigue REJECTED', function () { pm.expect(pm.response.json().State).to.eql('REJECTED'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_auth}}/transactions/{{transaction_id}}"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Reversa que falla: se reintenta hasta completarse",
+          "description": "El mock falla las dos primeras reversas de este monto. Deja la venta y su reversa en el lote abierto: lo cierra el paso de preparación de la próxima corrida.",
+          "item": [
+            {
+              "name": "AQ-50 Crear sesión de 770092",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('tx_amount', 770092);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-51 Pagar",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-52 Esperar la aprobación",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.state === 'APPROVED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La sesión termina en APPROVED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status"
+              }
+            },
+            {
+              "name": "AQ-53 Pedir la reversa",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/sessions/{{transaction_id}}/reversal",
+                "header": [
+                  {
+                    "key": "X-Terminal-ID",
+                    "value": "{{terminal_id}}"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "AQ-54 Sigue APPROVED, con el pedido guardado",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "setTimeout(function () {}, 500);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "var b = pm.response.json();",
+                      "pm.test('Sigue vigente', function () { pm.expect(b.State).to.eql('APPROVED'); });",
+                      "pm.test('Informa el pedido', function () { pm.expect(b.ReversalRequestedAt).to.not.be.empty; });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_auth}}/transactions/{{transaction_id}}"
+              }
+            },
+            {
+              "name": "AQ-55 El conciliador la completa",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'REVERSED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"Authorization en REVERSED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_auth}}/transactions/{{transaction_id}}"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
       "name": "📊 Métricas Prometheus",
       "item": [
         {

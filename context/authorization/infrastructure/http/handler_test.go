@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -169,5 +170,35 @@ func TestHandleGetTransaction_Success(t *testing.T) {
 	}
 	if body.AmountCents != 5000 {
 		t.Errorf("AmountCents = %d, want 5000", body.AmountCents)
+	}
+}
+
+func TestHandleReady_Schema(t *testing.T) {
+	cases := []struct {
+		name       string
+		missing    []string
+		err        error
+		want       int
+		wantReason string
+	}{
+		{"completo", nil, nil, http.StatusOK, ""},
+		{"falta una columna", []string{"pn_authorization.transactions.reversal_requested_at"}, nil, http.StatusServiceUnavailable, "database schema incomplete"},
+		{"no se puede consultar", nil, errors.New("connection reset"), http.StatusServiceUnavailable, "database unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router := NewRouter(&fakeQueryService{}, &fakePool{}, func(context.Context) ([]string, error) { return tc.missing, tc.err })
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
+			}
+			if tc.wantReason != "" && !strings.Contains(rec.Body.String(), tc.wantReason) {
+				t.Errorf("body = %s, want %q", rec.Body, tc.wantReason)
+			}
+			if strings.Contains(rec.Body.String(), "pn_authorization") {
+				t.Errorf("body = %s: the endpoint has no token, it should not name the schema", rec.Body)
+			}
+		})
 	}
 }

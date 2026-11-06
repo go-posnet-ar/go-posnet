@@ -2,11 +2,13 @@ package command
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
+	"github.com/juantevez/go-posnet/context/authorization/domain/repository"
 	"github.com/juantevez/go-posnet/pkg/observability"
 )
 
@@ -32,6 +34,7 @@ type Metrics struct {
 	acquirerErrors   metric.Int64Counter
 	acquirerDuration metric.Float64Histogram
 	sagaDuration     metric.Float64Histogram
+	reversalsIgnored metric.Int64Counter
 }
 
 // latencyBuckets son fronteras en segundos apropiadas para la saga (~1s p50)
@@ -78,6 +81,11 @@ func NewMetrics() (*Metrics, error) {
 	if err != nil {
 		return nil, err
 	}
+	reversalsIgnored, err := m.Int64Counter("posnet_reversals_ignored",
+		metric.WithDescription("Pedidos de reversa sin nada que revertir, por el estado de la transacción."))
+	if err != nil {
+		return nil, err
+	}
 
 	return &Metrics{
 		received:         received,
@@ -86,6 +94,7 @@ func NewMetrics() (*Metrics, error) {
 		acquirerErrors:   acquirerErrors,
 		acquirerDuration: acquirerDuration,
 		sagaDuration:     sagaDuration,
+		reversalsIgnored: reversalsIgnored,
 	}, nil
 }
 
@@ -114,6 +123,13 @@ func (m *Metrics) RecordRejected(ctx context.Context, rejectionCode, source stri
 		attribute.String("rejection_code", rejectionCode),
 		attribute.String("source", source),
 	))
+}
+
+func (m *Metrics) RecordReversalIgnored(ctx context.Context, state string) {
+	if m == nil {
+		return
+	}
+	m.reversalsIgnored.Add(ctx, 1, metric.WithAttributes(attribute.String("state", state)))
 }
 
 func (m *Metrics) RecordAcquirerError(ctx context.Context) {
@@ -145,4 +161,35 @@ func (m *Metrics) RecordSagaDuration(ctx context.Context, since time.Time, outco
 	m.sagaDuration.Record(ctx, time.Since(since).Seconds(), metric.WithAttributes(
 		attribute.String("outcome", outcome),
 	))
+}
+
+// unresolvedQueryTimeout limita la consulta en cada scrape.
+const unresolvedQueryTimeout = 5 * time.Second
+
+// RegisterUnresolvedGauge publica las transacciones sin un resultado conocido, consultando la
+// base en cada scrape. Si la consulta falla, la serie no se informa: un cero las ocultaría.
+func RegisterUnresolvedGauge(repo repository.TransactionRepository, stuckAfter, reversalsAfter time.Duration) error {
+	meter := observability.Meter("posnet.authorization")
+	gauge, err := meter.Int64ObservableGauge(
+		"posnet_authorization_unresolved_transactions",
+		metric.WithDescription("Transacciones sin resolver, por state: INDETERMINATE, PROCESSING trabadas o REVERSAL_PENDING."),
+	)
+	if err != nil {
+		return err
+	}
+	_, err = meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
+		ctx, cancel := context.WithTimeout(ctx, unresolvedQueryTimeout)
+		defer cancel()
+		now := time.Now()
+		counts, err := repo.CountUnresolved(ctx, now.Add(-stuckAfter), now.Add(-reversalsAfter))
+		if err != nil {
+			slog.ErrorContext(ctx, "failed to count unresolved transactions", slog.String("error", err.Error()))
+			return nil
+		}
+		o.ObserveInt64(gauge, counts.Indeterminate, metric.WithAttributes(attribute.String("state", "INDETERMINATE")))
+		o.ObserveInt64(gauge, counts.Processing, metric.WithAttributes(attribute.String("state", "PROCESSING")))
+		o.ObserveInt64(gauge, counts.ReversalPending, metric.WithAttributes(attribute.String("state", "REVERSAL_PENDING")))
+		return nil
+	}, gauge)
+	return err
 }

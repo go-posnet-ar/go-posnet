@@ -2,6 +2,7 @@ package nats
 
 import (
 	"context"
+	"github.com/jackc/pgx/v5"
 	"testing"
 	"time"
 
@@ -87,6 +88,34 @@ func (f *fakeRepo) UpdateState(_ context.Context, _ domain.TransactionID, _ valu
 
 func (f *fakeRepo) ExistsByID(_ context.Context, _ domain.TransactionID) (bool, error) {
 	return false, nil
+}
+
+func (f *fakeRepo) SaveIfState(ctx context.Context, tx *aggregate.Transaction, _ valueobject.TransactionState) (bool, error) {
+	return true, f.Save(ctx, tx)
+}
+
+func (f *fakeRepo) SaveIfStateTx(ctx context.Context, _ pgx.Tx, tx *aggregate.Transaction, _ valueobject.TransactionState) (bool, error) {
+	return true, f.Save(ctx, tx)
+}
+
+func (f *fakeRepo) FindByIDForUpdateTx(ctx context.Context, _ pgx.Tx, id domain.TransactionID) (*aggregate.Transaction, error) {
+	return f.FindByID(ctx, id)
+}
+
+func (f *fakeRepo) FindUnresolved(context.Context, time.Time, int) ([]*aggregate.Transaction, error) {
+	return nil, nil
+}
+
+func (f *fakeRepo) MarkReversalRequestedTx(context.Context, pgx.Tx, domain.TransactionID) error {
+	return nil
+}
+
+func (f *fakeRepo) FindPendingReversals(context.Context, time.Time, int) ([]*aggregate.Transaction, error) {
+	return nil, nil
+}
+
+func (f *fakeRepo) CountUnresolved(context.Context, time.Time, time.Time) (repository.UnresolvedCounts, error) {
+	return repository.UnresolvedCounts{}, nil
 }
 
 type fakeAcquirer struct {

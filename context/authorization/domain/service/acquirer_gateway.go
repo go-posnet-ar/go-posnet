@@ -22,6 +22,8 @@ type AcquirerGateway interface {
 	Authorize(ctx context.Context, tx *aggregate.Transaction) (AcquirerResponse, error)
 
 	// Reverse envía un mensaje de reversión (MTI 0400/0420) al adquirente.
+	// El conciliador lo usa también cuando no sabe si la autorización llegó, y puede repetirlo:
+	// debe dar éxito si el host no conoce la operación o si ya estaba revertida.
 	Reverse(ctx context.Context, tx *aggregate.Transaction) error
 }
 

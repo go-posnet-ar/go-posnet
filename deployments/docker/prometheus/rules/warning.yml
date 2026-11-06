@@ -117,6 +117,17 @@ groups:
           summary: "Envíos al procesador con resultado {{ $labels.result }}"
           description: "unavailable: sin procesador configurado. error: el procesador falló. Los lotes quedan en CLOSED hasta un resubmit (batch-close-failure.md, Escenario C)."
 
+      # El conciliador las resuelve en menos de un minuto: si siguen, las reversas están fallando.
+      # Investigar: docs/runbooks/incident-response.md, "Transacciones trabadas".
+      - alert: TransaccionesSinResolver
+        expr: max(posnet_authorization_unresolved_transactions) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} transacciones sin resultado conocido"
+          description: "Sin resultado conocido o con una reversa pedida sin completar. Revisar el adquirente y los logs 'transaction not reconciled' y 'reversal not completed'."
+
       # Outbox de Settlement sin avanzar: los eventos no se pierden, pero no salen.
       # Investigar: conexión a NATS y logs "outbox relay".
       - alert: OutboxSettlementTrabado

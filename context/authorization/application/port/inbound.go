@@ -86,4 +86,8 @@ type TransactionStatusResult struct {
 	Currency        string
 	AuthorizedAt    string
 	RejectedAt      string
+
+	// ReversalRequestedAt indica un pedido de reversa sin completar: la transacción sigue
+	// vigente hasta que pase a REVERSED. Vacío si no hay ninguno.
+	ReversalRequestedAt string
 }

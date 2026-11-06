@@ -17,7 +17,7 @@ func TestNewRouter_Routes(t *testing.T) {
 		TransactionID: "tx-1",
 		State:         "RECEIVED",
 	}}
-	router := NewRouter(qs, &fakePool{})
+	router := NewRouter(qs, &fakePool{}, nil)
 
 	tests := []struct {
 		name       string
@@ -45,7 +45,7 @@ func TestNewRouter_Routes(t *testing.T) {
 
 func TestNewRouter_ReadyzReflectsPoolFailure(t *testing.T) {
 	pool := &fakePool{pingErr: errors.New("connection refused")}
-	router := NewRouter(&fakeQueryService{}, pool)
+	router := NewRouter(&fakeQueryService{}, pool, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rec := httptest.NewRecorder()
@@ -57,7 +57,7 @@ func TestNewRouter_ReadyzReflectsPoolFailure(t *testing.T) {
 }
 
 func TestNewRouter_RecoversFromPanicInHandler(t *testing.T) {
-	router := NewRouter(&panickyQueryService{}, &fakePool{})
+	router := NewRouter(&panickyQueryService{}, &fakePool{}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/transactions/"+domain.NewTransactionID().String(), nil)
 	rec := httptest.NewRecorder()
@@ -72,7 +72,7 @@ func TestNewRouter_RecoversFromPanicInHandler(t *testing.T) {
 }
 
 func TestNewRouter_UnknownRouteReturns404(t *testing.T) {
-	router := NewRouter(&fakeQueryService{}, &fakePool{})
+	router := NewRouter(&fakeQueryService{}, &fakePool{}, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/does-not-exist", nil)
 	rec := httptest.NewRecorder()

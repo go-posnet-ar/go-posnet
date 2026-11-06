@@ -42,6 +42,8 @@ CREATE TABLE authorization.transactions (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     authorized_at   TIMESTAMPTZ,
     rejected_at     TIMESTAMPTZ,
+    processing_started_at TIMESTAMPTZ,
+    reversal_requested_at TIMESTAMPTZ,
 
     -- FK a settlement cuando la transacción es liquidada
     settlement_batch_id UUID
@@ -54,6 +56,14 @@ CREATE INDEX idx_auth_txn_terminal_date
 CREATE INDEX idx_auth_txn_state
     ON authorization.transactions(state)
     WHERE state IN ('RECEIVED', 'FRAUD_CHECKING', 'PROCESSING', 'INDETERMINATE');
+
+CREATE INDEX idx_auth_txn_unresolved
+    ON authorization.transactions (created_at)
+    WHERE state IN ('PROCESSING', 'INDETERMINATE');
+
+CREATE INDEX idx_auth_txn_reversal_pending
+    ON authorization.transactions (reversal_requested_at)
+    WHERE state = 'APPROVED' AND reversal_requested_at IS NOT NULL;
 
 CREATE INDEX idx_auth_txn_stan
     ON authorization.transactions(terminal_id, stan, created_at::date);

@@ -60,5 +60,9 @@ func (h *TransactionQueryHandler) GetTransactionStatus(
 		}
 	}
 
+	if tx.ReversalRequestedAt() != nil && tx.State() != valueobject.StateReversed && tx.State() != valueobject.StateRejected {
+		result.ReversalRequestedAt = tx.ReversalRequestedAt().UTC().Format("2006-01-02T15:04:05Z")
+	}
+
 	return result, nil
 }

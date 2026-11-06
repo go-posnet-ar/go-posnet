@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -27,6 +28,13 @@ type app struct {
 	subscriber *natsinfra.Subscriber
 	grpcSrv    *grpcserver.AuthorizationServer
 	httpSrv    *http.Server
+
+	authHandler    *command.AuthorizationHandler
+	reconcileEvery time.Duration
+	stuckAfter     time.Duration
+	callTimeout    time.Duration
+	stopReconciler context.CancelFunc
+	reconcilerWG   sync.WaitGroup
 }
 
 // wire construye el grafo de dependencias completo del BC Authorization.
@@ -91,7 +99,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	eventPub := natsinfra.NewEventPublisher(natsPub)
 
 	// ── Aplicación ─────────────────────────────────────────────────────────────
-	acquirerGW := pginfra.NewMockAcquirerGateway()
+	acquirerGW := pginfra.NewMockAcquirerGateway(cfg.Acquirer.MockScenarios)
 	authHandler := command.NewAuthorizationHandler(
 		txRepo,
 		acquirerGW, // acquirerGW — reemplazar con instancia real cuando esté implementado
@@ -105,13 +113,21 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	}
 	authHandler.SetMetrics(authMetrics)
 	authHandler.SetBlockedCards(blockedCards)
+	acquirerTimeout := time.Duration(cfg.Acquirer.TimeoutSeconds) * time.Second
+	authHandler.ConfigureAcquirerCalls(cfg.Acquirer.MaxConcurrent, acquirerTimeout)
+	if cfg.Acquirer.MockScenarios {
+		slog.Warn("acquirer mock scenarios enabled — some amounts are not approved")
+	}
+	if err := command.RegisterUnresolvedGauge(txRepo, cfg.Acquirer.StuckAfter, acquirerTimeout); err != nil {
+		return nil, fmt.Errorf("wire: register unresolved gauge: %w", err)
+	}
 	queryHandler := query.NewTransactionQueryHandler(txRepo)
 
 	// ── Adaptadores de entrada ─────────────────────────────────────────────────
 	subscriber := natsinfra.NewSubscriber(js, authHandler)
 	grpcSrv := grpcserver.NewAuthorizationServer(queryHandler)
 
-	router := httpinfra.NewRouter(queryHandler, pool)
+	router := httpinfra.NewRouter(queryHandler, pool, txRepo.MissingSchema)
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,
@@ -126,12 +142,16 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		subscriber: subscriber,
 		grpcSrv:    grpcSrv,
 		httpSrv:    httpSrv,
+
+		authHandler:    authHandler,
+		reconcileEvery: cfg.Acquirer.ReconcileEvery,
+		stuckAfter:     cfg.Acquirer.StuckAfter,
+		callTimeout:    acquirerTimeout,
 	}, nil
 }
 
 // start arranca todos los servidores en goroutines independientes.
-// func (a *app) start(ctx context.Context) error {
-func (a *app) start(_ context.Context) error {
+func (a *app) start(ctx context.Context) error {
 	if err := a.subscriber.Subscribe(); err != nil {
 		return fmt.Errorf("start: subscribe NATS consumers: %w", err)
 	}
@@ -151,12 +171,60 @@ func (a *app) start(_ context.Context) error {
 	}()
 	slog.Info("HTTP server starting", slog.String("addr", a.httpSrv.Addr))
 
+	if a.reconcileEvery > 0 {
+		reconcileCtx, stop := context.WithCancel(ctx)
+		a.stopReconciler = stop
+		a.reconcilerWG.Add(1)
+		go func() {
+			defer a.reconcilerWG.Done()
+			a.runReconciler(reconcileCtx)
+		}()
+		slog.Info("reconciler active", slog.Duration("every", a.reconcileEvery), slog.Duration("stuck_after", a.stuckAfter))
+	} else {
+		slog.Warn("reconciler disabled — unresolved transactions will not be reversed")
+	}
+
 	return nil
+}
+
+// runReconciler resuelve periódicamente las transacciones sin un resultado conocido. También
+// corre al arrancar: lo que quedó trabado por una caída es justo lo que tiene que encontrar.
+func (a *app) runReconciler(ctx context.Context) {
+	run := func() {
+		resolved, failed, err := a.authHandler.ReconcileUnresolved(ctx, time.Now(), a.stuckAfter)
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.Error("reconciler run failed", slog.String("error", err.Error()))
+			}
+			return
+		}
+		if resolved > 0 || failed > 0 {
+			slog.Info("reconciler run finished", slog.Int("resolved", resolved), slog.Int("failed", failed))
+		}
+	}
+
+	run()
+	ticker := time.NewTicker(a.reconcileEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 // close libera todos los recursos en orden inverso al de creación.
 func (a *app) close() {
 	slog.Info("closing resources")
+
+	// Antes de cerrar la base: una reversa interrumpida sigue en INDETERMINATE y se retoma.
+	if a.stopReconciler != nil {
+		a.stopReconciler()
+		a.reconcilerWG.Wait()
+	}
 
 	if a.httpSrv != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -167,6 +235,14 @@ func (a *app) close() {
 	if a.natsConn != nil {
 		_ = a.natsConn.Drain()
 		a.natsConn.Close()
+	}
+
+	// Con NATS cerrado no entran más. Lo que no termine a tiempo sigue en PROCESSING, o con
+	// su pedido de reversa guardado, y lo retoma el conciliador.
+	if a.authHandler != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), a.callTimeout+5*time.Second)
+		defer cancel()
+		a.authHandler.WaitAcquirerCalls(ctx)
 	}
 
 	if a.pool != nil {

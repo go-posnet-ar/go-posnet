@@ -29,6 +29,8 @@ type ReconstituteParams struct {
 	ReceivedAt      time.Time
 	AuthorizedAt    *time.Time
 	RejectedAt      *time.Time
+
+	ReversalRequestedAt *time.Time
 }
 
 // Reconstitute reconstruye un aggregate Transaction desde la base de datos.
@@ -51,6 +53,8 @@ func Reconstitute(p ReconstituteParams) *Transaction {
 		receivedAt:    p.ReceivedAt,
 		authorizedAt:  p.AuthorizedAt,
 		rejectedAt:    p.RejectedAt,
+
+		reversalRequestedAt: p.ReversalRequestedAt,
 	}
 
 	if p.AuthCode != nil {

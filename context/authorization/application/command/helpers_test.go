@@ -2,8 +2,11 @@ package command_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/juantevez/go-posnet/context/authorization/application/port"
 	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
@@ -25,6 +28,79 @@ type fakeRepo struct {
 	savedTxs   []*aggregate.Transaction
 	findResult *aggregate.Transaction
 	findErr    error
+
+	// claimErr, claimLost y claimed corresponden al guardado junto con el evento (SaveIfStateTx).
+	claimErr  error
+	claimLost bool
+	claimed   []claimedSave
+
+	// resultLost simula que otro proceso movió la transacción (SaveIfState devuelve false).
+	resultLost bool
+	expected   []valueobject.TransactionState
+	// failSaveAt hace fallar solo el guardado número failSaveAt de SaveIfState, contado desde 1.
+	failSaveAt int
+	saveCalls  int
+
+	unresolved    []*aggregate.Transaction
+	unresolvedErr error
+
+	reversalMarks    int
+	markErr          error
+	pendingReversals []*aggregate.Transaction
+	pendingErr       error
+}
+
+type claimedSave struct {
+	state    valueobject.TransactionState
+	expected valueobject.TransactionState
+}
+
+func (f *fakeRepo) SaveIfState(_ context.Context, tx *aggregate.Transaction, expected valueobject.TransactionState) (bool, error) {
+	f.saveCalls++
+	f.expected = append(f.expected, expected)
+	if f.saveErr != nil {
+		return false, f.saveErr
+	}
+	if f.failSaveAt == f.saveCalls {
+		return false, errors.New("db unreachable")
+	}
+	if f.resultLost {
+		return false, nil
+	}
+	f.savedTxs = append(f.savedTxs, tx)
+	return true, nil
+}
+
+func (f *fakeRepo) SaveIfStateTx(_ context.Context, _ pgx.Tx, tx *aggregate.Transaction, expected valueobject.TransactionState) (bool, error) {
+	if f.claimErr != nil {
+		return false, f.claimErr
+	}
+	if f.claimLost {
+		return false, nil
+	}
+	f.claimed = append(f.claimed, claimedSave{state: tx.State(), expected: expected})
+	return true, nil
+}
+
+func (f *fakeRepo) FindByIDForUpdateTx(ctx context.Context, _ pgx.Tx, id domain.TransactionID) (*aggregate.Transaction, error) {
+	return f.FindByID(ctx, id)
+}
+
+func (f *fakeRepo) FindUnresolved(context.Context, time.Time, int) ([]*aggregate.Transaction, error) {
+	return f.unresolved, f.unresolvedErr
+}
+
+func (f *fakeRepo) MarkReversalRequestedTx(context.Context, pgx.Tx, domain.TransactionID) error {
+	f.reversalMarks++
+	return f.markErr
+}
+
+func (f *fakeRepo) FindPendingReversals(context.Context, time.Time, int) ([]*aggregate.Transaction, error) {
+	return f.pendingReversals, f.pendingErr
+}
+
+func (f *fakeRepo) CountUnresolved(context.Context, time.Time, time.Time) (repository.UnresolvedCounts, error) {
+	return repository.UnresolvedCounts{}, nil
 }
 
 var _ repository.TransactionRepository = (*fakeRepo)(nil)

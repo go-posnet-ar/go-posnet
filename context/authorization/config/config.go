@@ -51,6 +51,17 @@ type AcquirerConfig struct {
 	TLSKeyPath     string
 	TLSCAPath      string
 	TimeoutSeconds int
+
+	// MaxConcurrent limita las llamadas simultáneas al adquirente.
+	MaxConcurrent int
+	// MockScenarios hace que el mock responda según el monto. Solo para desarrollo.
+	MockScenarios bool
+
+	// ReconcileEvery es cada cuánto corre el conciliador. 0 lo desactiva.
+	ReconcileEvery time.Duration
+	// StuckAfter es cuánto puede seguir una transacción en PROCESSING antes de que el
+	// conciliador la tome. Debe superar TimeoutSeconds: si no, revertiría llamadas en curso.
+	StuckAfter time.Duration
 }
 
 // TLSEnabled indica si hay configuración TLS real (no vacío ni "none").
@@ -98,7 +109,28 @@ func Load() (*Config, error) {
 			TLSKeyPath:     envStr("ACQUIRER_TLS_KEY", ""),
 			TLSCAPath:      envStr("ACQUIRER_TLS_CA", ""),
 			TimeoutSeconds: envInt("ACQUIRER_TIMEOUT_SECONDS", 30),
+			MaxConcurrent:  envInt("ACQUIRER_MAX_CONCURRENT", 20),
+			MockScenarios:  envStr("ACQUIRER_MOCK_SCENARIOS", "") == "true",
+			ReconcileEvery: envDuration("ACQUIRER_RECONCILE_EVERY", 30*time.Second),
+			StuckAfter:     envDuration("ACQUIRER_STUCK_AFTER", 2*time.Minute),
 		},
+	}
+
+	if timeout := time.Duration(cfg.Acquirer.TimeoutSeconds) * time.Second; cfg.Acquirer.StuckAfter <= timeout {
+		return nil, fmt.Errorf("config: ACQUIRER_STUCK_AFTER %s must be greater than ACQUIRER_TIMEOUT_SECONDS (%s): calls in progress would be reversed",
+			cfg.Acquirer.StuckAfter, timeout)
+	}
+	if cfg.Acquirer.TimeoutSeconds < 1 {
+		return nil, fmt.Errorf("config: ACQUIRER_TIMEOUT_SECONDS %d must be at least 1", cfg.Acquirer.TimeoutSeconds)
+	}
+	if cfg.Acquirer.MaxConcurrent < 1 {
+		return nil, fmt.Errorf("config: ACQUIRER_MAX_CONCURRENT %d must be at least 1", cfg.Acquirer.MaxConcurrent)
+	}
+	if cfg.Acquirer.MockScenarios && cfg.OTEL.Environment == "production" {
+		return nil, fmt.Errorf("config: ACQUIRER_MOCK_SCENARIOS cannot be used with ENVIRONMENT=production")
+	}
+	if cfg.Acquirer.ReconcileEvery < 0 {
+		return nil, fmt.Errorf("config: ACQUIRER_RECONCILE_EVERY %s cannot be negative", cfg.Acquirer.ReconcileEvery)
 	}
 
 	return cfg, nil

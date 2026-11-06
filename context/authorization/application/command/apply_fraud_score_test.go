@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/juantevez/go-posnet/context/authorization/application/command"
+	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/authorization/domain/service"
 	"github.com/juantevez/go-posnet/context/authorization/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
@@ -56,7 +57,6 @@ func TestApplyFraudScore_ClaimError(t *testing.T) {
 
 func TestApplyFraudScore_InvalidTransactionID(t *testing.T) {
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
 
 	h := command.NewAuthorizationHandler(
 		&fakeRepo{}, &fakeAcquirer{}, &fakePublisher{},
@@ -75,7 +75,7 @@ func TestApplyFraudScore_InvalidTransactionID(t *testing.T) {
 
 func TestApplyFraudScore_FindByIDError(t *testing.T) {
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedThenRollback(pool)
 
 	repo := &fakeRepo{findErr: errors.New("not found")}
 	h := command.NewAuthorizationHandler(
@@ -91,7 +91,6 @@ func TestApplyFraudScore_FindByIDError(t *testing.T) {
 
 func TestApplyFraudScore_InvalidFraudDecision(t *testing.T) {
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
 
 	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t)}
 	h := command.NewAuthorizationHandler(
@@ -109,20 +108,25 @@ func TestApplyFraudScore_InvalidFraudDecision(t *testing.T) {
 	}
 }
 
-func TestApplyFraudScore_ApplyDecisionErrorOnWrongState(t *testing.T) {
+// Una transacción que ya no espera el score no se toca: el mensaje se confirma, y el evento
+// queda marcado para que un duplicado no vuelva a evaluarse.
+func TestApplyFraudScore_WrongStateIsIgnored(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
 
-	// tx en RECEIVED (nunca pasó por StartFraudCheck) → ApplyFraudDecision debe fallar.
-	repo := &fakeRepo{findResult: newValidTransaction(t)}
+	repo := &fakeRepo{findResult: newApprovedTransaction(t)}
+	acquirer := &fakeAcquirer{}
+	publisher := &fakePublisher{}
 	h := command.NewAuthorizationHandler(
-		repo, &fakeAcquirer{}, &fakePublisher{},
+		repo, acquirer, publisher,
 		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
 	)
 
-	err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID()))
-	if err == nil || !strings.Contains(err.Error(), "apply decision") {
-		t.Fatalf("error = %v, want it to contain %q", err, "apply decision")
+	if err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID())); err != nil {
+		t.Fatalf("ApplyFraudScore() error = %v", err)
+	}
+	if acquirer.authorizeCalls != 0 || len(repo.claimed) != 0 || publisher.approvedCalls != 0 {
+		t.Errorf("calls = %d, claimed = %v, approved = %d, want nothing", acquirer.authorizeCalls, repo.claimed, publisher.approvedCalls)
 	}
 }
 
@@ -144,21 +148,24 @@ func TestApplyFraudScore_RejectByFraud(t *testing.T) {
 	if err := h.ApplyFraudScore(context.Background(), cmd); err != nil {
 		t.Fatalf("ApplyFraudScore() error = %v", err)
 	}
-	if len(repo.savedTxs) != 1 || repo.savedTxs[0].State() != valueobject.StateRejected {
-		t.Fatalf("saved tx = %+v, want a single tx in state REJECTED", repo.savedTxs)
+	want := claimedSave{state: valueobject.StateRejected, expected: valueobject.StateFraudChecking}
+	if len(repo.claimed) != 1 || repo.claimed[0] != want {
+		t.Fatalf("claimed = %+v, want [%+v]", repo.claimed, want)
 	}
 	if publisher.rejectedCalls != 1 {
 		t.Errorf("PublishRejected calls = %d, want 1", publisher.rejectedCalls)
 	}
 }
 
+// Si el rechazo no se puede guardar, el evento tampoco queda marcado: la reentrega reprocesa.
 func TestApplyFraudScore_RejectByFraud_SaveError(t *testing.T) {
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedThenRollback(pool)
 
-	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t), saveErr: errors.New("db unreachable")}
+	publisher := &fakePublisher{}
+	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t), claimErr: errors.New("db unreachable")}
 	h := command.NewAuthorizationHandler(
-		repo, &fakeAcquirer{}, &fakePublisher{},
+		repo, &fakeAcquirer{}, publisher,
 		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
 	)
 
@@ -167,8 +174,11 @@ func TestApplyFraudScore_RejectByFraud_SaveError(t *testing.T) {
 	cmd.Score = 90
 
 	err := h.ApplyFraudScore(context.Background(), cmd)
-	if err == nil || !strings.Contains(err.Error(), "persistAndPublishRejection") {
-		t.Fatalf("error = %v, want it to contain %q", err, "persistAndPublishRejection")
+	if err == nil || !strings.Contains(err.Error(), "persist decision") {
+		t.Fatalf("error = %v, want it to contain %q", err, "persist decision")
+	}
+	if publisher.rejectedCalls != 0 {
+		t.Errorf("PublishRejected calls = %d, want 0", publisher.rejectedCalls)
 	}
 }
 
@@ -190,8 +200,8 @@ func TestApplyFraudScore_RejectByFraud_PublishErrorIsNonFatal(t *testing.T) {
 	if err := h.ApplyFraudScore(context.Background(), cmd); err != nil {
 		t.Fatalf("ApplyFraudScore() error = %v, want nil (publish failure must not fail the saga)", err)
 	}
-	if len(repo.savedTxs) != 1 || repo.savedTxs[0].State() != valueobject.StateRejected {
-		t.Fatalf("saved tx = %+v, want a single tx in state REJECTED", repo.savedTxs)
+	if len(repo.claimed) != 1 || repo.claimed[0].state != valueobject.StateRejected {
+		t.Fatalf("claimed = %+v, want a single save in state REJECTED", repo.claimed)
 	}
 }
 
@@ -373,5 +383,123 @@ func TestApplyFraudScore_SaveErrorAfterAcquirerApproval(t *testing.T) {
 	err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID()))
 	if err == nil || !strings.Contains(err.Error(), "persist result") {
 		t.Fatalf("error = %v, want it to contain %q", err, "persist result")
+	}
+}
+
+// PROCESSING queda guardado, junto con el evento, antes de llamar al adquirente.
+func TestApplyFraudScore_SavesProcessingBeforeCallingAcquirer(t *testing.T) {
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+
+	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t)}
+	acquirer := &orderedAcquirer{repo: repo, t: t}
+	h := command.NewAuthorizationHandler(
+		repo, acquirer, &fakePublisher{},
+		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
+	)
+
+	if err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID())); err != nil {
+		t.Fatalf("ApplyFraudScore() error = %v", err)
+	}
+	if !acquirer.called {
+		t.Fatal("the acquirer was not called")
+	}
+	if want := []valueobject.TransactionState{valueobject.StateProcessing}; len(repo.expected) != 1 || repo.expected[0] != want[0] {
+		t.Errorf("result saved expecting %v, want %v", repo.expected, want)
+	}
+}
+
+type orderedAcquirer struct {
+	fakeAcquirer
+	repo   *fakeRepo
+	t      *testing.T
+	called bool
+}
+
+func (a *orderedAcquirer) Authorize(context.Context, *aggregate.Transaction) (service.AcquirerResponse, error) {
+	a.called = true
+	want := claimedSave{state: valueobject.StateProcessing, expected: valueobject.StateFraudChecking}
+	if len(a.repo.claimed) != 1 || a.repo.claimed[0] != want {
+		a.t.Errorf("at the acquirer call, claimed = %+v, want [%+v]", a.repo.claimed, want)
+	}
+	return service.AcquirerResponse{ResponseCode: valueobject.ISO_APPROVED, AuthCode: "AB1234"}, nil
+}
+
+// Dos scores de la misma transacción: el que pierde no llega al adquirente.
+func TestApplyFraudScore_LosingTheRaceDoesNotCallAcquirer(t *testing.T) {
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+
+	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t), claimLost: true}
+	acquirer := &fakeAcquirer{}
+	h := command.NewAuthorizationHandler(
+		repo, acquirer, &fakePublisher{},
+		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
+	)
+
+	if err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID())); err != nil {
+		t.Fatalf("ApplyFraudScore() error = %v", err)
+	}
+	if acquirer.authorizeCalls != 0 {
+		t.Errorf("Authorize calls = %d, want 0", acquirer.authorizeCalls)
+	}
+}
+
+// Sin poder guardar PROCESSING, no se llama al adquirente y el evento no queda marcado.
+func TestApplyFraudScore_ProcessingSaveErrorDoesNotCallAcquirer(t *testing.T) {
+	pool := newMockPool(t)
+	expectClaimedThenRollback(pool)
+
+	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t), claimErr: errors.New("db unreachable")}
+	acquirer := &fakeAcquirer{}
+	h := command.NewAuthorizationHandler(
+		repo, acquirer, &fakePublisher{},
+		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
+	)
+
+	if err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID())); err == nil {
+		t.Fatal("ApplyFraudScore() error = nil, want an error so the event is redelivered")
+	}
+	if acquirer.authorizeCalls != 0 {
+		t.Errorf("Authorize calls = %d, want 0", acquirer.authorizeCalls)
+	}
+}
+
+// El error al guardar INDETERMINATE ya no se ignora en silencio, pero tampoco rompe: la
+// transacción sigue en PROCESSING y el conciliador la toma.
+func TestApplyFraudScore_IndeterminateSaveErrorIsNotFatal(t *testing.T) {
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+
+	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t), saveErr: errors.New("db unreachable")}
+	h := command.NewAuthorizationHandler(
+		repo, &fakeAcquirer{authorizeErr: errors.New("acquirer timeout")}, &fakePublisher{},
+		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
+	)
+
+	if err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID())); err != nil {
+		t.Fatalf("ApplyFraudScore() error = %v", err)
+	}
+}
+
+// Una respuesta que llega después de que el conciliador tomó la transacción no se informa.
+func TestApplyFraudScore_LateAcquirerResponseIsNotPublished(t *testing.T) {
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+
+	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t), resultLost: true}
+	publisher := &fakePublisher{}
+	h := command.NewAuthorizationHandler(
+		repo,
+		&fakeAcquirer{authorizeResp: service.AcquirerResponse{ResponseCode: valueobject.ISO_APPROVED, AuthCode: "AB1234"}},
+		publisher,
+		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
+	)
+
+	if err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID())); err != nil {
+		t.Fatalf("ApplyFraudScore() error = %v", err)
+	}
+	if publisher.approvedCalls != 0 {
+		t.Errorf("PublishApproved calls = %d, want 0", publisher.approvedCalls)
 	}
 }
