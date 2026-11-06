@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/juantevez/go-posnet/context/settlement/application/port"
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
@@ -14,13 +15,18 @@ import (
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
 	"github.com/juantevez/go-posnet/pkg/observability"
+	"github.com/juantevez/go-posnet/pkg/outbox"
+	"github.com/juantevez/go-posnet/pkg/pgutil"
 )
 
 // AdminHandler implementa port.AdminService.
 type AdminHandler struct {
 	batchRepo  repository.SettlementBatchRepository
 	processor  service.SettlementProcessor
-	publisher  service.EventPublisher // opcional; nil = no publica eventos
+	audit      repository.BatchAuditLog
+	publisher  service.EventPublisher // opcional; nil = no genera eventos
+	outbox     *outbox.Store
+	pool       pgutil.PgxPool
 	mdrPercent float64
 }
 
@@ -28,11 +34,40 @@ func NewAdminHandler(batchRepo repository.SettlementBatchRepository, processor s
 	return &AdminHandler{batchRepo: batchRepo, processor: processor}
 }
 
-// ConfigureSettlement inyecta lo necesario para publicar BatchClosed y
-// SettlementCompleted (desde el wiring).
-func (h *AdminHandler) ConfigureSettlement(publisher service.EventPublisher, mdrPercent float64) {
+// ConfigureSettlement inyecta lo necesario para auditar las operaciones y generar
+// BatchClosed y SettlementCompleted (desde el wiring).
+func (h *AdminHandler) ConfigureSettlement(pool pgutil.PgxPool, audit repository.BatchAuditLog, publisher service.EventPublisher, outboxStore *outbox.Store, mdrPercent float64) {
+	h.pool = pool
+	h.audit = audit
 	h.publisher = publisher
+	h.outbox = outboxStore
 	h.mdrPercent = mdrPercent
+}
+
+// persist guarda el batch, su registro de auditoría y sus eventos (enqueue, opcional) en
+// una sola transacción. Sin ConfigureSettlement, solo guarda el batch.
+func (h *AdminHandler) persist(ctx context.Context, batch *aggregate.SettlementBatch, entry repository.BatchAuditEntry, enqueue func(tx pgx.Tx) error) error {
+	if h.pool == nil {
+		return h.batchRepo.Save(ctx, batch)
+	}
+	entry.BatchID = batch.ID()
+	entry.ToState = batch.State().String()
+	if s := batch.Summary(); s != nil {
+		total := s.TotalAmount().Cents()
+		entry.TotalAmount = &total
+	}
+	return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
+		if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
+			return err
+		}
+		if err := h.audit.InsertAuditTx(ctx, tx, entry); err != nil {
+			return err
+		}
+		if enqueue == nil {
+			return nil
+		}
+		return enqueue(tx)
+	})
 }
 
 // ForceClose fuerza el cierre de un batch desde operaciones de soporte, con los
@@ -62,27 +97,30 @@ func (h *AdminHandler) ForceClose(ctx context.Context, cmd port.ForceCloseComman
 			fmt.Sprintf("batch must be OPEN to force-close, current state is %s", batch.State()),
 		)
 	}
+	entry := repository.BatchAuditEntry{
+		Action: repository.AuditActionForceClose, OperatorID: cmd.OperatorID,
+		FromState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
+	}
 	if err := batch.CloseWithBackendTotals(); err != nil {
 		return fmt.Errorf("ForceClose: close: %w", err)
 	}
-	if err := h.batchRepo.Save(ctx, batch); err != nil {
+	err = h.persist(ctx, batch, entry, func(tx pgx.Tx) error {
+		// Un lote vacío no tiene nada que informar, igual que en el cierre automático.
+		if len(batch.Transactions()) == 0 {
+			return nil
+		}
+		return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch)
+	})
+	if err != nil {
 		return fmt.Errorf("ForceClose: save: %w", err)
 	}
 
-	log := observability.FromContext(ctx).With(slog.String("batch_id", batch.ID()))
-	log.Warn("batch force-closed by operator",
+	observability.FromContext(ctx).Warn("batch force-closed by operator",
+		slog.String("batch_id", batch.ID()),
 		slog.String("operator_id", cmd.OperatorID),
 		slog.Int("tx_count", len(batch.Transactions())),
 		slog.Int64("total_amount", batch.Summary().TotalAmount().Cents()),
 	)
-
-	// Un lote vacío no tiene nada que informar, igual que en el cierre automático.
-	if h.publisher != nil && len(batch.Transactions()) > 0 {
-		// El cierre ya está guardado: si esto falla, se registra y no se revierte.
-		if err := h.publisher.PublishBatchClosed(ctx, batch); err != nil {
-			log.Error("failed to publish BatchClosed", slog.String("error", err.Error()))
-		}
-	}
 	return nil
 }
 
@@ -117,11 +155,16 @@ func (h *AdminHandler) ResubmitBatch(ctx context.Context, cmd port.ResubmitBatch
 	// Un lote con discrepancias no se envía: pasa a DISPUTED, de donde el operador
 	// lo saca con ReopenBatch o ResolveDispute. Cubre los lotes de ForceClose y los
 	// que quedaron en CLOSED porque falló el guardado de DISPUTED durante el cierre.
+	entry := repository.BatchAuditEntry{
+		Action: repository.AuditActionResubmit, OperatorID: cmd.OperatorID,
+		FromState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
+	}
 	if batch.Discrepancies() > 0 {
 		if err := batch.MarkDisputed("resubmit blocked: batch has discrepancies"); err != nil {
 			return fmt.Errorf("ResubmitBatch: %w", err)
 		}
-		if err := h.batchRepo.Save(ctx, batch); err != nil {
+		entry.Action = repository.AuditActionResubmitBlocked
+		if err := h.persist(ctx, batch, entry, nil); err != nil {
 			return fmt.Errorf("ResubmitBatch: save: %w", err)
 		}
 		observability.FromContext(ctx).Warn("resubmit blocked by discrepancies — batch moved to DISPUTED",
@@ -142,7 +185,15 @@ func (h *AdminHandler) ResubmitBatch(ctx context.Context, cmd port.ResubmitBatch
 	if err := batch.Submit(); err != nil {
 		return fmt.Errorf("ResubmitBatch: %w", err)
 	}
-	if err := h.batchRepo.Save(ctx, batch); err != nil {
+	entry.ConfirmationID = confirmationID
+	if err := h.persist(ctx, batch, entry, nil); err != nil {
+		// El procesador ya aceptó: esta es la única copia del confirmation_id.
+		observability.FromContext(ctx).Error("batch accepted by processor but not saved — do not resubmit without checking",
+			slog.String("batch_id", batch.ID()),
+			slog.String("operator_id", cmd.OperatorID),
+			slog.String("confirmation_id", confirmationID),
+			slog.String("error", err.Error()),
+		)
 		return fmt.Errorf("ResubmitBatch: save: %w", err)
 	}
 
@@ -178,10 +229,14 @@ func (h *AdminHandler) ReopenBatch(ctx context.Context, cmd port.ReopenBatchComm
 	}
 
 	previousDiscrepancies := batch.Discrepancies()
+	entry := repository.BatchAuditEntry{
+		Action: repository.AuditActionReopen, OperatorID: cmd.OperatorID, Reason: cmd.Reason,
+		FromState: batch.State().String(), PreviousDiscrepancies: previousDiscrepancies,
+	}
 	if err := batch.Reopen(); err != nil {
 		return fmt.Errorf("ReopenBatch: %w", err)
 	}
-	if err := h.batchRepo.Save(ctx, batch); err != nil {
+	if err := h.persist(ctx, batch, entry, nil); err != nil {
 		return fmt.Errorf("ReopenBatch: save: %w", err)
 	}
 
@@ -207,10 +262,14 @@ func (h *AdminHandler) ResolveDispute(ctx context.Context, cmd port.ResolveDispu
 	}
 
 	previousDiscrepancies := batch.Discrepancies()
+	entry := repository.BatchAuditEntry{
+		Action: repository.AuditActionResolveDispute, OperatorID: cmd.OperatorID, Reason: cmd.Reason,
+		FromState: batch.State().String(), PreviousDiscrepancies: previousDiscrepancies,
+	}
 	if err := batch.ResolveDispute(); err != nil {
 		return fmt.Errorf("ResolveDispute: %w", err)
 	}
-	if err := h.batchRepo.Save(ctx, batch); err != nil {
+	if err := h.persist(ctx, batch, entry, nil); err != nil {
 		return fmt.Errorf("ResolveDispute: save: %w", err)
 	}
 
@@ -226,7 +285,7 @@ func (h *AdminHandler) ResolveDispute(ctx context.Context, cmd port.ResolveDispu
 
 // SettleBatch confirma la liquidación de un batch SUBMITTED. La confirmación es
 // manual porque todavía no hay un procesador real que la informe. Cuando se
-// liquidan todos los batches del comercio en esa fecha, publica SettlementCompleted.
+// liquidan todos los batches del comercio en esa fecha, encola SettlementCompleted.
 func (h *AdminHandler) SettleBatch(ctx context.Context, cmd port.SettleBatchCommand) error {
 	ctx, span := observability.StartSpan(ctx, "command.SettleBatch")
 	defer span.End()
@@ -251,10 +310,17 @@ func (h *AdminHandler) SettleBatch(ctx context.Context, cmd port.SettleBatchComm
 		)
 	}
 
+	entry := repository.BatchAuditEntry{
+		Action: repository.AuditActionSettle, OperatorID: cmd.OperatorID,
+		FromState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
+	}
 	if err := batch.MarkSettled(); err != nil {
 		return fmt.Errorf("SettleBatch: %w", err)
 	}
-	if err := h.batchRepo.Save(ctx, batch); err != nil {
+	err = h.persist(ctx, batch, entry, func(tx pgx.Tx) error {
+		return h.enqueueCompletedIfDone(ctx, tx, batch)
+	})
+	if err != nil {
 		return fmt.Errorf("SettleBatch: save: %w", err)
 	}
 
@@ -262,27 +328,15 @@ func (h *AdminHandler) SettleBatch(ctx context.Context, cmd port.SettleBatchComm
 		slog.String("batch_id", batch.ID()),
 		slog.String("operator_id", cmd.OperatorID),
 	)
-
-	h.publishCompletedIfDone(ctx, batch)
 	return nil
 }
 
-// publishCompletedIfDone publica SettlementCompleted si ya se liquidaron todos los
-// batches con transacciones del comercio en esa fecha, un evento por moneda. La
-// liquidación ya está guardada: si esto falla, se registra y no revierte nada.
-func (h *AdminHandler) publishCompletedIfDone(ctx context.Context, settled *aggregate.SettlementBatch) {
-	if h.publisher == nil {
-		return
-	}
-	log := observability.FromContext(ctx).With(
-		slog.String("merchant_id", settled.MerchantID().String()),
-		slog.String("settlement_date", settled.BatchDate().Format("2006-01-02")),
-	)
-
-	batches, err := h.batchRepo.ListByMerchantDate(ctx, settled.MerchantID(), settled.BatchDate())
+// enqueueCompletedIfDone encola SettlementCompleted si ya se liquidaron todos los
+// batches con transacciones del comercio en esa fecha, un evento por moneda.
+func (h *AdminHandler) enqueueCompletedIfDone(ctx context.Context, tx pgx.Tx, settled *aggregate.SettlementBatch) error {
+	batches, err := h.batchRepo.MerchantDayBatchesTx(ctx, tx, settled.MerchantID(), settled.BatchDate())
 	if err != nil {
-		log.Error("failed to check daily settlement completion", slog.String("error", err.Error()))
-		return
+		return fmt.Errorf("check daily settlement completion: %w", err)
 	}
 
 	type totals struct {
@@ -291,21 +345,16 @@ func (h *AdminHandler) publishCompletedIfDone(ctx context.Context, settled *aggr
 	}
 	byCurrency := map[string]*totals{}
 	for _, b := range batches {
-		if len(b.Transactions()) == 0 {
-			continue
+		if !b.Settled {
+			return nil
 		}
-		if b.State() != valueobject.BatchStateSettled {
-			return
-		}
-		t, ok := byCurrency[b.Currency()]
+		t, ok := byCurrency[b.Currency]
 		if !ok {
 			t = &totals{}
-			byCurrency[b.Currency()] = t
+			byCurrency[b.Currency] = t
 		}
 		t.batches++
-		if s := b.Summary(); s != nil {
-			t.gross += s.TotalAmount().Cents()
-		}
+		t.gross += b.TotalAmount
 	}
 
 	currencies := make([]string, 0, len(byCurrency))
@@ -316,17 +365,18 @@ func (h *AdminHandler) publishCompletedIfDone(ctx context.Context, settled *aggr
 
 	for _, c := range currencies {
 		t := byCurrency[c]
-		net := netAmount(t.gross, h.mdrPercent)
-		if err := h.publisher.PublishSettlementCompleted(ctx,
+		subject, eventID, payload, err := h.publisher.BuildSettlementCompleted(ctx,
 			settled.MerchantID().String(), settled.BatchDate().Format("2006-01-02"),
-			t.batches, t.gross, net, c, h.mdrPercent,
-		); err != nil {
-			log.Error("failed to publish SettlementCompleted",
-				slog.String("currency", c),
-				slog.String("error", err.Error()),
-			)
+			t.batches, t.gross, netAmount(t.gross, h.mdrPercent), c, h.mdrPercent,
+		)
+		if err != nil {
+			return fmt.Errorf("build SettlementCompleted: %w", err)
+		}
+		if err := h.outbox.InsertTx(ctx, tx, subject, eventID, payload); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
 // netAmount descuenta la comisión (MDR) del monto bruto, redondeada al centavo.

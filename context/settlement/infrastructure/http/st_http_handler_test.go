@@ -570,3 +570,29 @@ func TestHandleForceClose_WrongStateReturnsBadRequest(t *testing.T) {
 		t.Errorf("body[error] = %v, want VALIDATION_ERROR", got)
 	}
 }
+
+func TestReadyz_NATS(t *testing.T) {
+	tests := []struct {
+		name       string
+		connected  func() bool
+		wantStatus int
+	}{
+		{"connected", func() bool { return true }, http.StatusOK},
+		{"disconnected", func() bool { return false }, http.StatusServiceUnavailable},
+		{"not configured", nil, http.StatusOK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &fakeBatchRepo{}
+			h := NewHandler(query.NewBatchQueryHandler(repo), command.NewAdminHandler(repo, nil), &fakePool{})
+			h.natsConnected = tt.connected
+
+			rec := httptest.NewRecorder()
+			h.handleReady(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+			if rec.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d; body = %s", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+		})
+	}
+}

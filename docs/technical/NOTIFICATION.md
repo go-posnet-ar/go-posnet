@@ -556,7 +556,7 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | `capture_card` se ignora | `pkg/domain/card_capture.go` prevé escalar la alerta, pero no ocurre, y el comprobante no lo indica | `NotifyRejection` |
 | Los rechazos no generan webhook | Es una decisión explícita del código; el comercio no recibe un aviso automático | `NotifyRejection` |
 | Comprobante incompleto | `MerchantName` y `MerchantAddress` están vacíos, `TerminalCode` guarda un UUID, y el cliente gRPC omite `transaction_at` | `NotifyApproval`, `nt_grpc_client.go` |
-| No hay aviso por `settlement.completed` | Settlement tampoco lo publica hoy | `nt_nats_subscriber.go` |
+| No hay aviso por `settlement.completed` | Settlement lo publica, pero Notification no se suscribe | `nt_nats_subscriber.go` |
 
 ### Operación y datos
 

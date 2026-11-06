@@ -12,15 +12,14 @@ import (
 // El lote no se envió y permanece en CLOSED hasta que un operador lo reenvíe.
 var ErrProcessorUnavailable = errors.New("settlement processor unavailable")
 
-// EventPublisher es el puerto de salida hacia NATS JetStream.
+// EventPublisher arma los eventos del BC. No los publica: el handler los guarda en el
+// outbox, en la misma transacción que el batch, y el Relay los envía a JetStream.
 type EventPublisher interface {
-	// PublishBatchClosed publica el evento al stream POSNET_SETTLEMENT.
-	// Consumido por: Notification BC.
-	PublishBatchClosed(ctx context.Context, batch *aggregate.SettlementBatch) error
+	// BuildBatchClosed serializa el evento BatchClosed. Consumido por: Notification BC.
+	BuildBatchClosed(ctx context.Context, batch *aggregate.SettlementBatch) (subject, eventID string, payload []byte, err error)
 
-	// PublishSettlementCompleted publica el resumen de liquidación diaria.
-	// Consumido por: Notification BC.
-	PublishSettlementCompleted(ctx context.Context, merchantID, settlementDate string, totalBatches int, totalAmount, netAmount int64, currency string, mdrPercent float64) error
+	// BuildSettlementCompleted serializa el resumen de liquidación diaria.
+	BuildSettlementCompleted(ctx context.Context, merchantID, settlementDate string, totalBatches int, totalAmount, netAmount int64, currency string, mdrPercent float64) (subject, eventID string, payload []byte, err error)
 }
 
 // SettlementProcessor es el puerto de salida hacia el procesador externo

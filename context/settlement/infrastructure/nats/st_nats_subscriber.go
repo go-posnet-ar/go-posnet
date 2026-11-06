@@ -15,6 +15,19 @@ import (
 	natsclient "github.com/nats-io/nats.go"
 )
 
+// maxDeliveries es el total de entregas de cada mensaje. Cambiarlo requiere recrear
+// los consumers: la suscripción a un durable existente falla si el valor difiere.
+const maxDeliveries = 5
+
+// retryDelays es la espera antes de cada reentrega por un error transitorio, y da unos
+// 12 minutos para que se recupere, por ejemplo, una base caída.
+var retryDelays = [maxDeliveries - 1]time.Duration{
+	5 * time.Second,
+	30 * time.Second,
+	2 * time.Minute,
+	10 * time.Minute,
+}
+
 // Subscriber registra y gestiona los durable consumers del BC Settlement.
 type Subscriber struct {
 	js           natsclient.JetStreamContext
@@ -42,19 +55,19 @@ func (s *Subscriber) Subscribe() error {
 			subject:  events.SubjectAuthApproved,
 			durable:  "settlement-auth-consumer",
 			handler:  s.handleAuthApproved,
-			maxDeliv: 5,
+			maxDeliv: maxDeliveries,
 		},
 		{
 			subject:  events.SubjectReversalCompleted,
 			durable:  "settlement-reversal-consumer",
 			handler:  s.handleReversalCompleted,
-			maxDeliv: 5,
+			maxDeliv: maxDeliveries,
 		},
 		{
 			subject:  events.SubjectBatchCloseRequested,
 			durable:  "settlement-batch-consumer",
 			handler:  s.handleBatchCloseRequested,
-			maxDeliv: 5,
+			maxDeliv: maxDeliveries,
 		},
 	}
 
@@ -213,12 +226,50 @@ func (s *Subscriber) nak(ctx context.Context, msg *natsclient.Msg, err error, ev
 		return
 	}
 
+	delivered := deliveryCount(msg)
+	if delivered >= maxDeliveries {
+		// JetStream no vuelve a entregarlo: sin intervención, el evento se pierde.
+		s.log.ErrorContext(ctx, "deliveries exhausted — event will not be retried",
+			slog.String("event_id", eventID),
+			slog.String("subject", msg.Subject),
+			slog.Uint64("delivered", delivered),
+			slog.String("error", err.Error()),
+		)
+		observability.RecordNATSFailed(ctx, msg.Subject, "exhausted")
+		_ = msg.Nak()
+		return
+	}
+
+	delay := retryDelay(delivered)
 	s.log.WarnContext(ctx, "transient error — nacking for retry",
 		slog.String("event_id", eventID),
+		slog.Uint64("delivered", delivered),
+		slog.Duration("retry_in", delay),
 		slog.String("error", err.Error()),
 	)
 	observability.RecordNATSFailed(ctx, msg.Subject, "transient")
-	_ = msg.Nak()
+	_ = msg.NakWithDelay(delay)
+}
+
+// deliveryCount devuelve el número de entrega del mensaje. Si no puede leerlo, asume
+// la primera: es preferible reintentar de más que dar un evento por perdido.
+func deliveryCount(msg *natsclient.Msg) uint64 {
+	meta, err := msg.Metadata()
+	if err != nil {
+		return 1
+	}
+	return meta.NumDelivered
+}
+
+// retryDelay devuelve la espera después de la entrega indicada, contada desde 1.
+func retryDelay(delivered uint64) time.Duration {
+	if delivered < 1 {
+		return retryDelays[0]
+	}
+	if delivered > uint64(len(retryDelays)) {
+		return retryDelays[len(retryDelays)-1]
+	}
+	return retryDelays[delivered-1]
 }
 
 // countedHandler envuelve un MsgHandler para contabilizar cada mensaje entregado

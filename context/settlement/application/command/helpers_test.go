@@ -2,6 +2,7 @@ package command_test
 
 import (
 	"context"
+	"github.com/jackc/pgx/v5"
 	"testing"
 	"time"
 
@@ -33,6 +34,12 @@ type fakeBatchRepo struct {
 	listResult []*aggregate.SettlementBatch
 	listErr    error
 
+	dayResult []repository.MerchantDayBatch
+	dayErr    error
+
+	auditEntries []repository.BatchAuditEntry
+	auditErr     error
+
 	staleIDs []string
 	staleErr error
 }
@@ -43,6 +50,22 @@ func (f *fakeBatchRepo) Save(_ context.Context, b *aggregate.SettlementBatch) er
 	f.saveCallCount++
 	f.savedBatches = append(f.savedBatches, b)
 	return f.saveErr
+}
+
+func (f *fakeBatchRepo) SaveTx(ctx context.Context, _ pgx.Tx, b *aggregate.SettlementBatch) error {
+	return f.Save(ctx, b)
+}
+
+func (f *fakeBatchRepo) MerchantDayBatchesTx(context.Context, pgx.Tx, domain.MerchantID, time.Time) ([]repository.MerchantDayBatch, error) {
+	return f.dayResult, f.dayErr
+}
+
+func (f *fakeBatchRepo) InsertAuditTx(_ context.Context, _ pgx.Tx, e repository.BatchAuditEntry) error {
+	if f.auditErr != nil {
+		return f.auditErr
+	}
+	f.auditEntries = append(f.auditEntries, e)
+	return nil
 }
 
 func (f *fakeBatchRepo) lastSaved() *aggregate.SettlementBatch {
@@ -77,11 +100,11 @@ func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, 
 // ─── fakePublisher / fakeProcessor ───────────────────────────────────────────
 
 type fakePublisher struct {
-	publishBatchClosedErr   error
-	publishBatchClosedCalls int
+	buildBatchClosedErr   error
+	buildBatchClosedCalls int
 
-	publishCompletedErr error
-	completed           []completedEvent
+	buildCompletedErr error
+	completed         []completedEvent
 }
 
 type completedEvent struct {
@@ -92,14 +115,14 @@ type completedEvent struct {
 	mdr              float64
 }
 
-func (f *fakePublisher) PublishBatchClosed(context.Context, *aggregate.SettlementBatch) error {
-	f.publishBatchClosedCalls++
-	return f.publishBatchClosedErr
+func (f *fakePublisher) BuildBatchClosed(context.Context, *aggregate.SettlementBatch) (string, string, []byte, error) {
+	f.buildBatchClosedCalls++
+	return "posnet.settlement.batch-closed.v1", "event-closed", []byte("{}"), f.buildBatchClosedErr
 }
 
-func (f *fakePublisher) PublishSettlementCompleted(_ context.Context, merchantID, date string, batches int, gross, net int64, currency string, mdr float64) error {
+func (f *fakePublisher) BuildSettlementCompleted(_ context.Context, merchantID, date string, batches int, gross, net int64, currency string, mdr float64) (string, string, []byte, error) {
 	f.completed = append(f.completed, completedEvent{merchantID, date, batches, gross, net, currency, mdr})
-	return f.publishCompletedErr
+	return "posnet.settlement.completed.v1", "event-completed", []byte("{}"), f.buildCompletedErr
 }
 
 type fakeProcessor struct {

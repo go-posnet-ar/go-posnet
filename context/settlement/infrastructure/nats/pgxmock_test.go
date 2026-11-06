@@ -37,3 +37,17 @@ func expectClaimed(pool pgxmock.PgxPoolIface, rowsAffected int64) {
 	pool.ExpectCommit()
 	pool.ExpectRollback()
 }
+
+// expectClaimedWithEvent simula el evento nuevo que guarda el lote y encola su evento
+// en el outbox, todo en la misma transacción.
+func expectClaimedWithEvent(pool pgxmock.PgxPoolIface) {
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectExec("INSERT INTO " + idempotencySchema + ".processed_events").
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectExec("INSERT INTO "+idempotencySchema+".outbox").
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectCommit()
+	pool.ExpectRollback()
+}

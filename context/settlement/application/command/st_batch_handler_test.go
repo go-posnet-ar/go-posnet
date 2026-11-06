@@ -18,12 +18,13 @@ import (
 	"github.com/juantevez/go-posnet/pkg/domain"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
+	"github.com/juantevez/go-posnet/pkg/outbox"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 	"github.com/pashagolub/pgxmock/v4"
 )
 
 func newHandler(pool pgutil.PgxPool, batchRepo repository.SettlementBatchRepository, publisher service.EventPublisher, processor service.SettlementProcessor) *command.BatchHandler {
-	return command.NewBatchHandler(batchRepo, publisher, processor, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool, 2.5)
+	return command.NewBatchHandler(batchRepo, publisher, outbox.NewStore(idempotencySchema), processor, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool, 2.5)
 }
 
 // ─── RegisterApproval ──────────────────────────────────────────────────────────
@@ -480,8 +481,8 @@ func TestProcessBatchClose_DuplicateEventSkipsPersistAndPublish(t *testing.T) {
 	if repo.saveCallCount != 0 {
 		t.Errorf("Save call count = %d, want 0 for a duplicate event", repo.saveCallCount)
 	}
-	if publisher.publishBatchClosedCalls != 0 {
-		t.Errorf("PublishBatchClosed calls = %d, want 0", publisher.publishBatchClosedCalls)
+	if publisher.buildBatchClosedCalls != 0 {
+		t.Errorf("BuildBatchClosed calls = %d, want 0", publisher.buildBatchClosedCalls)
 	}
 	if processor.calls != 0 {
 		t.Errorf("processor.Submit calls = %d, want 0", processor.calls)
@@ -504,7 +505,7 @@ func TestProcessBatchClose_NoDiscrepancy_SubmitsToProcessor(t *testing.T) {
 	batch := closableFoundBatch(t) // total 3000/2 tx, matches validProcessCloseCmd()
 	repo := &fakeBatchRepo{findOpenResult: batch}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 	publisher := &fakePublisher{}
 	processor := &fakeProcessor{confirmationID: "conf-123"}
 
@@ -513,8 +514,8 @@ func TestProcessBatchClose_NoDiscrepancy_SubmitsToProcessor(t *testing.T) {
 		t.Fatalf("ProcessBatchClose() error = %v", err)
 	}
 
-	if publisher.publishBatchClosedCalls != 1 {
-		t.Errorf("PublishBatchClosed calls = %d, want 1", publisher.publishBatchClosedCalls)
+	if publisher.buildBatchClosedCalls != 1 {
+		t.Errorf("BuildBatchClosed calls = %d, want 1", publisher.buildBatchClosedCalls)
 	}
 	if processor.calls != 1 {
 		t.Errorf("processor.Submit calls = %d, want 1", processor.calls)
@@ -531,20 +532,22 @@ func TestProcessBatchClose_NoDiscrepancy_SubmitsToProcessor(t *testing.T) {
 	}
 }
 
-func TestProcessBatchClose_PublishErrorIsNonFatal(t *testing.T) {
+// Si no se puede guardar el evento, el cierre tampoco se confirma: el mensaje se
+// reintenta y el lote sigue abierto.
+func TestProcessBatchClose_EventErrorRollsBackClose(t *testing.T) {
 	batch := closableFoundBatch(t)
 	repo := &fakeBatchRepo{findOpenResult: batch}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
-	publisher := &fakePublisher{publishBatchClosedErr: errors.New("nats unavailable")}
+	expectClaimedThenFail(pool, 1)
+	publisher := &fakePublisher{buildBatchClosedErr: errors.New("marshal failed")}
 	processor := &fakeProcessor{confirmationID: "conf-123"}
 
 	h := newHandler(pool, repo, publisher, processor)
-	if err := h.ProcessBatchClose(context.Background(), validProcessCloseCmd()); err != nil {
-		t.Fatalf("ProcessBatchClose() error = %v, want nil (publish errors are logged only)", err)
+	if err := h.ProcessBatchClose(context.Background(), validProcessCloseCmd()); err == nil {
+		t.Fatal("ProcessBatchClose() error = nil, want the event error")
 	}
-	if processor.calls != 1 {
-		t.Errorf("processor.Submit calls = %d, want 1 (should still run after a publish failure)", processor.calls)
+	if processor.calls != 0 {
+		t.Errorf("processor.Submit calls = %d, want 0", processor.calls)
 	}
 }
 
@@ -552,7 +555,7 @@ func TestProcessBatchClose_WithDiscrepancy_MarksDisputedAndSkipsSubmit(t *testin
 	batch := closableFoundBatch(t) // backend total = 3000/2 tx
 	repo := &fakeBatchRepo{findOpenResult: batch}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 	publisher := &fakePublisher{}
 	processor := &fakeProcessor{}
 
@@ -567,8 +570,12 @@ func TestProcessBatchClose_WithDiscrepancy_MarksDisputedAndSkipsSubmit(t *testin
 	if processor.calls != 0 {
 		t.Errorf("processor.Submit calls = %d, want 0 (no debe enviarse un batch en disputa)", processor.calls)
 	}
-	if repo.saveCallCount != 2 {
-		t.Fatalf("Save call count = %d, want 2 (close + mark disputed)", repo.saveCallCount)
+	// Un solo guardado: el lote no puede quedar en CLOSED con discrepancias.
+	if repo.saveCallCount != 1 {
+		t.Fatalf("Save call count = %d, want 1", repo.saveCallCount)
+	}
+	if publisher.buildBatchClosedCalls != 1 {
+		t.Errorf("BuildBatchClosed calls = %d, want 1", publisher.buildBatchClosedCalls)
 	}
 	saved := repo.lastSaved()
 	if saved.State() != valueobject.BatchStateDisputed {
@@ -576,18 +583,22 @@ func TestProcessBatchClose_WithDiscrepancy_MarksDisputedAndSkipsSubmit(t *testin
 	}
 }
 
-func TestProcessBatchClose_MarkDisputedSaveError(t *testing.T) {
+func TestProcessBatchClose_DisputedSaveErrorEnqueuesNothing(t *testing.T) {
 	batch := closableFoundBatch(t)
-	repo := &fakeBatchRepoSaveErrOnCall{fakeBatchRepo: fakeBatchRepo{findOpenResult: batch}, errOnCall: 2}
+	repo := &fakeBatchRepo{findOpenResult: batch, saveErr: errors.New("connection reset")}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedThenFail(pool, 1)
+	publisher := &fakePublisher{}
 
-	h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+	h := newHandler(pool, repo, publisher, &fakeProcessor{})
 	cmd := validProcessCloseCmd()
 	cmd.TerminalCount = 5
 
 	if err := h.ProcessBatchClose(context.Background(), cmd); err == nil {
-		t.Fatal("ProcessBatchClose() error = nil, want it to propagate the second Save error")
+		t.Fatal("ProcessBatchClose() error = nil, want the Save error")
+	}
+	if publisher.buildBatchClosedCalls != 0 {
+		t.Errorf("BuildBatchClosed calls = %d, want 0", publisher.buildBatchClosedCalls)
 	}
 }
 
@@ -595,7 +606,7 @@ func TestProcessBatchClose_SubmitSaveError(t *testing.T) {
 	batch := closableFoundBatch(t) // sin discrepancias — sigue a submitBatch
 	repo := &fakeBatchRepoSaveErrOnCall{fakeBatchRepo: fakeBatchRepo{findOpenResult: batch}, errOnCall: 2}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 	processor := &fakeProcessor{confirmationID: "conf-123"}
 
 	h := newHandler(pool, repo, &fakePublisher{}, processor)
@@ -612,7 +623,7 @@ func TestProcessBatchClose_ProcessorSubmitError(t *testing.T) {
 	batch := closableFoundBatch(t)
 	repo := &fakeBatchRepo{findOpenResult: batch}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 	processor := &fakeProcessor{err: errors.New("processor unavailable")}
 
 	h := newHandler(pool, repo, &fakePublisher{}, processor)
@@ -632,7 +643,7 @@ func TestProcessBatchClose_InvalidBatchDateFallsBackToNow(t *testing.T) {
 	batch := closableFoundBatch(t)
 	repo := &fakeBatchRepo{findOpenResult: batch}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 
 	h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{confirmationID: "conf-1"})
 	cmd := validProcessCloseCmd()
@@ -665,7 +676,7 @@ func TestProcessBatchClose_NoProcessorKeepsBatchClosed(t *testing.T) {
 	batch := closableFoundBatch(t)
 	repo := &fakeBatchRepo{findOpenResult: batch}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 	publisher := &fakePublisher{}
 
 	h := newHandler(pool, repo, publisher, nil)
@@ -679,8 +690,8 @@ func TestProcessBatchClose_NoProcessorKeepsBatchClosed(t *testing.T) {
 	if got := repo.lastSaved().State(); got != valueobject.BatchStateClosed {
 		t.Errorf("State() = %v, want %v", got, valueobject.BatchStateClosed)
 	}
-	if publisher.publishBatchClosedCalls != 1 {
-		t.Errorf("PublishBatchClosed calls = %d, want 1", publisher.publishBatchClosedCalls)
+	if publisher.buildBatchClosedCalls != 1 {
+		t.Errorf("BuildBatchClosed calls = %d, want 1", publisher.buildBatchClosedCalls)
 	}
 }
 
@@ -700,7 +711,7 @@ func TestCloseStaleBatches_ClosesPublishesAndSubmits(t *testing.T) {
 	batch := closableFoundBatch(t)
 	repo := &fakeBatchRepo{staleIDs: []string{batch.ID()}, findByIDResult: batch}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 	publisher := &fakePublisher{}
 	processor := &fakeProcessor{confirmationID: "conf-1"}
 
@@ -711,8 +722,8 @@ func TestCloseStaleBatches_ClosesPublishesAndSubmits(t *testing.T) {
 	if closed != 1 || failed != 0 {
 		t.Errorf("closed = %d, failed = %d, want 1, 0", closed, failed)
 	}
-	if publisher.publishBatchClosedCalls != 1 {
-		t.Errorf("PublishBatchClosed calls = %d, want 1", publisher.publishBatchClosedCalls)
+	if publisher.buildBatchClosedCalls != 1 {
+		t.Errorf("BuildBatchClosed calls = %d, want 1", publisher.buildBatchClosedCalls)
 	}
 	if processor.calls != 1 {
 		t.Errorf("processor.Submit calls = %d, want 1", processor.calls)
@@ -729,7 +740,7 @@ func TestCloseStaleBatches_NoProcessorKeepsClosed(t *testing.T) {
 	batch := closableFoundBatch(t)
 	repo := &fakeBatchRepo{staleIDs: []string{batch.ID()}, findByIDResult: batch}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 
 	closed, failed, err := newHandler(pool, repo, &fakePublisher{}, nil).CloseStaleBatches(context.Background(), time.Now())
 	if err != nil || closed != 1 || failed != 0 {
@@ -752,8 +763,8 @@ func TestCloseStaleBatches_EmptyBatchIsClosedSilently(t *testing.T) {
 	if err != nil || closed != 1 {
 		t.Fatalf("closed = %d, err = %v, want 1, nil", closed, err)
 	}
-	if publisher.publishBatchClosedCalls != 0 || processor.calls != 0 {
-		t.Errorf("publish calls = %d, submit calls = %d, want 0, 0", publisher.publishBatchClosedCalls, processor.calls)
+	if publisher.buildBatchClosedCalls != 0 || processor.calls != 0 {
+		t.Errorf("publish calls = %d, submit calls = %d, want 0, 0", publisher.buildBatchClosedCalls, processor.calls)
 	}
 	if got := repo.lastSaved().State(); got != valueobject.BatchStateClosed {
 		t.Errorf("State() = %v, want %v", got, valueobject.BatchStateClosed)
@@ -773,8 +784,8 @@ func TestCloseStaleBatches_AlreadyClaimedSkips(t *testing.T) {
 	if err != nil || closed != 0 || failed != 0 {
 		t.Fatalf("closed = %d, failed = %d, err = %v, want 0, 0, nil", closed, failed, err)
 	}
-	if repo.saveCallCount != 0 || publisher.publishBatchClosedCalls != 0 || processor.calls != 0 {
-		t.Errorf("save = %d, publish = %d, submit = %d, want 0, 0, 0", repo.saveCallCount, publisher.publishBatchClosedCalls, processor.calls)
+	if repo.saveCallCount != 0 || publisher.buildBatchClosedCalls != 0 || processor.calls != 0 {
+		t.Errorf("save = %d, publish = %d, submit = %d, want 0, 0, 0", repo.saveCallCount, publisher.buildBatchClosedCalls, processor.calls)
 	}
 }
 
@@ -806,7 +817,7 @@ func TestCloseStaleBatches_SubmitErrorIsNotAFailure(t *testing.T) {
 	batch := closableFoundBatch(t)
 	repo := &fakeBatchRepo{staleIDs: []string{batch.ID()}, findByIDResult: batch}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 	processor := &fakeProcessor{err: errors.New("processor down")}
 
 	closed, failed, err := newHandler(pool, repo, &fakePublisher{}, processor).CloseStaleBatches(context.Background(), time.Now())
@@ -991,7 +1002,7 @@ func TestProcessBatchClose_ReloadsBatchOnStale(t *testing.T) {
 	repo := &fakeBatchRepoStaleReload{builds: func() *aggregate.SettlementBatch { return closableFoundBatch(t) }, staleSaves: 1}
 	pool := newMockPool(t)
 	expectClaimedThenFail(pool, 1)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 
 	if err := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{confirmationID: "c"}).ProcessBatchClose(context.Background(), validProcessCloseCmd()); err != nil {
 		t.Fatalf("ProcessBatchClose() error = %v, want nil after retrying", err)
@@ -1073,4 +1084,162 @@ func (f *fakeBatchRepoCancelOnSave) Save(context.Context, *aggregate.SettlementB
 	f.saves++
 	f.cancel()
 	return repository.ErrStaleBatch
+}
+
+func (f *fakeBatchRepoSaveErrOnCall) SaveTx(ctx context.Context, _ pgx.Tx, b *aggregate.SettlementBatch) error {
+	return f.Save(ctx, b)
+}
+
+func (f *fakeBatchRepoStale) SaveTx(ctx context.Context, _ pgx.Tx, b *aggregate.SettlementBatch) error {
+	return f.Save(ctx, b)
+}
+
+func (f *fakeBatchRepoStaleReload) SaveTx(ctx context.Context, _ pgx.Tx, b *aggregate.SettlementBatch) error {
+	return f.Save(ctx, b)
+}
+
+func (f *fakeBatchRepoCancelOnSave) SaveTx(ctx context.Context, _ pgx.Tx, b *aggregate.SettlementBatch) error {
+	return f.Save(ctx, b)
+}
+
+// ─── Revisión de reversas ─────────────────────────────────────────────────────
+
+type fakeReviews struct {
+	purchase *repository.ReversalPurchase
+	findErr  error
+
+	inserted  []repository.ReversalReview
+	insertErr error
+
+	reconcileReason   string
+	reconcileResolved bool
+	reconcileErr      error
+	reconciled        []repository.ReversalPurchase
+}
+
+func (f *fakeReviews) FindPurchaseTx(context.Context, pgx.Tx, string) (*repository.ReversalPurchase, error) {
+	return f.purchase, f.findErr
+}
+
+func (f *fakeReviews) InsertReversalReviewTx(_ context.Context, _ pgx.Tx, r repository.ReversalReview) error {
+	f.inserted = append(f.inserted, r)
+	return f.insertErr
+}
+
+func (f *fakeReviews) ReconcileReversalReviewTx(_ context.Context, _ pgx.Tx, _ string, p repository.ReversalPurchase) (string, bool, error) {
+	f.reconciled = append(f.reconciled, p)
+	return f.reconcileReason, f.reconcileResolved, f.reconcileErr
+}
+
+func TestRegisterReversal_Review(t *testing.T) {
+	cmd := validReversalCmd()
+	match := repository.ReversalPurchase{MerchantID: cmd.MerchantID, AmountCents: cmd.AmountCents, Currency: cmd.Currency}
+	with := func(change func(*repository.ReversalPurchase)) *repository.ReversalPurchase {
+		p := match
+		change(&p)
+		return &p
+	}
+	tests := []struct {
+		name       string
+		purchase   *repository.ReversalPurchase
+		wantReason string
+	}{
+		{"coincide", &match, ""},
+		{"sin compra", nil, repository.ReversalReviewPurchaseNotFound},
+		{"otro monto", with(func(p *repository.ReversalPurchase) { p.AmountCents++ }), repository.ReversalReviewAmountMismatch},
+		{"otra moneda", with(func(p *repository.ReversalPurchase) { p.Currency = "USD" }), repository.ReversalReviewCurrencyMismatch},
+		{"otro comercio", with(func(p *repository.ReversalPurchase) { p.MerchantID = domain.NewMerchantID().String() }), repository.ReversalReviewMerchantMismatch},
+		{"el comercio pesa más que el monto", with(func(p *repository.ReversalPurchase) {
+			p.MerchantID = domain.NewMerchantID().String()
+			p.AmountCents++
+		}), repository.ReversalReviewMerchantMismatch},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+			repo := &fakeBatchRepo{findOrCreateResult: batch}
+			pool := newMockPool(t)
+			expectClaimed(pool, 1)
+			reviews := &fakeReviews{purchase: tc.purchase}
+			h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+			h.SetReversalReviews(reviews)
+
+			if err := h.RegisterReversal(context.Background(), cmd); err != nil {
+				t.Fatalf("RegisterReversal() error = %v", err)
+			}
+
+			// La reversa se registra siempre, con el monto del evento.
+			if repo.saveCallCount != 1 {
+				t.Errorf("Save call count = %d, want 1", repo.saveCallCount)
+			}
+			if tc.wantReason == "" {
+				if len(reviews.inserted) != 0 {
+					t.Errorf("reviews = %+v, want none", reviews.inserted)
+				}
+				return
+			}
+			if len(reviews.inserted) != 1 {
+				t.Fatalf("reviews = %d, want 1", len(reviews.inserted))
+			}
+			got := reviews.inserted[0]
+			if got.Reason != tc.wantReason || got.BatchID != batch.ID() || got.TransactionID != cmd.OriginalTransactionID || got.AmountCents != cmd.AmountCents {
+				t.Errorf("review = %+v", got)
+			}
+		})
+	}
+}
+
+// Si no se puede validar, nada se confirma: el evento se reintenta.
+func TestRegisterReversal_ReviewErrorsRollBack(t *testing.T) {
+	tests := []struct {
+		name    string
+		reviews *fakeReviews
+	}{
+		{"lookup", &fakeReviews{findErr: errors.New("db down")}},
+		{"insert", &fakeReviews{insertErr: errors.New("db down")}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &fakeBatchRepo{findOrCreateResult: newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())}
+			pool := newMockPool(t)
+			expectClaimedThenFail(pool, 1)
+			h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+			h.SetReversalReviews(tc.reviews)
+
+			if err := h.RegisterReversal(context.Background(), validReversalCmd()); err == nil {
+				t.Fatal("RegisterReversal() error = nil, want it to fail")
+			}
+		})
+	}
+}
+
+func TestRegisterApproval_ReconcilesPendingReview(t *testing.T) {
+	repo := &fakeBatchRepo{findOrCreateResult: newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())}
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+	reviews := &fakeReviews{reconcileReason: repository.ReversalReviewPurchaseNotFound, reconcileResolved: true}
+	h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+	h.SetReversalReviews(reviews)
+	cmd := validApprovalCmd()
+
+	if err := h.RegisterApproval(context.Background(), cmd); err != nil {
+		t.Fatalf("RegisterApproval() error = %v", err)
+	}
+
+	want := repository.ReversalPurchase{MerchantID: cmd.MerchantID, AmountCents: cmd.AmountCents, Currency: cmd.Currency}
+	if len(reviews.reconciled) != 1 || reviews.reconciled[0] != want {
+		t.Errorf("reconciled = %+v, want [%+v]", reviews.reconciled, want)
+	}
+}
+
+func TestRegisterApproval_ReconcileErrorRollsBack(t *testing.T) {
+	repo := &fakeBatchRepo{findOrCreateResult: newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())}
+	pool := newMockPool(t)
+	expectClaimedThenFail(pool, 1)
+	h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+	h.SetReversalReviews(&fakeReviews{reconcileErr: errors.New("db down")})
+
+	if err := h.RegisterApproval(context.Background(), validApprovalCmd()); err == nil {
+		t.Fatal("RegisterApproval() error = nil, want the reconcile error")
+	}
 }

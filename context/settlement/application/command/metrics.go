@@ -2,11 +2,13 @@ package command
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
+	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
 	"github.com/juantevez/go-posnet/pkg/observability"
 )
 
@@ -20,6 +22,9 @@ import (
 //	posnet_settlement_batches       → posnet_settlement_batches_total{currency,state}
 //	posnet_settlement_batch_duration → posnet_settlement_batch_duration_seconds
 //	posnet_settlement_submissions   → posnet_settlement_submissions_total{result}
+//	posnet_settlement_batches_attention → posnet_settlement_batches_attention{reason}
+//	posnet_settlement_outbox_stuck → posnet_settlement_outbox_stuck
+//	posnet_settlement_reversals_in_review → posnet_settlement_reversals_in_review
 //
 // El label "bc" lo inyecta Prometheus como target label (prometheus.yml).
 type Metrics struct {
@@ -35,6 +40,20 @@ const (
 	submissionSubmitted   = "submitted"
 	submissionUnavailable = "unavailable"
 	submissionError       = "error"
+)
+
+const (
+	// closedUnsentAfter es cuánto puede seguir un lote en CLOSED antes de considerarlo
+	// trabado: da margen a un operador que está resolviendo una disputa o reenviando.
+	closedUnsentAfter = time.Hour
+	// outboxStuckAfter es cuánto puede esperar un evento en el outbox: el Relay lo
+	// publica en segundos, salvo que NATS no esté disponible.
+	outboxStuckAfter = time.Minute
+	// reversalReviewAfter da tiempo a que llegue la compra de una reversa adelantada: un
+	// evento puede tardar unos 12 minutos en reintentos (ver retryDelays en el subscriber).
+	reversalReviewAfter = 15 * time.Minute
+	// attentionQueryTimeout acota la consulta para no demorar el scrape de /metrics.
+	attentionQueryTimeout = 2 * time.Second
 )
 
 var latencyBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10}
@@ -112,4 +131,58 @@ func (m *Metrics) RecordBatchClosed(ctx context.Context, currency, state string,
 		attribute.String("state", state),
 	))
 	m.batchDuration.Record(ctx, d.Seconds())
+}
+
+// RegisterBatchAttentionGauge publica los lotes que requieren atención, consultando la
+// base en cada scrape. El cálculo es por zona de negocio, igual que el cierre automático.
+// Si la consulta falla, la serie no se informa en ese scrape: un cero ocultaría los lotes.
+func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *time.Location) error {
+	gauge, err := observability.Meter("posnet.settlement").Int64ObservableGauge(
+		"posnet_settlement_batches_attention",
+		metric.WithDescription("Lotes que requieren atención, por reason: disputed, closed_unsent u open_overdue."),
+	)
+	if err != nil {
+		return err
+	}
+	outboxGauge, err := observability.Meter("posnet.settlement").Int64ObservableGauge(
+		"posnet_settlement_outbox_stuck",
+		metric.WithDescription("Eventos que esperan en el outbox desde hace más de un minuto."),
+	)
+	if err != nil {
+		return err
+	}
+	reviewGauge, err := observability.Meter("posnet.settlement").Int64ObservableGauge(
+		"posnet_settlement_reversals_in_review",
+		metric.WithDescription("Reversas que no coinciden con su compra, en revisión hace más de 15 minutos."),
+	)
+	if err != nil {
+		return err
+	}
+	_, err = observability.Meter("posnet.settlement").RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			ctx, cancel := context.WithTimeout(ctx, attentionQueryTimeout)
+			defer cancel()
+
+			now := time.Now()
+			y, m, d := now.In(loc).Date()
+			today := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+
+			counts, err := counter.CountBatchesNeedingAttention(ctx, today, now.Add(-closedUnsentAfter), now.Add(-outboxStuckAfter), now.Add(-reversalReviewAfter))
+			if err != nil {
+				slog.ErrorContext(ctx, "failed to count batches needing attention", slog.String("error", err.Error()))
+				return nil
+			}
+			observe := func(reason string, value int64) {
+				o.ObserveInt64(gauge, value, metric.WithAttributes(attribute.String("reason", reason)))
+			}
+			observe("disputed", counts.Disputed)
+			observe("closed_unsent", counts.ClosedUnsent)
+			observe("open_overdue", counts.OpenOverdue)
+			o.ObserveInt64(outboxGauge, counts.OutboxStuck)
+			o.ObserveInt64(reviewGauge, counts.ReversalsInReview)
+			return nil
+		},
+		gauge, outboxGauge, reviewGauge,
+	)
+	return err
 }

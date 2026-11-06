@@ -20,6 +20,7 @@ import (
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
 	"github.com/juantevez/go-posnet/pkg/observability"
+	"github.com/juantevez/go-posnet/pkg/outbox"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 )
 
@@ -29,11 +30,18 @@ type BatchHandler struct {
 	batchRepo   repository.SettlementBatchRepository
 	publisher   service.EventPublisher
 	processor   service.SettlementProcessor
+	outbox      *outbox.Store
 	idempotency *natsutil.IdempotencyStore
 	pool        pgutil.PgxPool
 	mdrPercent  float64
 	metrics     *Metrics // opcional; nil = sin instrumentación (tests)
 	location    *time.Location
+	reviews     repository.ReversalReviewLog // opcional; nil = no valida las reversas
+}
+
+// SetReversalReviews habilita la validación de las reversas contra sus compras.
+func (h *BatchHandler) SetReversalReviews(reviews repository.ReversalReviewLog) {
+	h.reviews = reviews
 }
 
 // SetBusinessLocation define la zona horaria del día de negocio. Sin configurar, usa UTC.
@@ -60,6 +68,7 @@ func (h *BatchHandler) SetMetrics(m *Metrics) {
 func NewBatchHandler(
 	batchRepo repository.SettlementBatchRepository,
 	publisher service.EventPublisher,
+	outboxStore *outbox.Store,
 	processor service.SettlementProcessor,
 	idempotency *natsutil.IdempotencyStore,
 	pool pgutil.PgxPool,
@@ -68,6 +77,7 @@ func NewBatchHandler(
 	return &BatchHandler{
 		batchRepo:   batchRepo,
 		publisher:   publisher,
+		outbox:      outboxStore,
 		processor:   processor,
 		idempotency: idempotency,
 		pool:        pool,
@@ -110,9 +120,13 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 		authorizedAt = time.Now().UTC()
 	}
 
-	var batchID string
+	var (
+		batchID        string
+		reviewReason   string
+		reviewResolved bool
+	)
 	err = retryOnStale(ctx, func() error {
-		batchID = ""
+		batchID, reviewReason, reviewResolved = "", "", false
 		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
 			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
 			if err != nil {
@@ -131,7 +145,17 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 				return fmt.Errorf("add transaction: %w", err)
 			}
 			batchID = batch.ID()
-			return h.batchRepo.Save(ctx, batch)
+			if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
+				return err
+			}
+			if h.reviews == nil {
+				return nil
+			}
+			// La reversa pudo llegar antes: si la estaba esperando, se compara ahora.
+			reviewReason, reviewResolved, err = h.reviews.ReconcileReversalReviewTx(ctx, tx, txID.String(), repository.ReversalPurchase{
+				MerchantID: merchantID.String(), AmountCents: cmd.AmountCents, Currency: cmd.Currency,
+			})
+			return err
 		})
 	})
 	if err != nil {
@@ -139,6 +163,11 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 		return fmt.Errorf("RegisterApproval: %w", err)
 	}
 
+	if reviewResolved {
+		log.Info("reversal review resolved — the purchase arrived and matches")
+	} else if reviewReason != "" {
+		log.Warn("reversal does not match the purchase that arrived later", slog.String("reason", reviewReason))
+	}
 	if batchID != "" {
 		h.metrics.RecordAuthApproved(ctx)
 		log.Info("transaction registered in batch",
@@ -177,9 +206,12 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 		completedAt = time.Now().UTC()
 	}
 
-	var registered bool
+	var (
+		registered   bool
+		reviewReason string
+	)
 	err = retryOnStale(ctx, func() error {
-		registered = false
+		registered, reviewReason = false, ""
 		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
 			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
 			if err != nil {
@@ -197,7 +229,11 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 				return fmt.Errorf("remove transaction: %w", err)
 			}
 			registered = true
-			return h.batchRepo.Save(ctx, batch)
+			if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
+				return err
+			}
+			reviewReason, err = h.reviewReversal(ctx, tx, batch.ID(), origTxID.String(), merchantID.String(), cmd)
+			return err
 		})
 	})
 	if err != nil {
@@ -206,7 +242,58 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 	if registered {
 		h.metrics.RecordReversal(ctx)
 	}
+	if reviewReason != "" {
+		observability.FromContext(ctx).Warn("reversal registered for review",
+			slog.String("transaction_id", cmd.OriginalTransactionID),
+			slog.String("event_id", cmd.EventID),
+			slog.String("reason", reviewReason),
+			slog.Int64("amount_cents", cmd.AmountCents),
+			slog.String("currency", cmd.Currency),
+		)
+	}
 	return nil
+}
+
+// reviewReversal compara la reversa con su compra y, si no coinciden, abre una revisión.
+// Devuelve el motivo, o vacío si coinciden.
+func (h *BatchHandler) reviewReversal(ctx context.Context, tx pgx.Tx, batchID, transactionID, merchantID string, cmd port.RegisterReversalCommand) (string, error) {
+	if h.reviews == nil {
+		return "", nil
+	}
+	purchase, err := h.reviews.FindPurchaseTx(ctx, tx, transactionID)
+	if err != nil {
+		return "", err
+	}
+	reason := reversalMismatch(purchase, merchantID, cmd.AmountCents, cmd.Currency)
+	if reason == "" {
+		return "", nil
+	}
+	err = h.reviews.InsertReversalReviewTx(ctx, tx, repository.ReversalReview{
+		TransactionID: transactionID,
+		BatchID:       batchID,
+		Reason:        reason,
+		MerchantID:    merchantID,
+		AmountCents:   cmd.AmountCents,
+		Currency:      cmd.Currency,
+		Purchase:      purchase,
+	})
+	return reason, err
+}
+
+// reversalMismatch devuelve por qué la reversa no coincide con la compra, o vacío si
+// coincide. Authorization siempre revierte el monto completo: no hay reversas parciales.
+func reversalMismatch(purchase *repository.ReversalPurchase, merchantID string, amountCents int64, currency string) string {
+	switch {
+	case purchase == nil:
+		return repository.ReversalReviewPurchaseNotFound
+	case purchase.MerchantID != merchantID:
+		return repository.ReversalReviewMerchantMismatch
+	case purchase.Currency != currency:
+		return repository.ReversalReviewCurrencyMismatch
+	case purchase.AmountCents != amountCents:
+		return repository.ReversalReviewAmountMismatch
+	}
+	return ""
 }
 
 // ProcessBatchClose procesa el cierre de lote solicitado por el terminal.
@@ -253,6 +340,12 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 		if err := batch.Close(cmd.TerminalCount, cmd.TerminalAmount); err != nil {
 			return fmt.Errorf("close batch: %w", err)
 		}
+		// Con discrepancias, el lote no se envía: pasa a DISPUTED en el mismo guardado.
+		if batch.Discrepancies() > 0 {
+			if err := batch.MarkDisputed("terminal count/amount mismatch"); err != nil {
+				return fmt.Errorf("mark disputed: %w", err)
+			}
+		}
 
 		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
 			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
@@ -264,7 +357,10 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 				return nil
 			}
 			processed = true
-			return h.batchRepo.Save(ctx, batch)
+			if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
+				return err
+			}
+			return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch)
 		})
 	})
 	if err != nil {
@@ -279,29 +375,31 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 	}
 	h.metrics.RecordBatchClosed(ctx, batch.Currency(), batch.State().String(), time.Since(closeStart))
 
-	// Publicar BatchClosed a NATS → Notification BC
-	if err := h.publisher.PublishBatchClosed(ctx, batch); err != nil {
-		log.Error("failed to publish BatchClosed", slog.String("error", err.Error()))
-	}
-
 	log.Info("batch closed successfully",
 		slog.String("batch_id", batch.ID()),
+		slog.String("state", batch.State().String()),
 		slog.Int("discrepancies", batch.Discrepancies()),
 	)
 
-	// Si hay discrepancias, marcar como DISPUTED en lugar de continuar
-	if batch.Discrepancies() > 0 {
-		log.Warn("batch has discrepancies — marking as disputed",
+	if batch.State() == valueobject.BatchStateDisputed {
+		log.Warn("batch has discrepancies — marked as disputed",
+			slog.String("batch_id", batch.ID()),
 			slog.Int("discrepancies", batch.Discrepancies()),
 		)
-		if err := batch.MarkDisputed("terminal count/amount mismatch"); err != nil {
-			return fmt.Errorf("ProcessBatchClose: mark disputed: %w", err)
-		}
-		return h.batchRepo.Save(ctx, batch)
+		return nil
 	}
 
 	// Sin discrepancias → enviar al procesador externo
 	return h.submitBatch(ctx, batch)
+}
+
+// enqueueBatchClosed guarda el evento BatchClosed en el outbox, dentro de tx.
+func enqueueBatchClosed(ctx context.Context, tx pgx.Tx, publisher service.EventPublisher, store *outbox.Store, batch *aggregate.SettlementBatch) error {
+	subject, eventID, payload, err := publisher.BuildBatchClosed(ctx, batch)
+	if err != nil {
+		return fmt.Errorf("build BatchClosed: %w", err)
+	}
+	return store.InsertTx(ctx, tx, subject, eventID, payload)
 }
 
 // Reintentos ante un conflicto de versión. Son internos porque las entregas de NATS
@@ -408,7 +506,14 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 			return nil
 		}
 		processed = true
-		return h.batchRepo.Save(ctx, batch)
+		if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
+			return err
+		}
+		// Un lote vacío (lo crea una reversa de otra fecha) no tiene nada que informar.
+		if len(batch.Transactions()) == 0 {
+			return nil
+		}
+		return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch)
 	})
 	if err != nil {
 		return false, fmt.Errorf("persist batch: %w", err)
@@ -422,14 +527,11 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 		slog.Int("tx_count", len(batch.Transactions())),
 	)
 
-	// Un lote vacío (lo crea una reversa de otra fecha) no tiene nada que informar ni enviar.
+	// Un lote vacío no tiene nada que enviar.
 	if len(batch.Transactions()) == 0 {
 		return true, nil
 	}
 
-	if err := h.publisher.PublishBatchClosed(ctx, batch); err != nil {
-		log.Error("failed to publish BatchClosed", slog.String("error", err.Error()))
-	}
 	// El lote ya quedó CLOSED: si el envío falla, se reintenta con ResubmitBatch.
 	if err := h.submitBatch(ctx, batch); err != nil {
 		log.Error("automatic batch submit failed", slog.String("error", err.Error()))

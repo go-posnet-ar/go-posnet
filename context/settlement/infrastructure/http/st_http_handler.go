@@ -26,6 +26,8 @@ type Handler struct {
 	queryHandler *query.BatchQueryHandler
 	adminHandler *command.AdminHandler
 	pool         pgutil.PgxPool
+	// natsConnected informa el estado de la conexión a NATS; nil = sin verificar.
+	natsConnected func() bool
 }
 
 func NewHandler(
@@ -70,6 +72,12 @@ func (h *Handler) handleReady(w http.ResponseWriter, r *http.Request) {
 	if err := pgutil.HealthCheck(r.Context(), h.pool); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"status": "not ready", "reason": "database unavailable",
+		})
+		return
+	}
+	if h.natsConnected != nil && !h.natsConnected() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "not ready", "reason": "nats unavailable",
 		})
 		return
 	}

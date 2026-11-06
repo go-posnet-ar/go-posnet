@@ -8,13 +8,18 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync"
 
 	"github.com/juantevez/go-posnet/pkg/observability"
 	"google.golang.org/grpc"
 )
 
 // SettlementServer es el servidor gRPC del BC.
-type SettlementServer struct{}
+type SettlementServer struct {
+	mu      sync.Mutex
+	grpc    *grpc.Server
+	stopped bool
+}
 
 func NewSettlementServer() *SettlementServer {
 	return &SettlementServer{}
@@ -31,9 +36,30 @@ func Start(srv *SettlementServer, grpcPort int) error {
 		grpc.UnaryInterceptor(observability.GRPCUnaryServerInterceptor()),
 	)
 
+	srv.mu.Lock()
+	if srv.stopped {
+		srv.mu.Unlock()
+		_ = listener.Close()
+		return nil
+	}
+	srv.grpc = grpcServer
+	srv.mu.Unlock()
+
 	// TODO: registrar servicios gRPC cuando se definan
 	// ej: settlementv1.RegisterSettlementServiceServer(grpcServer, srv)
 
 	slog.Info("Settlement gRPC server listening", slog.Int("port", grpcPort))
 	return grpcServer.Serve(listener)
+}
+
+// Stop detiene el servidor de forma ordenada. Si todavía no arrancó, evita que lo haga.
+func (s *SettlementServer) Stop() {
+	s.mu.Lock()
+	s.stopped = true
+	grpcServer := s.grpc
+	s.mu.Unlock()
+
+	if grpcServer != nil {
+		grpcServer.GracefulStop()
+	}
 }

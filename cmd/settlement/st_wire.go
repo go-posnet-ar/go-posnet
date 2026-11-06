@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,6 +19,7 @@ import (
 	pginfra "github.com/juantevez/go-posnet/context/settlement/infrastructure/postgres"
 	stprocessor "github.com/juantevez/go-posnet/context/settlement/infrastructure/processor"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
+	"github.com/juantevez/go-posnet/pkg/outbox"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 	natsclient "github.com/nats-io/nats.go"
 )
@@ -28,10 +30,15 @@ type app struct {
 	natsConn   *natsclient.Conn
 	subscriber *natsinfra.Subscriber
 	grpcSrv    *grpcserver.SettlementServer
+	grpcPort   int
 	httpSrv    *http.Server
 
 	batchHandler   *command.BatchHandler
 	batchCloseHour int
+
+	outboxRelay *outbox.Relay
+	// relayWG espera al Relay en el apagado, antes de cerrar NATS y Postgres.
+	relayWG sync.WaitGroup
 }
 
 // wire construye el grafo de dependencias completo del BC Settlement.
@@ -88,6 +95,8 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	idempotency := natsutil.NewIdempotencyStore(pool, "settlement")
 	natsPub := natsutil.NewPublisher(js)
 	eventPub := natsinfra.NewEventPublisher(natsPub)
+	outboxStore := outbox.NewStore("settlement")
+	outboxRelay := outbox.NewRelay(pool, js, "settlement", time.Second, 50)
 
 	// SettlementProcessor — adaptador hacia el procesador externo (Visa/MC).
 	// TODO: agregar el adaptador real cuando esté implementado.
@@ -97,6 +106,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	batchHandler := command.NewBatchHandler(
 		batchRepo,
 		eventPub,
+		outboxStore,
 		processor,
 		idempotency,
 		pool,
@@ -107,13 +117,17 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		return nil, fmt.Errorf("init settlement metrics: %w", err)
 	}
 	batchHandler.SetMetrics(settlementMetrics)
+	batchHandler.SetReversalReviews(batchRepo)
 	businessLocation, err := time.LoadLocation(cfg.Settlement.BusinessTimezone)
 	if err != nil {
 		return nil, fmt.Errorf("wire: load business timezone: %w", err)
 	}
 	batchHandler.SetBusinessLocation(businessLocation)
+	if err := command.RegisterBatchAttentionGauge(batchRepo, businessLocation); err != nil {
+		return nil, fmt.Errorf("wire: register batch attention gauge: %w", err)
+	}
 	adminHandler := command.NewAdminHandler(batchRepo, processor)
-	adminHandler.ConfigureSettlement(eventPub, cfg.Settlement.MDRPercent)
+	adminHandler.ConfigureSettlement(pool, batchRepo, eventPub, outboxStore, cfg.Settlement.MDRPercent)
 	queryHandler := query.NewBatchQueryHandler(batchRepo)
 
 	// ── Adaptadores de entrada ─────────────────────────────────────────────────
@@ -128,7 +142,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	if cfg.Settlement.AdminAPIKey == "" {
 		slog.Warn("SETTLEMENT_ADMIN_API_KEY is not configured — admin write operations are disabled")
 	}
-	router := httpinfra.NewRouter(queryHandler, adminHandler, pool, cfg.Settlement.AdminAPIKey)
+	router := httpinfra.NewRouter(queryHandler, adminHandler, pool, cfg.Settlement.AdminAPIKey, natsConn.IsConnected)
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,
@@ -142,10 +156,13 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		natsConn:   natsConn,
 		subscriber: subscriber,
 		grpcSrv:    grpcSrv,
+		grpcPort:   cfg.GRPCPort,
 		httpSrv:    httpSrv,
 
 		batchHandler:   batchHandler,
 		batchCloseHour: cfg.Settlement.BatchCloseHour,
+
+		outboxRelay: outboxRelay,
 	}, nil
 }
 
@@ -171,13 +188,21 @@ func (a *app) start(ctx context.Context) error {
 		slog.String("consumers", "settlement-auth, settlement-reversal, settlement-batch"),
 	)
 
+	// Outbox relay — publica batch-closed y settlement.completed, con reintentos
+	a.relayWG.Add(1)
+	go func() {
+		defer a.relayWG.Done()
+		a.outboxRelay.Run(ctx)
+	}()
+	slog.Info("outbox relay active")
+
 	// gRPC server
 	go func() {
-		if err := grpcserver.Start(a.grpcSrv, 9093); err != nil {
+		if err := grpcserver.Start(a.grpcSrv, a.grpcPort); err != nil {
 			slog.Error("gRPC server stopped", slog.String("error", err.Error()))
 		}
 	}()
-	slog.Info("gRPC server starting", slog.Int("port", 9093))
+	slog.Info("gRPC server starting", slog.Int("port", a.grpcPort))
 
 	// HTTP server
 	go func() {
@@ -249,6 +274,13 @@ func (a *app) close() {
 		defer cancel()
 		_ = a.httpSrv.Shutdown(ctx)
 	}
+
+	if a.grpcSrv != nil {
+		a.grpcSrv.Stop()
+	}
+
+	// El contexto ya se canceló: el Relay termina su ciclo y sale.
+	a.relayWG.Wait()
 
 	if a.natsConn != nil {
 		_ = a.natsConn.Drain()

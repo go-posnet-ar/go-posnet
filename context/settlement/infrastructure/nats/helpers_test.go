@@ -2,6 +2,7 @@ package nats
 
 import (
 	"context"
+	"github.com/jackc/pgx/v5"
 	"testing"
 	"time"
 
@@ -71,6 +72,14 @@ func (f *fakeBatchRepo) Save(_ context.Context, b *aggregate.SettlementBatch) er
 	return f.saveErr
 }
 
+func (f *fakeBatchRepo) SaveTx(_ context.Context, _ pgx.Tx, b *aggregate.SettlementBatch) error {
+	return f.Save(context.Background(), b)
+}
+
+func (f *fakeBatchRepo) MerchantDayBatchesTx(context.Context, pgx.Tx, domain.MerchantID, time.Time) ([]repository.MerchantDayBatch, error) {
+	return nil, nil
+}
+
 func (f *fakeBatchRepo) lastSaved() *aggregate.SettlementBatch {
 	if len(f.savedBatches) == 0 {
 		return nil
@@ -105,12 +114,12 @@ func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, 
 // que es lo que se está testeando en st_nats_publisher_test.go.
 type fakeDomainPublisher struct{}
 
-func (f *fakeDomainPublisher) PublishBatchClosed(context.Context, *aggregate.SettlementBatch) error {
-	return nil
+func (f *fakeDomainPublisher) BuildBatchClosed(context.Context, *aggregate.SettlementBatch) (string, string, []byte, error) {
+	return "subject", "event-id", []byte("{}"), nil
 }
 
-func (f *fakeDomainPublisher) PublishSettlementCompleted(context.Context, string, string, int, int64, int64, string, float64) error {
-	return nil
+func (f *fakeDomainPublisher) BuildSettlementCompleted(context.Context, string, string, int, int64, int64, string, float64) (string, string, []byte, error) {
+	return "subject", "event-id", []byte("{}"), nil
 }
 
 type fakeProcessor struct {

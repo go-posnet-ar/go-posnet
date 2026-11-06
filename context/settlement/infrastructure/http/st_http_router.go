@@ -15,10 +15,12 @@ func NewRouter(
 	adminHandler *command.AdminHandler,
 	pool pgutil.PgxPool,
 	adminAPIKey string,
+	natsConnected func() bool,
 ) http.Handler {
 	mux := http.NewServeMux()
 
 	h := NewHandler(queryHandler, adminHandler, pool)
+	h.natsConnected = natsConnected
 	h.RegisterRoutes(mux)
 
 	mux.Handle("GET /metrics", observability.MetricsHandler())

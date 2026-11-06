@@ -36,23 +36,43 @@ func TestStart_ListenError(t *testing.T) {
 	}
 }
 
-func TestStart_ServesSuccessfully(t *testing.T) {
+func TestStop_EndsServing(t *testing.T) {
 	srv := server.NewSettlementServer()
 
 	errCh := make(chan error, 1)
-	go func() {
-		// Puerto 0: el OS asigna uno libre. Start() no expone el listener ni el
-		// *grpc.Server, así que no hay forma de apagarlo prolijamente desde el
-		// test; el goroutine queda corriendo en background hasta que termine el
-		// binario de test, que libera el socket al salir.
-		errCh <- server.Start(srv, 0)
-	}()
+	go func() { errCh <- server.Start(srv, 0) }()
 
 	select {
 	case err := <-errCh:
 		t.Fatalf("Start() returned early with error = %v, want it to keep serving", err)
 	case <-time.After(200 * time.Millisecond):
-		// No devolvió error en la ventana de espera → bind + Serve() arrancaron
-		// correctamente.
+	}
+
+	srv.Stop()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start() error = %v, want nil after Stop", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start() did not return after Stop")
+	}
+}
+
+func TestStop_BeforeStartPreventsServing(t *testing.T) {
+	srv := server.NewSettlementServer()
+	srv.Stop()
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Start(srv, 0) }()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start() error = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start() kept serving after Stop")
 	}
 }
