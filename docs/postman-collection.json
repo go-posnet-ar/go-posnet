@@ -96,6 +96,10 @@
     {
       "key": "tz_merchant_id",
       "value": ""
+    },
+    {
+      "key": "card_token",
+      "value": ""
     }
   ],
   "item": [
@@ -4215,7 +4219,7 @@
     },
     {
       "name": "🔌 Adquirente — Fallos y reversas",
-      "description": "Requiere ACQUIRER_MOCK_SCENARIOS=true, activado en Docker Compose.",
+      "description": "Requiere el simulador iso-host, activado en Docker Compose. Con ACQUIRER_MODE=mock, también ACQUIRER_MOCK_SCENARIOS=true.",
       "item": [
         {
           "name": "Rechazo del emisor",
@@ -5087,6 +5091,294 @@
               "request": {
                 "method": "GET",
                 "url": "{{base_url_auth}}/transactions/{{transaction_id}}"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Retención de tarjeta: queda en la blocklist",
+          "description": "El siguiente pago con ese token se corta sin llegar al host.",
+          "item": [
+            {
+              "name": "AQ-60 Crear sesión de 770041",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Un token nuevo en cada corrida: la tarjeta queda bloqueada para siempre.",
+                      "var hex = ''; for (var i = 0; i < 64; i++) { hex += Math.floor(Math.random() * 16).toString(16); }",
+                      "pm.collectionVariables.set('card_token', hex);",
+                      "pm.collectionVariables.set('tx_amount', 770041);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-61 Pagar con token",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\",\n  \"card_token\": \"{{card_token}}\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-62 El host ordena retenerla",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = json.state === 'REJECTED';",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test('La sesión termina en REJECTED', function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "  pm.test('Código 41', function () { pm.expect(json.rejection_code).to.eql('41'); });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status"
+              }
+            },
+            {
+              "name": "AQ-63 Crear otra sesión, de monto normal",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('tx_amount', 12345);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-64 Pagar con la misma tarjeta",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\",\n  \"card_token\": \"{{card_token}}\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-65 Se corta por la blocklist",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = json.state === 'REJECTED';",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test('La sesión termina en REJECTED', function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "  pm.test('Código CARD_BLOCKED', function () { pm.expect(json.rejection_code).to.eql('CARD_BLOCKED'); });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status"
+              }
+            }
+          ]
+        },
+        {
+          "name": "Token de tarjeta inválido",
+          "item": [
+            {
+              "name": "AQ-70 Crear sesión",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('tx_amount', 12345);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "AQ-71 Pagar con un token inválido",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 400', function () { pm.response.to.have.status(400); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\",\n  \"card_token\": \"no-es-un-token\"\n}"
+                }
               }
             }
           ]

@@ -112,6 +112,18 @@ services:
     environment:
       MOCKSERVER_SERVER_PORT: 9200
 
+  # Simula el host del emisor por ISO 8583, hasta que exista card-management-service.
+  iso-host:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.iso-host
+      network: host
+    container_name: posnet-iso-host
+    restart: unless-stopped
+    networks: [posnet]
+    environment:
+      ISO_HOST_ADDRESS: ":9101"
+
   authorization:
     build:
       context: ../..
@@ -128,13 +140,17 @@ services:
       HTTP_PORT: "8080"
       GRPC_PORT: "9090"
       OTEL_SERVICE_NAME: posnet-authorization
-      # Solo para desarrollo: el mock responde según el monto, y los fallos se resuelven rápido
-      # para poder probarlos. Ver AUTHORIZATION.md, "Probar los fallos del adquirente".
-      ACQUIRER_MOCK_SCENARIOS: "true"
+      # Solo para desarrollo: habla ISO 8583 con el simulador, que responde según el monto, y los
+      # fallos se resuelven rápido para poder probarlos. Ver AUTHORIZATION.md, "ISO 8583".
+      ACQUIRER_MODE: iso8583
+      ACQUIRER_HOST: iso-host
+      ACQUIRER_PORT: "9101"
       ACQUIRER_TIMEOUT_SECONDS: "3"
       ACQUIRER_STUCK_AFTER: "10s"
       ACQUIRER_RECONCILE_EVERY: "2s"
     depends_on:
+      iso-host:
+        condition: service_started
       postgres:
         condition: service_healthy
       nats:

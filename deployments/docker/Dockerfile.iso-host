@@ -1,0 +1,46 @@
+# =============================================================================
+# Dockerfile — simulador del host ISO 8583
+# Multi-stage build: builder (compilación) + runner (imagen mínima)
+# =============================================================================
+
+# ── Stage 1: Builder ──────────────────────────────────────────────────────────
+FROM golang:1.25-alpine AS builder
+
+# Dependencias de compilación
+RUN apk add --no-cache git ca-certificates tzdata
+
+WORKDIR /app
+
+# Copiar go.mod y go.sum primero para aprovechar el cache de Docker
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copiar el código fuente completo
+COPY . .
+
+# Compilar solo el binario del simulador
+# CGO_ENABLED=0 → binario estático sin dependencias del sistema
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-w -s" \
+    -o /app/bin/iso-host \
+    ./cmd/iso-host-simulator/
+
+# ── Stage 2: Runner ───────────────────────────────────────────────────────────
+FROM alpine:3.19
+
+# Certificados CA del sistema (para TLS hacia adquirente y NATS)
+RUN apk add --no-cache ca-certificates tzdata wget
+
+WORKDIR /app
+
+# Copiar solo el binario compilado
+COPY --from=builder /app/bin/iso-host .
+
+
+# Usuario no-root por seguridad
+RUN addgroup -S posnet && adduser -S posnet -G posnet
+USER posnet
+
+EXPOSE 9101
+
+ENTRYPOINT ["./iso-host"]

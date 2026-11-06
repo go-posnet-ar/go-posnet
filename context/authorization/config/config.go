@@ -52,6 +52,10 @@ type AcquirerConfig struct {
 	TLSCAPath      string
 	TimeoutSeconds int
 
+	// Mode elige el adquirente: mock o iso8583.
+	Mode string
+	// InstitutionID es el DE-32 de los mensajes ISO 8583.
+	InstitutionID string
 	// MaxConcurrent limita las llamadas simultáneas al adquirente.
 	MaxConcurrent int
 	// MockScenarios hace que el mock responda según el monto. Solo para desarrollo.
@@ -63,6 +67,12 @@ type AcquirerConfig struct {
 	// conciliador la tome. Debe superar TimeoutSeconds: si no, revertiría llamadas en curso.
 	StuckAfter time.Duration
 }
+
+// Adquirentes disponibles.
+const (
+	AcquirerModeMock    = "mock"
+	AcquirerModeISO8583 = "iso8583"
+)
 
 // TLSEnabled indica si hay configuración TLS real (no vacío ni "none").
 func (a AcquirerConfig) TLSEnabled() bool {
@@ -109,6 +119,8 @@ func Load() (*Config, error) {
 			TLSKeyPath:     envStr("ACQUIRER_TLS_KEY", ""),
 			TLSCAPath:      envStr("ACQUIRER_TLS_CA", ""),
 			TimeoutSeconds: envInt("ACQUIRER_TIMEOUT_SECONDS", 30),
+			Mode:           envStr("ACQUIRER_MODE", AcquirerModeMock),
+			InstitutionID:  envStr("ACQUIRER_INSTITUTION_ID", "000001"),
 			MaxConcurrent:  envInt("ACQUIRER_MAX_CONCURRENT", 20),
 			MockScenarios:  envStr("ACQUIRER_MOCK_SCENARIOS", "") == "true",
 			ReconcileEvery: envDuration("ACQUIRER_RECONCILE_EVERY", 30*time.Second),
@@ -119,6 +131,16 @@ func Load() (*Config, error) {
 	if timeout := time.Duration(cfg.Acquirer.TimeoutSeconds) * time.Second; cfg.Acquirer.StuckAfter <= timeout {
 		return nil, fmt.Errorf("config: ACQUIRER_STUCK_AFTER %s must be greater than ACQUIRER_TIMEOUT_SECONDS (%s): calls in progress would be reversed",
 			cfg.Acquirer.StuckAfter, timeout)
+	}
+	switch cfg.Acquirer.Mode {
+	case AcquirerModeMock:
+	case AcquirerModeISO8583:
+		// Hoy los datos de la tarjeta los resuelve un stub con tarjetas de prueba.
+		if cfg.OTEL.Environment == "production" {
+			return nil, fmt.Errorf("config: ACQUIRER_MODE=%s uses test cards and cannot be used with ENVIRONMENT=production", AcquirerModeISO8583)
+		}
+	default:
+		return nil, fmt.Errorf("config: ACQUIRER_MODE %q must be %q or %q", cfg.Acquirer.Mode, AcquirerModeMock, AcquirerModeISO8583)
 	}
 	if cfg.Acquirer.TimeoutSeconds < 1 {
 		return nil, fmt.Errorf("config: ACQUIRER_TIMEOUT_SECONDS %d must be at least 1", cfg.Acquirer.TimeoutSeconds)

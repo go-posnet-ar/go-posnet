@@ -258,7 +258,7 @@ frontend (5173) está fijo en el código.
 ### Simular pago
 
 ```json
-{ "card_last4": "4242", "card_network": "VISA" }
+{ "card_last4": "4242", "card_network": "VISA", "card_token": "<64 caracteres hex>" }
 ```
 
 Ambos campos son opcionales; sus valores por defecto son `0000` y `VISA`. También se acepta
@@ -339,7 +339,7 @@ Payload de `transaction.received`:
 | `amount_cents`, `currency` | Centavos e ISO 4217 |
 | `stan`, `entry_mode` | `entry_mode` se deriva del canal |
 | `card_last4`, `card_network` | Vienen del request de pago |
-| `card_token` | HMAC del PAN para la blocklist. Hoy siempre está vacío |
+| `card_token` | Identifica la tarjeta, sin ser el PAN: lo usan la blocklist y Authorization para pedir sus datos. Viene del request de pago; vacío si no llegó. Con un formato inválido, `/pay` responde `400` |
 | `emv_data_b64`, `iso8583_raw` | Hoy siempre están vacíos |
 | `received_at` | RFC3339 UTC |
 
@@ -556,7 +556,6 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | `MockNotifier` en lugar de WebSocket | Ningún terminal recibe el resultado | `tg_wire.go` |
 | La orden de retener la tarjeta no llega al terminal | Solo queda en los logs; tampoco aparece en las respuestas HTTP | `mock_notifier.go`, `tg_qr_handler.go` |
 | `SendReceipt` responde `delivered=true` sin entregar | Notification puede registrar como entregado un comprobante que no se envió | `tg_grpc_server.go` |
-| `card_token` no se recibe en `/pay` | La blocklist no puede detectar tarjetas bloqueadas en este flujo | `tg_qr_handler.go` |
 | `GetTerminalStatus` no mide la conexión | Un terminal conectado sin sesión figura como `DISCONNECTED` | `tg_grpc_server.go` |
 | Sin parsing de ISO 8583 | `iso8583_raw` y `emv_data_b64` viajan vacíos | `tg_qr_handler.go` |
 | Sin notificación ni estado al expirar | `NotifySessionExpired` no se invoca y `EXPIRED` no se persiste | `tg_wire.go` |

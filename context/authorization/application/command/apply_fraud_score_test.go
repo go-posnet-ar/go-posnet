@@ -3,6 +3,7 @@ package command_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -501,5 +502,39 @@ func TestApplyFraudScore_LateAcquirerResponseIsNotPublished(t *testing.T) {
 	}
 	if publisher.approvedCalls != 0 {
 		t.Errorf("PublishApproved calls = %d, want 0", publisher.approvedCalls)
+	}
+}
+
+// Si la autorización seguro no salió, se rechaza sin pasar por INDETERMINATE ni revertir.
+func TestApplyFraudScore_NotSentIsRejectedWithoutReversal(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code string
+	}{
+		{"sin conexión", service.ErrNotSent, valueobject.ISO_ISSUER_UNAVAILABLE},
+		{"tarjeta desconocida", fmt.Errorf("%w: %w", service.ErrNotSent, service.ErrCardDataNotFound), valueobject.ISO_CARD_NOT_FOUND},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newMockPool(t)
+			expectClaimed(pool, 1)
+
+			repo := &fakeRepo{findResult: newFraudCheckingTransaction(t)}
+			publisher := &fakePublisher{}
+			acquirer := &fakeAcquirer{authorizeErr: tc.err}
+			h := command.NewAuthorizationHandler(repo, acquirer, publisher, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool)
+
+			if err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID())); err != nil {
+				t.Fatalf("ApplyFraudScore() error = %v", err)
+			}
+			tx := repo.savedTxs[0]
+			if tx.State() != valueobject.StateRejected || tx.RejectionCode().Code() != tc.code {
+				t.Errorf("state = %s, rejection = %v, want REJECTED %s", tx.State(), tx.RejectionCode(), tc.code)
+			}
+			if publisher.rejectedCalls != 1 || acquirer.reverseCalls != 0 {
+				t.Errorf("rejected = %d, reverse = %d", publisher.rejectedCalls, acquirer.reverseCalls)
+			}
+		})
 	}
 }

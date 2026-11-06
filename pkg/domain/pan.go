@@ -41,7 +41,8 @@ var reFourDigits = regexp.MustCompile(`^\d{4}$`)
 
 // PAN representa el número de tarjeta de forma segura.
 // INVARIANTE CRÍTICA: solo almacena los últimos 4 dígitos.
-// El PAN completo NUNCA llega al backend Go — viaja cifrado en el payload EMV.
+// El PAN completo no se guarda ni viaja por eventos: solo el adaptador del adquirente lo tiene en
+// memoria, mientras arma un mensaje (ver service.CardDataProvider en Authorization).
 type PAN struct {
 	last4   string
 	network CardNetwork

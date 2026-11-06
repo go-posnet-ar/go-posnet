@@ -127,8 +127,14 @@ func (h *QRHandler) handleSimulatePay(w http.ResponseWriter, r *http.Request) {
 		CardLast4   string `json:"card_last4"`
 		CardNetwork string `json:"card_network"`
 		EntryMode   string `json:"entry_mode"`
+		CardToken   string `json:"card_token"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
+	// Se valida acá porque ya no hay a quién responderle: Authorization descartaría el evento.
+	if _, err := domain.ParseOptionalCardToken(req.CardToken); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("INVALID_CARD_TOKEN", "card_token is not valid"))
+		return
+	}
 	if req.CardLast4 == "" {
 		req.CardLast4 = "0000"
 	}
@@ -150,6 +156,7 @@ func (h *QRHandler) handleSimulatePay(w http.ResponseWriter, r *http.Request) {
 		EMVDataBase64: "",
 		CardLast4:     req.CardLast4,
 		CardNetwork:   req.CardNetwork,
+		CardToken:     req.CardToken,
 	}
 
 	if err := h.sessionService.ProcessPayment(ctx, cmd); err != nil {
