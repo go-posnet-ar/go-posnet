@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -12,8 +14,11 @@ import (
 	"github.com/juantevez/go-posnet/context/authorization/application/command"
 	"github.com/juantevez/go-posnet/context/authorization/application/query"
 	"github.com/juantevez/go-posnet/context/authorization/config"
+	"github.com/juantevez/go-posnet/context/authorization/domain/service"
+	"github.com/juantevez/go-posnet/context/authorization/infrastructure/carddata"
 	grpcserver "github.com/juantevez/go-posnet/context/authorization/infrastructure/grpc/server"
 	httpinfra "github.com/juantevez/go-posnet/context/authorization/infrastructure/http"
+	isoclient "github.com/juantevez/go-posnet/context/authorization/infrastructure/iso8583"
 	natsinfra "github.com/juantevez/go-posnet/context/authorization/infrastructure/nats"
 	pginfra "github.com/juantevez/go-posnet/context/authorization/infrastructure/postgres"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
@@ -30,6 +35,9 @@ type app struct {
 	httpSrv    *http.Server
 
 	authHandler    *command.AuthorizationHandler
+	acquirerClient *isoclient.Client // nil con el mock
+	stopAcquirer   context.CancelFunc
+	acquirerWG     sync.WaitGroup
 	reconcileEvery time.Duration
 	stuckAfter     time.Duration
 	callTimeout    time.Duration
@@ -99,10 +107,13 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	eventPub := natsinfra.NewEventPublisher(natsPub)
 
 	// ── Aplicación ─────────────────────────────────────────────────────────────
-	acquirerGW := pginfra.NewMockAcquirerGateway(cfg.Acquirer.MockScenarios)
+	acquirerGW, acquirerClient, err := newAcquirer(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("wire: %w", err)
+	}
 	authHandler := command.NewAuthorizationHandler(
 		txRepo,
-		acquirerGW, // acquirerGW — reemplazar con instancia real cuando esté implementado
+		acquirerGW,
 		eventPub,
 		idempotency,
 		pool,
@@ -144,14 +155,46 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		httpSrv:    httpSrv,
 
 		authHandler:    authHandler,
+		acquirerClient: acquirerClient,
 		reconcileEvery: cfg.Acquirer.ReconcileEvery,
 		stuckAfter:     cfg.Acquirer.StuckAfter,
 		callTimeout:    acquirerTimeout,
 	}, nil
 }
 
+// newAcquirer elige el adquirente. Devuelve el cliente ISO 8583 aparte, porque hay que iniciarlo.
+func newAcquirer(cfg *config.Config) (service.AcquirerGateway, *isoclient.Client, error) {
+	if cfg.Acquirer.Mode != config.AcquirerModeISO8583 {
+		return pginfra.NewMockAcquirerGateway(cfg.Acquirer.MockScenarios), nil, nil
+	}
+	slog.Warn("card data comes from a stub with test cards — replace it with card-management-service")
+	client := isoclient.NewClient(isoclient.Config{
+		Address:    net.JoinHostPort(cfg.Acquirer.Host, strconv.Itoa(cfg.Acquirer.Port)),
+		AcquirerID: cfg.Acquirer.InstitutionID,
+		EchoEvery:  acquirerEchoEvery,
+	}, carddata.NewStub())
+	if err := client.RegisterConnectedGauge(); err != nil {
+		return nil, nil, fmt.Errorf("register acquirer gauge: %w", err)
+	}
+	return client, client, nil
+}
+
+// acquirerEchoEvery es cada cuánto se prueba la conexión con el host.
+const acquirerEchoEvery = 30 * time.Second
+
 // start arranca todos los servidores en goroutines independientes.
 func (a *app) start(ctx context.Context) error {
+	// Antes de consumir eventos, para que las primeras ventas ya tengan conexión.
+	if a.acquirerClient != nil {
+		acquirerCtx, stop := context.WithCancel(ctx)
+		a.stopAcquirer = stop
+		a.acquirerWG.Add(1)
+		go func() {
+			defer a.acquirerWG.Done()
+			a.acquirerClient.Run(acquirerCtx)
+		}()
+	}
+
 	if err := a.subscriber.Subscribe(); err != nil {
 		return fmt.Errorf("start: subscribe NATS consumers: %w", err)
 	}
@@ -243,6 +286,10 @@ func (a *app) close() {
 		ctx, cancel := context.WithTimeout(context.Background(), a.callTimeout+5*time.Second)
 		defer cancel()
 		a.authHandler.WaitAcquirerCalls(ctx)
+	}
+	if a.stopAcquirer != nil {
+		a.stopAcquirer()
+		a.acquirerWG.Wait()
 	}
 
 	if a.pool != nil {

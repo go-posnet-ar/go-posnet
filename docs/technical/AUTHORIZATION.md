@@ -10,10 +10,10 @@ Authorization orquesta la Saga de autorización de cada pago: recibe la transacc
 [Terminal Gateway](TERMINAL-GATEWAY.md), consulta la blocklist, pide la evaluación de fraude, llama al
 adquirente y publica el resultado al resto del sistema.
 
-La Saga funciona de punta a punta, pero **el adquirente es un mock que aprueba todo**. El único
-rechazo posible hoy es el de fraude, y el flujo QR tampoco lo alcanza con los pesos por defecto (ver
-[Fraud Detection](FRAUD-DETECTION.md#45-alcance-real-de-reject)). En la práctica, cuando la Saga de ese
-flujo se completa, siempre termina aprobada.
+La Saga funciona de punta a punta y **puede hablar [ISO 8583](#iso-8583) por TCP con un host, hoy un simulador**. Los datos
+de la tarjeta los resuelve un stub con tarjetas de prueba, hasta que exista `card-management-service`. El rechazo por
+fraude sigue sin alcanzarse en el flujo QR con los pesos por defecto (ver
+[Fraud Detection](FRAUD-DETECTION.md#45-alcance-real-de-reject)).
 
 | Capacidad | Estado | Detalle |
 |---|---|---|
@@ -23,8 +23,9 @@ flujo se completa, siempre termina aprobada.
 | Reversas | Implementado | Contra el mock |
 | Consulta de estado | Implementado | HTTP y gRPC, sin autenticación |
 | Métricas, trazas, alertas y SLO | Implementado | Ver [§10](#10-observabilidad) |
-| Adquirente real (ISO 8583 sobre TCP/TLS) | **Mock** | `MockAcquirerGateway` aprueba, salvo con [escenarios de prueba](#probar-los-fallos-del-adquirente) |
-| Blocklist de tarjetas | **Parcial** | El código está, pero ningún flujo real la activa |
+| Adquirente por ISO 8583 sobre TCP | Implementado | `0100`, `0400` y `0800`, contra un [simulador](#iso-8583). Sin TLS |
+| Datos de la tarjeta | **Stub** | Tarjetas de prueba. No se puede usar en producción |
+| Blocklist de tarjetas | Implementado | Con `card_token` en `/pay` y un `41` del host |
 | Bypass por timeout de fraude | **Pendiente** | `BypassFraudCheck` no se invoca |
 | Conciliación de `INDETERMINATE` | **Parcial** | Las revierte y rechaza. No consulta el resultado al host |
 | `ListTerminalTransactions` (gRPC) | **Pendiente** | Devuelve `Unimplemented` |
@@ -93,7 +94,7 @@ Toda la Saga está en
 | `fraudDecision` | Score (0–100), decisión y reglas activadas |
 | `authCode` | 6 caracteres alfanuméricos en mayúscula, si se aprobó |
 | `rejectionCode` | Código y fuente, si se rechazó |
-| `emvDataBase64`, `iso8583Raw` | Datos opacos para el adquirente; hoy llegan vacíos |
+| `emvDataBase64`, `iso8583Raw` | Datos opacos del terminal; hoy llegan vacíos. El mensaje al host no se guarda acá: lleva el PAN |
 | `receivedAt`, `authorizedAt`, `rejectedAt` | Marcas de tiempo |
 
 Redes aceptadas: `VISA`, `MASTERCARD`, `AMEX`, `CABAL`, `NARANJA` y `UNKNOWN`.
@@ -236,6 +237,39 @@ No ocupan el handler de NATS. La transacción ya está guardada, así que el men
 en un worker, con hasta `ACQUIRER_MAX_CONCURRENT` simultáneas y un timeout de `ACQUIRER_TIMEOUT_SECONDS` cada una, que no
 depende del `AckWait` de NATS. Un adquirente lento no frena la cola hasta que se ocupan todos los workers. Ahí, el consumo
 espera, en lugar de acumular llamadas sin límite.
+
+### ISO 8583
+
+Con `ACQUIRER_MODE=iso8583`, activado en Docker Compose, `iso8583.Client` implementa `AcquirerGateway`, con ISO 8583:1987 en
+ASCII y un largo de 2 bytes delante de cada mensaje. Usa una sola conexión TCP, multiplexada: las respuestas se
+correlacionan por tipo de mensaje y RRN (DE-37). Reconecta sola, con una espera creciente de hasta 30 s, y prueba la
+conexión con un `0800` cada 30 s.
+
+| Mensaje | Uso | Campos |
+|---|---|---|
+| `0100`/`0110` | Autorización | DE-2, 3, 4, 7, 11, 12, 13, 14, 22, 25, 32, 37, 41, 42, 49 y 55 si hay datos EMV. Responde DE-38 y 39 |
+| `0400`/`0410` | Reversa | Los mismos, más DE-38 si se aprobó y DE-90 con los datos originales. DE-39 `00` o `25` (el host no la conoce) son un éxito |
+| `0800`/`0810` | Eco | DE-7, 11 y 70 (`301`) |
+
+El RRN y DE-7 se derivan de la transacción, así que la reversa los repite sin guardar nada. DE-41 y DE-42 son un hash del
+terminal y del comercio, porque sus UUID no entran en esos campos. **Un host real va a pedir su propio formato:** el dialecto
+se ajusta en `messages.go`.
+
+**El PAN solo existe en memoria,** dentro del adaptador y mientras arma un mensaje. No se guarda, no viaja por eventos, y
+`CardData` lo oculta en los logs. `CardDataProvider` lo resuelve a partir de `card_token`, el mismo token de la blocklist,
+que llega en `POST /api/sessions/{id}/pay`. Hoy lo implementa un stub, que usa una tarjeta de prueba fija si el pago llega
+sin token. **Para conectar `card-management-service`, alcanza con otra implementación de ese puerto.** Tendrá que rechazar
+los pagos sin token, y conviene comparar los últimos 4 dígitos con los de la transacción.
+
+**Qué pasa según el error:**
+
+| Situación | ¿Salió el mensaje? | Resultado |
+|---|---|---|
+| Sin conexión o sin escribir nada | No | `REJECTED` con `91`, reintentable. Sin reversa |
+| Tarjeta desconocida para el proveedor | No | `REJECTED` con `14` |
+| Otro error del proveedor | No | `REJECTED` con `91`. Sin reversa |
+| Vence el timeout, o se corta esperando la respuesta | No se sabe | `INDETERMINATE`, y el conciliador revierte |
+| Respuesta después del timeout | Sí | Se ignora con un `WARN`, y vale lo que resolvió el conciliador |
 
 ### 5.6 Conciliación
 
@@ -425,6 +459,7 @@ conciliador. El servidor gRPC no se detiene de forma ordenada.
 | `posnet_acquirer_request_duration_seconds` | Histogram | `result` |
 | `posnet_saga_duration_seconds` | Histogram | `outcome` |
 | `posnet_authorization_unresolved_transactions` | Gauge | `state`: `INDETERMINATE`, `PROCESSING` trabadas o `REVERSAL_PENDING`. Consulta la base en cada scrape |
+| `posnet_acquirer_connected` | Gauge | Con `iso8583`: 1 conectado, 0 caído |
 | `posnet_reversals_ignored_total` | Counter | `state`: pedidos de reversa sin nada que revertir |
 
 `posnet_saga_duration_seconds` solo registra sagas que terminan en aprobación o rechazo: las trabadas no aparecen.
@@ -446,6 +481,7 @@ Reglas en [`deployments/docker/prometheus/rules/`](../../deployments/docker/prom
 |---|---|---|
 | `SagaCompletaDetenida` | Crítica | Entran transacciones y ninguna se aprueba durante 2 min |
 | `ErrorRateAlta` | Crítica | Rechazos por encima del 10 % de las recibidas durante 5 min |
+| `AdquirenteDesconectado` | Warning | Sin conexión con el host durante 2 min: las ventas se rechazan con `91` |
 | `TransaccionesSinResolver` | Warning | Transacciones sin resultado conocido o reversas sin completar durante 5 min: las reversas están fallando |
 | `LatenciaSagaAlta` | Warning | p95 de la Saga por encima de 3 s durante 5 min |
 | `DuplicadosNATSAltos` | Warning | Duplicados por encima de 0,05/s durante 5 min |
@@ -481,16 +517,17 @@ métrica cuenta las publicaciones fallidas.
 | `GRPC_PORT` | `9090` | **No**: el puerto está fijo en 9090 |
 | `ACQUIRER_RECONCILE_EVERY` | `30s` | Sí; cada cuánto corre el conciliador, y `0` lo desactiva. Docker Compose usa `2s`. Si es negativo, el servicio no arranca |
 | `ACQUIRER_STUCK_AFTER` | `2m` | Sí; Docker Compose usa `10s`. Cuánto puede seguir una transacción en `PROCESSING`. Si no supera `ACQUIRER_TIMEOUT_SECONDS`, el servicio no arranca: revertiría llamadas en curso |
-| `ACQUIRER_HOST`, `ACQUIRER_PORT` | `localhost`, `9100` | **No**: se usa el mock |
+| `ACQUIRER_MODE` | `mock` | Sí; `mock` o `iso8583`. Docker Compose usa `iso8583`. Con otro valor, o con `iso8583` y `ENVIRONMENT=production`, el servicio no arranca |
+| `ACQUIRER_HOST`, `ACQUIRER_PORT` | `localhost`, `9100` | Con `iso8583`. Docker Compose apunta a `iso-host:9101` |
+| `ACQUIRER_INSTITUTION_ID` | `000001` | Con `iso8583`; es el DE-32 |
 | `ACQUIRER_TIMEOUT_SECONDS` | `30` | Sí; timeout de cada llamada al adquirente. Docker Compose usa `3` |
 | `ACQUIRER_MAX_CONCURRENT` | `20` | Sí; llamadas simultáneas al adquirente. Si es menor que 1, el servicio no arranca |
-| `ACQUIRER_MOCK_SCENARIOS` | `false` | Sí; el mock responde [según el monto](#probar-los-fallos-del-adquirente). Docker Compose lo activa. Con `ENVIRONMENT=production`, el servicio no arranca |
-| `ACQUIRER_TLS_CERT`, `ACQUIRER_TLS_KEY`, `ACQUIRER_TLS_CA` | Vacías | **No**: se usa el mock |
+| `ACQUIRER_MOCK_SCENARIOS` | `false` | Solo con `ACQUIRER_MODE=mock`; el mock responde [según el monto](#probar-los-fallos-del-adquirente). Con `ENVIRONMENT=production`, el servicio no arranca |
+| `ACQUIRER_TLS_CERT`, `ACQUIRER_TLS_KEY`, `ACQUIRER_TLS_CA` | Vacías | **No**: el cliente no usa TLS |
 | `MIGRATIONS_DIR` | `migrations/authorization` | **No**: `Migrate` no hace nada, y esa carpeta no existe |
 
-La variable del README `ACQUIRER_TIMEOUT` no existe. `.env.docker` apunta al servicio `acquirer-mock`
-de Compose, pero Authorization no se conecta con él: usa `MockAcquirerGateway`, dentro del propio
-proceso.
+La variable del README `ACQUIRER_TIMEOUT` no existe. El servicio `acquirer-mock` de Compose no se usa: el host de desarrollo
+es `iso-host`, y `MockAcquirerGateway` corre dentro del proceso.
 
 ### Levantar el servicio
 
@@ -521,16 +558,19 @@ curl -s localhost:8080/transactions/$ID | jq
 
 ### Probar los fallos del adquirente
 
-Con `ACQUIRER_MOCK_SCENARIOS=true`, activado en Docker Compose, estos montos no se aprueban. Con cualquier otro, el mock
-aprueba. La colección de Postman los usa en la carpeta "Adquirente".
+El simulador `iso-host` responde según el monto. Con `ACQUIRER_MODE=mock` y `ACQUIRER_MOCK_SCENARIOS=true`, el mock hace lo
+mismo sin conexión. Con cualquier otro monto, aprueban. La colección de Postman los usa en la carpeta "Adquirente".
 
-| `amount_cents` | El mock | Resultado |
+| `amount_cents` | El host | Resultado |
 |---|---|---|
 | `770051` | Responde `51` | `REJECTED`, de origen `ACQUIRER` |
-| `770041` | Responde `41` | `REJECTED`, y ordena retener la tarjeta |
-| `770091` | Devuelve un error | `INDETERMINATE`, y el conciliador la rechaza con `TIMEOUT` |
-| `770098` | No responde hasta el timeout | Igual que el anterior, unos segundos después |
-| `770092` | Aprueba, y falla las dos primeras reversas | `APPROVED`, y `REVERSED` cuando el conciliador reintenta |
+| `770041` | Responde `41` | `REJECTED`, ordena retener la tarjeta y, si llegó `card_token`, la bloquea |
+| `770091` | Cierra la conexión | `INDETERMINATE`, y el conciliador la rechaza con `TIMEOUT` |
+| `770098` | No responde | Igual que el anterior, unos segundos después |
+| `770092` | Aprueba, y responde `96` a las dos primeras reversas | `APPROVED`, y `REVERSED` cuando el conciliador reintenta |
+
+El simulador solo acepta tarjetas de prueba, y responde `14` a cualquier otra: una tarjeta real no pasa por acá. También
+responde `54` a una vencida. Para que el host esté caído: `docker compose stop iso-host`.
 
 ### Tests
 
@@ -554,7 +594,7 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 ### Resolver antes de conectar un adquirente real
 
-Sin un adquirente real, estas fallas no ocurren: el mock solo falla con [los montos de prueba](#probar-los-fallos-del-adquirente).
+Con el simulador, estas fallas solo ocurren con [los montos de prueba](#probar-los-fallos-del-adquirente).
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
@@ -580,9 +620,12 @@ Sin un adquirente real, estas fallas no ocurren: el mock solo falla con [los mon
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| Ningún flujo real activa la blocklist | Terminal Gateway siempre envía `card_token` vacío, y el mock nunca devuelve `04`, `41` ni `43`. Está probada solo con tests | `tg_qr_handler.go`, `mock_acquirer.go` |
+| Solo tarjetas propias | El PAN lo resolverá `card-management-service`, que solo conoce las tarjetas del emisor propio. Una tarjeta de otro banco se rechaza con `14`. Procesarlas requiere otra implementación de `CardDataProvider` | `CardDataProvider` |
+| Sin TLS hacia el host | El mensaje lleva el PAN en claro por TCP. Solo se puede usar con tarjetas de prueba | `iso8583.Client` |
+| Dialecto propio | Los campos siguen ISO 8583:1987, pero un host real va a pedir los suyos, además de certificación | `messages.go` |
+| El stub no usa `card_token` para nada real | Devuelve una tarjeta de prueba: no valida que el token exista ni que coincidan los últimos 4 dígitos | `carddata.Stub` |
 | Sin caso de uso para desbloquear | Un bloqueo es permanente, salvo que se borre la fila a mano | `BlockedCardRepository` |
-| `iso8583_raw` se guarda tal como llega | Hoy llega vacío, pero un mensaje ISO 8583 real suele incluir el PAN, y la invariante del sistema es que no llegue al backend. Definir qué se guarda antes de procesar mensajes reales | `TransactionRepo.Save` |
+| `iso8583_raw` se guarda tal como llega | El mensaje al host no se guarda ahí, pero si un terminal lo enviara con el PAN, quedaría en la base. Definir qué se guarda antes de recibir mensajes de terminales | `TransactionRepo.Save` |
 
 ### Operación y datos
 

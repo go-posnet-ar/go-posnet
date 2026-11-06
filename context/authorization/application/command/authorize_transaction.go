@@ -4,6 +4,7 @@ package command
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -355,6 +356,12 @@ func (h *AuthorizationHandler) callAcquirer(
 	callCtx, cancel := h.withAcquirerTimeout(ctx)
 	defer cancel()
 	response, err := h.acquirer.Authorize(callCtx, tx)
+	if errors.Is(err, service.ErrNotSent) {
+		// Seguro no salió: no hay nada que revertir, y se responde como un rechazo.
+		h.metrics.RecordAcquirerError(ctx)
+		log.Warn("authorization not sent to the acquirer — rejecting", slog.String("error", err.Error()))
+		response, err = notSentResponse(err), nil
+	}
 	if err != nil {
 		h.metrics.RecordAcquirerDuration(ctx, time.Since(acquirerStart), "error")
 		h.metrics.RecordAcquirerError(ctx)
@@ -436,6 +443,16 @@ func (h *AuthorizationHandler) callAcquirer(
 	}
 
 	return nil
+}
+
+// notSentResponse traduce un envío imposible a un código ISO 8583: tarjeta desconocida, o un
+// emisor al que no se puede llegar, que se puede reintentar.
+func notSentResponse(err error) service.AcquirerResponse {
+	code := valueobject.ISO_ISSUER_UNAVAILABLE
+	if errors.Is(err, service.ErrCardDataNotFound) {
+		code = valueobject.ISO_CARD_NOT_FOUND
+	}
+	return service.AcquirerResponse{ResponseCode: code, RespondedAt: time.Now().UTC()}
 }
 
 // isCardBlocked consulta la blocklist. Con la blocklist deshabilitada o sin

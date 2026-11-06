@@ -2,6 +2,7 @@
 package service
 
 import (
+	"errors"
 	"context"
 	"time"
 
@@ -15,6 +16,9 @@ import (
 //
 // Esta interface vive en el dominio porque el dominio la necesita,
 // pero su implementación está en infraestructura.
+//
+// ErrNotSent distingue un error en el que seguro el mensaje no salió, y no hay nada que revertir.
+// Cualquier otro error es ambiguo: la transacción pasa a INDETERMINATE y se revierte.
 type AcquirerGateway interface {
 	// Authorize envía el mensaje de autorización al adquirente y espera la respuesta.
 	// El timeout es responsabilidad del implementador (típicamente 30s).
@@ -26,6 +30,9 @@ type AcquirerGateway interface {
 	// debe dar éxito si el host no conoce la operación o si ya estaba revertida.
 	Reverse(ctx context.Context, tx *aggregate.Transaction) error
 }
+
+// ErrNotSent indica que la autorización seguro no llegó al host.
+var ErrNotSent = errors.New("acquirer: request was not sent")
 
 // AcquirerResponse encapsula la respuesta del host adquirente.
 type AcquirerResponse struct {

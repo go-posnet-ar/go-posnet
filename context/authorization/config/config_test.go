@@ -365,3 +365,26 @@ func TestLoad_AcquirerCallsConfig(t *testing.T) {
 		t.Errorf("Load() = %+v, %v", cfg, err)
 	}
 }
+
+func TestLoad_AcquirerMode(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "postgres://x")
+	t.Setenv("NATS_URL", "nats://x")
+
+	cfg, err := Load()
+	if err != nil || cfg.Acquirer.Mode != AcquirerModeMock {
+		t.Fatalf("default = %+v, %v", cfg, err)
+	}
+	t.Setenv("ACQUIRER_MODE", "otro")
+	if _, err := Load(); err == nil {
+		t.Error("Load() error = nil with an unknown mode")
+	}
+	t.Setenv("ACQUIRER_MODE", AcquirerModeISO8583)
+	if cfg, err := Load(); err != nil || cfg.Acquirer.Mode != AcquirerModeISO8583 {
+		t.Errorf("iso8583 = %+v, %v", cfg, err)
+	}
+	// Usa tarjetas de prueba: en producción, nunca.
+	t.Setenv("ENVIRONMENT", "production")
+	if _, err := Load(); err == nil {
+		t.Error("Load() error = nil with test cards in production")
+	}
+}

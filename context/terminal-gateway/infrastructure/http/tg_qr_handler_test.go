@@ -326,3 +326,39 @@ func TestGetLocalIP_ReturnsNonEmptyWithoutOverride(t *testing.T) {
 		t.Error("getLocalIP() = empty, want a non-empty IP or \"localhost\" fallback")
 	}
 }
+
+func TestHandleSimulatePay_CardToken(t *testing.T) {
+	txID := domain.NewTransactionID().String()
+	token := strings.Repeat("a", 64)
+	cases := []struct {
+		name      string
+		body      string
+		want      int
+		wantToken string
+	}{
+		{"con token", `{"card_token":"` + token + `"}`, http.StatusAccepted, token},
+		{"sin token", `{}`, http.StatusAccepted, ""},
+		{"token inválido", `{"card_token":"corto"}`, http.StatusBadRequest, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &fakeSessionService{}
+			mux := newQRTestMux(newTestQRHandler(svc, &fakeSessionRepo{}))
+
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/sessions/"+txID+"/pay", strings.NewReader(tc.body)))
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d, body = %s", rec.Code, tc.want, rec.Body)
+			}
+			if tc.want != http.StatusAccepted {
+				if len(svc.processPaymentCalls) != 0 {
+					t.Error("an invalid token should not start the payment")
+				}
+				return
+			}
+			if len(svc.processPaymentCalls) != 1 || svc.processPaymentCalls[0].CardToken != tc.wantToken {
+				t.Errorf("calls = %+v, want token %q", svc.processPaymentCalls, tc.wantToken)
+			}
+		})
+	}
+}

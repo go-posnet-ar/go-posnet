@@ -117,6 +117,16 @@ groups:
           summary: "Envíos al procesador con resultado {{ $labels.result }}"
           description: "unavailable: sin procesador configurado. error: el procesador falló. Los lotes quedan en CLOSED hasta un resubmit (batch-close-failure.md, Escenario C)."
 
+      # Sin conexión, las ventas se rechazan con 91 y las reversas quedan pendientes.
+      - alert: AdquirenteDesconectado
+        expr: max(posnet_acquirer_connected) == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sin conexión con el host adquirente"
+          description: "Las ventas se rechazan con 91 y las reversas quedan pendientes hasta que vuelva. El servicio reconecta solo. Revisar el host y los logs 'acquirer host unreachable'."
+
       # El conciliador las resuelve en menos de un minuto: si siguen, las reversas están fallando.
       # Investigar: docs/runbooks/incident-response.md, "Transacciones trabadas".
       - alert: TransaccionesSinResolver
