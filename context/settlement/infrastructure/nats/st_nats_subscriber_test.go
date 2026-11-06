@@ -18,6 +18,7 @@ import (
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
 	"github.com/juantevez/go-posnet/pkg/events"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
+	"github.com/juantevez/go-posnet/pkg/outbox"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 )
 
@@ -53,7 +54,7 @@ func (l *logRecorder) last() slog.Record {
 // ─── builders ────────────────────────────────────────────────────────────────
 
 func newTestBatchHandler(pool pgutil.PgxPool, repo *fakeBatchRepo, publisher *fakeDomainPublisher, processor *fakeProcessor) *command.BatchHandler {
-	return command.NewBatchHandler(repo, publisher, processor, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool, 2.5)
+	return command.NewBatchHandler(repo, publisher, outbox.NewStore(idempotencySchema), processor, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool, 2.5)
 }
 
 func newEnvelopeMsg(t *testing.T, subject, aggregateID string, payload any) *natsclient.Msg {
@@ -348,7 +349,7 @@ func TestHandleBatchCloseRequested_NoOpenBatch(t *testing.T) {
 
 func TestHandleBatchCloseRequested_Success(t *testing.T) {
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 
 	batch := newClosableBatch(t) // 1 compra de 1000
 	repo := &fakeBatchRepo{findOpenResult: batch}

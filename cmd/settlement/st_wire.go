@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,6 +19,7 @@ import (
 	pginfra "github.com/juantevez/go-posnet/context/settlement/infrastructure/postgres"
 	stprocessor "github.com/juantevez/go-posnet/context/settlement/infrastructure/processor"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
+	"github.com/juantevez/go-posnet/pkg/outbox"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 	natsclient "github.com/nats-io/nats.go"
 )
@@ -33,6 +35,10 @@ type app struct {
 
 	batchHandler   *command.BatchHandler
 	batchCloseHour int
+
+	outboxRelay *outbox.Relay
+	// relayWG espera al Relay en el apagado, antes de cerrar NATS y Postgres.
+	relayWG sync.WaitGroup
 }
 
 // wire construye el grafo de dependencias completo del BC Settlement.
@@ -89,6 +95,8 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	idempotency := natsutil.NewIdempotencyStore(pool, "settlement")
 	natsPub := natsutil.NewPublisher(js)
 	eventPub := natsinfra.NewEventPublisher(natsPub)
+	outboxStore := outbox.NewStore("settlement")
+	outboxRelay := outbox.NewRelay(pool, js, "settlement", time.Second, 50)
 
 	// SettlementProcessor — adaptador hacia el procesador externo (Visa/MC).
 	// TODO: agregar el adaptador real cuando esté implementado.
@@ -98,6 +106,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	batchHandler := command.NewBatchHandler(
 		batchRepo,
 		eventPub,
+		outboxStore,
 		processor,
 		idempotency,
 		pool,
@@ -117,7 +126,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		return nil, fmt.Errorf("wire: register batch attention gauge: %w", err)
 	}
 	adminHandler := command.NewAdminHandler(batchRepo, processor)
-	adminHandler.ConfigureSettlement(eventPub, cfg.Settlement.MDRPercent)
+	adminHandler.ConfigureSettlement(pool, eventPub, outboxStore, cfg.Settlement.MDRPercent)
 	queryHandler := query.NewBatchQueryHandler(batchRepo)
 
 	// ── Adaptadores de entrada ─────────────────────────────────────────────────
@@ -151,6 +160,8 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 
 		batchHandler:   batchHandler,
 		batchCloseHour: cfg.Settlement.BatchCloseHour,
+
+		outboxRelay: outboxRelay,
 	}, nil
 }
 
@@ -175,6 +186,14 @@ func (a *app) start(ctx context.Context) error {
 	slog.Info("NATS consumers active",
 		slog.String("consumers", "settlement-auth, settlement-reversal, settlement-batch"),
 	)
+
+	// Outbox relay — publica batch-closed y settlement.completed, con reintentos
+	a.relayWG.Add(1)
+	go func() {
+		defer a.relayWG.Done()
+		a.outboxRelay.Run(ctx)
+	}()
+	slog.Info("outbox relay active")
 
 	// gRPC server
 	go func() {
@@ -258,6 +277,9 @@ func (a *app) close() {
 	if a.grpcSrv != nil {
 		a.grpcSrv.Stop()
 	}
+
+	// El contexto ya se canceló: el Relay termina su ciclo y sale.
+	a.relayWG.Wait()
 
 	if a.natsConn != nil {
 		_ = a.natsConn.Drain()

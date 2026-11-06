@@ -79,6 +79,7 @@ verificar NATS por separado.
 | `CacheRulesLow` | Volumen de tráfico: con poco tráfico puede activarse sin que haya un problema |
 | `PoolPostgresAgotado`, `PostgresDeadlock` | [Sección 4](#4-postgres) |
 | `DuplicadosNATSAltos` | Reinicios en bucle o `AckWait` insuficiente |
+| `OutboxSettlementTrabado` | NATS y el log `outbox relay`. **No se pierde nada:** los eventos de Settlement salen solos al resolver la causa |
 | `EventoSettlementPerdido` | **Falta una venta, una reversa o un cierre en Settlement.** Buscá `deliveries exhausted` en los logs y seguí [Reprocesamiento](nats-dlq-reprocess.md) |
 | `LotesEnDisputa` | [Escenario A](batch-close-failure.md#escenario-a--lote-en-disputed) |
 | `LotesCerradosSinEnviar`, `EnvioAlProcesadorFallando` | [Escenario C](batch-close-failure.md#escenario-c--lote-en-closed-sin-enviar) |
@@ -205,7 +206,7 @@ consulta puntual.
 **Migraciones manuales:** no se aplican solas. Sin la de la
 [blocklist](../technical/AUTHORIZATION.md#aplicar-la-migración-de-blocklist), todas las transacciones fallan
 por la falta de `card_token`. Sin la de
-[lotes](../technical/SETTLEMENT.md#aplicar-la-migración), Settlement falla por la falta de `version`.
+[lotes](../technical/SETTLEMENT.md#aplicar-la-migración), Settlement falla por la falta de `version` o de `settlement.outbox`.
 
 ---
 

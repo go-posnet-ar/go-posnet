@@ -6,6 +6,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
@@ -19,6 +20,16 @@ type SettlementBatchRepository interface {
 	// Save persiste un batch nuevo o actualiza uno existente (UPSERT).
 	// Retorna ErrStaleBatch si otro proceso lo modificó desde que se cargó.
 	Save(ctx context.Context, batch *aggregate.SettlementBatch) error
+
+	// SaveTx hace lo mismo dentro de una transacción existente, para guardar el batch
+	// junto con su evento en el outbox. Si la transacción no confirma, hay que descartar
+	// el batch y volver a cargarlo: su versión en memoria ya avanzó.
+	SaveTx(ctx context.Context, tx pgx.Tx, batch *aggregate.SettlementBatch) error
+
+	// MerchantDayBatchesTx devuelve los batches con transacciones de un comercio en una
+	// fecha. Espera a que terminen las demás llamadas por ese comercio y fecha, y mantiene
+	// la exclusión hasta el fin de tx: quien llama ve lo que confirmaron las anteriores.
+	MerchantDayBatchesTx(ctx context.Context, tx pgx.Tx, merchantID domain.MerchantID, date time.Time) ([]MerchantDayBatch, error)
 
 	// FindByID recupera un batch por su ID.
 	FindByID(ctx context.Context, id string) (*aggregate.SettlementBatch, error)
@@ -40,15 +51,23 @@ type SettlementBatchRepository interface {
 	FindStaleOpenIDs(ctx context.Context, before time.Time) ([]string, error)
 }
 
+// MerchantDayBatch resume un batch para decidir si se completó la liquidación diaria.
+type MerchantDayBatch struct {
+	Currency    string
+	Settled     bool
+	TotalAmount int64
+}
+
 // BatchAttentionCounts son los lotes que requieren atención de un operador.
 type BatchAttentionCounts struct {
 	Disputed     int64 // En DISPUTED
 	ClosedUnsent int64 // En CLOSED, con transacciones, desde antes del corte
 	OpenOverdue  int64 // En OPEN, de un día de negocio anterior
+	OutboxStuck  int64 // Eventos en el outbox desde antes del corte
 }
 
 // BatchAttentionCounter cuenta los lotes que requieren atención. Es un puerto aparte
 // porque solo lo usan las métricas.
 type BatchAttentionCounter interface {
-	CountBatchesNeedingAttention(ctx context.Context, today, closedBefore time.Time) (BatchAttentionCounts, error)
+	CountBatchesNeedingAttention(ctx context.Context, today, closedBefore, outboxBefore time.Time) (BatchAttentionCounts, error)
 }

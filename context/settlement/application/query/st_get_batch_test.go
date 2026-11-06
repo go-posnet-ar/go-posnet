@@ -7,9 +7,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/juantevez/go-posnet/context/settlement/application/port"
 	"github.com/juantevez/go-posnet/context/settlement/application/query"
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
@@ -28,6 +31,14 @@ type fakeBatchRepo struct {
 }
 
 func (f *fakeBatchRepo) Save(context.Context, *aggregate.SettlementBatch) error { return nil }
+
+func (f *fakeBatchRepo) SaveTx(_ context.Context, _ pgx.Tx, b *aggregate.SettlementBatch) error {
+	return f.Save(context.Background(), b)
+}
+
+func (f *fakeBatchRepo) MerchantDayBatchesTx(context.Context, pgx.Tx, domain.MerchantID, time.Time) ([]repository.MerchantDayBatch, error) {
+	return nil, nil
+}
 
 func (f *fakeBatchRepo) FindByID(context.Context, string) (*aggregate.SettlementBatch, error) {
 	return f.findByIDResult, f.findByIDErr

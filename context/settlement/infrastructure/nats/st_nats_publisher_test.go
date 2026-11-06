@@ -2,7 +2,6 @@ package nats
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -15,23 +14,20 @@ func newTestPublisher(js *fakeJetStream) *EventPublisher {
 	return NewEventPublisher(natsutil.NewPublisher(js))
 }
 
-// ─── PublishBatchClosed ────────────────────────────────────────────────────────
+// ─── BuildBatchClosed ────────────────────────────────────────────────────────
 
-func TestPublishBatchClosed_NilSummary(t *testing.T) {
+func TestBuildBatchClosed_NilSummary(t *testing.T) {
 	js := &fakeJetStream{}
 	p := newTestPublisher(js)
 	b := newOpenBatch(t) // OPEN — Summary() es nil
 
-	err := p.PublishBatchClosed(context.Background(), b)
+	_, _, _, err := p.BuildBatchClosed(context.Background(), b)
 	if err == nil || !strings.Contains(err.Error(), "summary is nil") {
 		t.Fatalf("error = %v, want it to mention summary is nil", err)
 	}
-	if len(js.published) != 0 {
-		t.Errorf("published messages = %d, want 0", len(js.published))
-	}
 }
 
-func TestPublishBatchClosed_Success(t *testing.T) {
+func TestBuildBatchClosed_Success(t *testing.T) {
 	js := &fakeJetStream{ackSeq: 7}
 	p := newTestPublisher(js)
 	b := newClosableBatch(t)
@@ -43,20 +39,17 @@ func TestPublishBatchClosed_Success(t *testing.T) {
 	}
 
 	before := time.Now().UTC().Add(-time.Second)
-	if err := p.PublishBatchClosed(context.Background(), b); err != nil {
-		t.Fatalf("PublishBatchClosed() error = %v", err)
+	subject, eventID, data, err := p.BuildBatchClosed(context.Background(), b)
+	if err != nil {
+		t.Fatalf("BuildBatchClosed() error = %v", err)
 	}
 	after := time.Now().UTC().Add(time.Second)
 
-	if len(js.published) != 1 {
-		t.Fatalf("published messages = %d, want 1", len(js.published))
-	}
-	msg := js.published[0]
-	if msg.Subject != events.SubjectBatchClosed {
-		t.Errorf("Subject = %q, want %q", msg.Subject, events.SubjectBatchClosed)
+	if subject != events.SubjectBatchClosed {
+		t.Errorf("subject = %q, want %q", subject, events.SubjectBatchClosed)
 	}
 
-	envelope, err := events.UnmarshalEnvelope(msg.Data)
+	envelope, err := events.UnmarshalEnvelope(data)
 	if err != nil {
 		t.Fatalf("UnmarshalEnvelope() error = %v", err)
 	}
@@ -92,6 +85,9 @@ func TestPublishBatchClosed_Success(t *testing.T) {
 	if payload.Currency != b.Currency() {
 		t.Errorf("Currency = %q, want %q", payload.Currency, b.Currency())
 	}
+	if eventID != envelope.EventID {
+		t.Errorf("eventID = %q, want the envelope's %q", eventID, envelope.EventID)
+	}
 	if payload.Discrepancies != b.Discrepancies() {
 		t.Errorf("Discrepancies = %d, want %d", payload.Discrepancies, b.Discrepancies())
 	}
@@ -105,48 +101,30 @@ func TestPublishBatchClosed_Success(t *testing.T) {
 	}
 }
 
-func TestPublishBatchClosed_PublishError(t *testing.T) {
-	js := &fakeJetStream{publishErr: errors.New("nats unavailable")}
-	p := newTestPublisher(js)
-	b := newClosableBatch(t)
-	if err := b.RequestClose(); err != nil {
-		t.Fatalf("RequestClose() error = %v", err)
-	}
-	if err := b.Close(1, 1000); err != nil {
-		t.Fatalf("Close() error = %v", err)
-	}
+// ─── BuildSettlementCompleted ────────────────────────────────────────────────
 
-	err := p.PublishBatchClosed(context.Background(), b)
-	if err == nil || !strings.Contains(err.Error(), "publish BatchClosed") {
-		t.Fatalf("error = %v, want it to contain %q", err, "publish BatchClosed")
-	}
-}
-
-// ─── PublishSettlementCompleted ────────────────────────────────────────────────
-
-func TestPublishSettlementCompleted_Success(t *testing.T) {
+func TestBuildSettlementCompleted_Success(t *testing.T) {
 	js := &fakeJetStream{ackSeq: 3}
 	p := newTestPublisher(js)
 	merchantID := "merchant-1"
 
 	before := time.Now().UTC().Add(-time.Second)
-	err := p.PublishSettlementCompleted(context.Background(), merchantID, "2026-01-15", 4, 100000, 97500, "ARS", 2.5)
+	subject, eventID, data, err := p.BuildSettlementCompleted(context.Background(), merchantID, "2026-01-15", 4, 100000, 97500, "ARS", 2.5)
 	if err != nil {
-		t.Fatalf("PublishSettlementCompleted() error = %v", err)
+		t.Fatalf("BuildSettlementCompleted() error = %v", err)
 	}
 	after := time.Now().UTC().Add(time.Second)
 
-	if len(js.published) != 1 {
-		t.Fatalf("published messages = %d, want 1", len(js.published))
-	}
-	msg := js.published[0]
-	if msg.Subject != events.SubjectSettlementCompleted {
-		t.Errorf("Subject = %q, want %q", msg.Subject, events.SubjectSettlementCompleted)
+	if subject != events.SubjectSettlementCompleted {
+		t.Errorf("subject = %q, want %q", subject, events.SubjectSettlementCompleted)
 	}
 
-	envelope, err := events.UnmarshalEnvelope(msg.Data)
+	envelope, err := events.UnmarshalEnvelope(data)
 	if err != nil {
 		t.Fatalf("UnmarshalEnvelope() error = %v", err)
+	}
+	if eventID != envelope.EventID {
+		t.Errorf("eventID = %q, want the envelope's %q", eventID, envelope.EventID)
 	}
 	if envelope.AggregateType != "Settlement" {
 		t.Errorf("AggregateType = %q, want %q", envelope.AggregateType, "Settlement")
@@ -187,15 +165,5 @@ func TestPublishSettlementCompleted_Success(t *testing.T) {
 	}
 	if completedAt.Before(before) || completedAt.After(after) {
 		t.Errorf("CompletedAt = %v, want between %v and %v", completedAt, before, after)
-	}
-}
-
-func TestPublishSettlementCompleted_PublishError(t *testing.T) {
-	js := &fakeJetStream{publishErr: errors.New("nats unavailable")}
-	p := newTestPublisher(js)
-
-	err := p.PublishSettlementCompleted(context.Background(), "merchant-1", "2026-01-15", 1, 1000, 975, "ARS", 2.5)
-	if err == nil || !strings.Contains(err.Error(), "publish SettlementCompleted") {
-		t.Fatalf("error = %v, want it to contain %q", err, "publish SettlementCompleted")
 	}
 }

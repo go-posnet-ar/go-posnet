@@ -30,6 +30,14 @@ var _ repository.SettlementBatchRepository = (*fakeBatchRepo)(nil)
 
 func (f *fakeBatchRepo) Save(context.Context, *aggregate.SettlementBatch) error { return f.saveErr }
 
+func (f *fakeBatchRepo) SaveTx(_ context.Context, _ pgx.Tx, b *aggregate.SettlementBatch) error {
+	return f.Save(context.Background(), b)
+}
+
+func (f *fakeBatchRepo) MerchantDayBatchesTx(context.Context, pgx.Tx, domain.MerchantID, time.Time) ([]repository.MerchantDayBatch, error) {
+	return nil, nil
+}
+
 func (f *fakeBatchRepo) FindByID(context.Context, string) (*aggregate.SettlementBatch, error) {
 	return f.findByIDResult, f.findByIDErr
 }
@@ -57,6 +65,14 @@ type panickyBatchRepo struct{}
 var _ repository.SettlementBatchRepository = (*panickyBatchRepo)(nil)
 
 func (p *panickyBatchRepo) Save(context.Context, *aggregate.SettlementBatch) error { return nil }
+
+func (f *panickyBatchRepo) SaveTx(_ context.Context, _ pgx.Tx, b *aggregate.SettlementBatch) error {
+	return f.Save(context.Background(), b)
+}
+
+func (f *panickyBatchRepo) MerchantDayBatchesTx(context.Context, pgx.Tx, domain.MerchantID, time.Time) ([]repository.MerchantDayBatch, error) {
+	return nil, nil
+}
 
 func (p *panickyBatchRepo) FindByID(context.Context, string) (*aggregate.SettlementBatch, error) {
 	panic("boom")

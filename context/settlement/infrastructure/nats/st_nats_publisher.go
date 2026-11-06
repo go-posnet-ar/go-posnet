@@ -20,11 +20,11 @@ func NewEventPublisher(pub *natsutil.Publisher) *EventPublisher {
 	return &EventPublisher{pub: pub}
 }
 
-// PublishBatchClosed publica al stream POSNET_SETTLEMENT.
+// BuildBatchClosed serializa el evento BatchClosed sin publicarlo.
 // Consumido por: Notification BC.
-func (p *EventPublisher) PublishBatchClosed(ctx context.Context, b *aggregate.SettlementBatch) error {
+func (p *EventPublisher) BuildBatchClosed(ctx context.Context, b *aggregate.SettlementBatch) (string, string, []byte, error) {
 	if b.Summary() == nil {
-		return fmt.Errorf("st publisher: cannot publish BatchClosed — summary is nil")
+		return "", "", nil, fmt.Errorf("st publisher: cannot build BatchClosed — summary is nil")
 	}
 
 	payload := events.BatchClosedPayload{
@@ -39,7 +39,7 @@ func (p *EventPublisher) PublishBatchClosed(ctx context.Context, b *aggregate.Se
 		ClosedAt:      time.Now().UTC().Format(time.RFC3339),
 	}
 
-	_, err := p.pub.Publish(ctx,
+	eventID, data, err := p.pub.Build(ctx,
 		events.SubjectBatchClosed,
 		events.SubjectBatchClosed,
 		b.ID(), "SettlementBatch",
@@ -47,21 +47,20 @@ func (p *EventPublisher) PublishBatchClosed(ctx context.Context, b *aggregate.Se
 		payload,
 	)
 	if err != nil {
-		return fmt.Errorf("st publisher: publish BatchClosed: %w", err)
+		return "", "", nil, fmt.Errorf("st publisher: build BatchClosed: %w", err)
 	}
-	return nil
+	return events.SubjectBatchClosed, eventID, data, nil
 }
 
-// PublishSettlementCompleted publica el resumen de liquidación diaria.
-// Consumido por: Notification BC.
-func (p *EventPublisher) PublishSettlementCompleted(
+// BuildSettlementCompleted serializa el resumen de liquidación diaria sin publicarlo.
+func (p *EventPublisher) BuildSettlementCompleted(
 	ctx context.Context,
 	merchantID, settlementDate string,
 	totalBatches int,
 	totalAmount, netAmount int64,
 	currency string,
 	mdrPercent float64,
-) error {
+) (string, string, []byte, error) {
 	payload := events.SettlementCompletedPayload{
 		MerchantID:     merchantID,
 		SettlementDate: settlementDate,
@@ -73,7 +72,7 @@ func (p *EventPublisher) PublishSettlementCompleted(
 		CompletedAt:    time.Now().UTC().Format(time.RFC3339),
 	}
 
-	_, err := p.pub.Publish(ctx,
+	eventID, data, err := p.pub.Build(ctx,
 		events.SubjectSettlementCompleted,
 		events.SubjectSettlementCompleted,
 		merchantID, "Settlement",
@@ -81,7 +80,7 @@ func (p *EventPublisher) PublishSettlementCompleted(
 		payload,
 	)
 	if err != nil {
-		return fmt.Errorf("st publisher: publish SettlementCompleted: %w", err)
+		return "", "", nil, fmt.Errorf("st publisher: build SettlementCompleted: %w", err)
 	}
-	return nil
+	return events.SubjectSettlementCompleted, eventID, data, nil
 }

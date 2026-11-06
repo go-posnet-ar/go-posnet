@@ -1,6 +1,6 @@
 # Settlement — Documentación técnica
 
-> Revisado el 2026-11-05. Este documento describe lo que el código hace
+> Revisado el 2026-11-06. Este documento describe lo que el código hace
 > hoy. Si algo difiere del [README del contexto](../../context/settlement/README.md) o de los
 > comentarios del código, vale lo que está acá. Para operar un incidente, ver el
 > [runbook de cierre de lote](../runbooks/batch-close-failure.md).
@@ -15,9 +15,9 @@ registra la liquidación.
 externo. Con `SETTLEMENT_PROCESSOR=mock`, el envío se simula; con `none`, el default, el lote queda en
 `CLOSED`. La liquidación la confirma un operador.
 
-**Una base anterior a esta versión necesita la
-[migración](#aplicar-la-migración) antes del despliegue:** sin ella, el servicio falla al leer y guardar
-lotes.
+**Una base anterior a esta versión necesita las
+[migraciones](#aplicar-la-migración) antes del despliegue:** sin ellas, el servicio falla al leer y guardar
+lotes, o al cerrarlos y liquidarlos.
 
 | Capacidad | Estado | Detalle |
 |---|---|---|
@@ -27,7 +27,7 @@ lotes.
 | Cierre automático | Implementado | Lotes de días de negocio anteriores, sin conciliación |
 | Resolución de disputas | Implementado | `reopen` y `resolve-dispute` |
 | Liquidación y comisión (MDR) | Implementado | Confirmación manual con `settle` |
-| Publicación de `batch-closed` y `settlement.completed` | Implementado | Directa a NATS, sin outbox. Nadie consume `settlement.completed` |
+| Publicación de `batch-closed` y `settlement.completed` | Implementado | Por outbox, con reintentos. Nadie consume `settlement.completed` |
 | Consulta de lotes | Implementado | HTTP, sin autenticación |
 | Envío al procesador | **Simulado** | `none` no envía; `mock` acepta sin enviar nada |
 | Cierre forzado por soporte | Implementado | Con los totales del backend, sin conciliación |
@@ -107,7 +107,8 @@ OPEN ──► PENDING_CLOSE ──► CLOSED ──► SUBMITTED ──► SETT
 | Transición | ¿Cuándo ocurre? |
 |---|---|
 | `OPEN` → `PENDING_CLOSE` → `CLOSED` | Al cerrar, en un solo paso: `PENDING_CLOSE` nunca se guarda |
-| `CLOSED` → `DISPUTED` | Al cerrar con discrepancias, o en un `resubmit` si el lote las tiene |
+| `OPEN` → `DISPUTED` | Al cerrar con discrepancias: el lote se guarda directamente en `DISPUTED` |
+| `CLOSED` → `DISPUTED` | En un `resubmit`, si el lote tiene discrepancias de una versión anterior |
 | `DISPUTED` → `OPEN` | Con `reopen` |
 | `DISPUTED` → `CLOSED` | Con `resolve-dispute` |
 | `CLOSED` → `SUBMITTED` | Si el procesador acepta el envío (hoy, solo `mock`) |
@@ -197,19 +198,17 @@ Busca el lote OPEN del terminal para batch_date
 Calcula totales y discrepancias
    │
    ▼
-TX: marca el evento ─ guarda el lote en CLOSED
+TX: marca el evento ─ guarda el lote (CLOSED o DISPUTED) ─ encola batch-closed en el outbox
    │
-   ▼
-Publica settlement.batch-closed (si falla, solo log)
-   │
-   ├─ discrepancies > 0 ─► guarda DISPUTED ─► fin
+   ├─ discrepancies > 0 ─► fin
    │
    └─ discrepancies = 0 ─► envía al procesador
                               ├─ none ─► queda CLOSED, WARN y métrica
                               └─ mock ─► guarda SUBMITTED
 ```
 
-Sin procesador, el mensaje se confirma: reintentarlo no cambiaría nada. El lote sigue en `CLOSED` hasta
+Las tres escrituras son atómicas: si alguna falla, el lote sigue `OPEN` y el mensaje se reintenta. El
+[Relay](#publicados) envía el evento a NATS después, por separado. Sin procesador, el mensaje se confirma: reintentarlo no cambiaría nada. El lote sigue en `CLOSED` hasta
 un `resubmit`. Con cualquier otro error del procesador, el mensaje se reintenta, pero la reentrega ya no
 encuentra un lote `OPEN` y no hace nada: la vía para reintentar también es `resubmit`.
 
@@ -236,7 +235,7 @@ desactivado.
    recibiendo ventas.
 2. Los cierra con los totales del backend: **no hay conciliación**, porque el terminal no informó los
    suyos, y por eso tampoco hay discrepancias.
-3. Publica `batch-closed` y envía el lote al procesador. Un lote vacío solo se cierra.
+3. Encola `batch-closed` en la misma transacción y envía el lote al procesador. Un lote vacío solo se cierra.
 
 Un evento sintético en `processed_events`, determinístico por lote y día, evita que dos instancias cierren
 el mismo lote. Si falla el cierre de un lote, el job sigue con los demás y reintenta en el minuto
@@ -264,11 +263,15 @@ un nuevo evento: si los totales cambian, Notification no se entera.
 procesador que la informe.
 
 Cuando se liquidó el último lote con transacciones de un comercio en esa fecha, se publica
-`settlement.completed`, un evento por moneda:
+`settlement.completed`, un evento por moneda. Se encola en la misma transacción que la liquidación: si no se
+puede encolar, `settle` falla, el lote sigue `SUBMITTED` y se puede repetir.
 
 ```
 neto = bruto − redondeo(bruto × MDR / 100)
 ```
+
+La verificación usa un advisory lock por comercio y fecha: si se liquidan en paralelo los dos últimos lotes,
+el segundo ve lo que confirmó el primero, y sale un solo evento.
 
 Si después un terminal del mismo comercio abre otro lote para esa fecha, al liquidarlo se publica otro
 evento con el total acumulado.
@@ -283,13 +286,13 @@ evento con el total acumulado.
 | Conflicto con otro guardado del mismo lote | Reintento interno, y después `Nak` | **Sí** (ver [§5.10](#510-concurrencia)) |
 | Moneda inválida o monto no positivo | `Term`; no se reintenta | No |
 | Se pierde `auth.approved` en Authorization | La transacción falta en el lote; el cierre da `DISPUTED` | No |
-| Falla la publicación de `batch-closed` | Solo log; Notification no se entera | No |
-| Falla el guardado de `DISPUTED` | `Nak`; la reentrega no hace nada y queda `CLOSED` con discrepancias. El próximo `resubmit` lo pasa a `DISPUTED` | Con operador |
+| Falla el guardado del cierre o de su evento | `Nak`; el lote sigue `OPEN` y el cierre se reintenta | **Sí** |
+| NATS no disponible al publicar | Los eventos esperan en el outbox; alerta `OutboxSettlementTrabado` | **Sí**, al volver NATS |
 | Cierre sin procesador configurado | Queda `CLOSED` | Con `resubmit` |
 | El procesador falla | Queda `CLOSED` | Con `resubmit` |
 | El terminal nunca pide el cierre | El job lo cierra sin conciliar | **Sí** |
 | Falla el cierre automático de un lote | Reintenta en el minuto siguiente | **Sí** |
-| Falla la publicación de `settlement.completed` | Solo log; el lote queda `SETTLED`, y nada lo reintenta | No |
+| Falla el guardado de `settle` o de su evento | `500`; el lote sigue `SUBMITTED` | Con operador: repetir `settle` |
 
 ### 5.10 Concurrencia
 
@@ -362,7 +365,7 @@ pero sin completar `SubmittedAt` ni `SettledAt`. Puede haber varios lotes de un 
 Responde `{"status": "closed"}`. El lote queda en `CLOSED` con los **totales del backend**, sin discrepancias y
 **sin conciliar**, porque no hay totales del terminal. Después:
 
-- Publica `batch-closed`, salvo que el lote esté vacío. Si falla, queda en el log y el cierre se mantiene.
+- Encola `batch-closed` en la misma transacción, salvo que el lote esté vacío.
 - No envía el lote: hay que usar `resubmit`.
 - Registra `operator_id` en los logs, en nivel `WARN`.
 
@@ -435,8 +438,16 @@ Un mensaje que agota las entregas no pasa a una DLQ: queda el log `deliveries ex
 
 | Subject | Stream | ¿Se publica? | Consumidor |
 |---|---|---|---|
-| `posnet.settlement.batch-closed.v1` | `POSNET_SETTLEMENT` | Sí, sin outbox | Notification |
-| `posnet.settlement.completed.v1` | `POSNET_SETTLEMENT` | Sí, sin outbox | Ninguno: Notification no lo consume |
+| `posnet.settlement.batch-closed.v1` | `POSNET_SETTLEMENT` | Sí, por outbox | Notification |
+| `posnet.settlement.completed.v1` | `POSNET_SETTLEMENT` | Sí, por outbox | Ninguno: Notification no lo consume |
+
+Los eventos se guardan en `settlement.outbox`, en la misma transacción que el lote. Un Relay revisa la tabla
+cada segundo, publica hasta 50 eventos por ciclo y borra los enviados. Puede correr en varias instancias:
+cada fila la toma una sola, con `FOR UPDATE SKIP LOCKED`.
+
+**La entrega es al menos una vez.** Si el Relay publica y no llega a borrar la fila, reenvía el evento con el
+mismo `Nats-Msg-Id`: JetStream lo descarta dentro de su ventana de deduplicación, de 2 minutos por defecto.
+Pasada esa ventana, llega duplicado, y el consumidor debe descartarlo por `event_id`, como hace Notification.
 
 Payload de `batch-closed`:
 
@@ -469,6 +480,7 @@ hace nada, [`migrations/settlement/`](../../migrations/settlement/) se aplica a 
 | `settlement_batches` | Lotes | PK `id`; único `(terminal_id, batch_date, currency)` solo para `OPEN` |
 | `batch_transactions` | Transacciones del lote | PK `id`; único `(transaction_id, tx_type)`; FK `batch_id` |
 | `processed_events` | Idempotencia | PK `event_id` |
+| `outbox` | Eventos pendientes de publicar | PK `id`; índice `created_at` |
 
 | Índice | Para qué sirve |
 |---|---|
@@ -481,16 +493,20 @@ Con 2.000 lotes y 400.000 transacciones, cargar un lote pasó de recorrer toda l
 
 ### Aplicar la migración
 
-**Una base existente necesita esta migración antes de desplegar esta versión del servicio.** `01-init.sql`
-solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
+**Una base existente necesita `000001` y `000003` antes de desplegar esta versión del servicio.**
+`01-init.sql` solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
 
 ```bash
 psql "$POSTGRES_DSN" -f migrations/settlement/000001_batch_integrity.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000002_batch_indexes.up.sql
+psql "$POSTGRES_DSN" -f migrations/settlement/000003_outbox.up.sql
 ```
 
-Ambas son idempotentes y no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
+Son idempotentes y no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
 coincide con el de una base nueva.
+
+**Sin `000003`, fallan los cierres y las liquidaciones,** y `/metrics` deja de informar los lotes que
+requieren atención. Se puede aplicar con el servicio anterior en marcha, porque solo agrega una tabla.
 
 `000002` crea los índices con `CONCURRENTLY`, sin bloquear las escrituras, y por eso no puede correr dentro de
 una transacción: no usar `psql -1`. Si se interrumpe, puede dejar un índice inválido: hay que borrarlo y volver
@@ -498,7 +514,8 @@ a ejecutarla. Se puede aplicar después del despliegue, porque el servicio no de
 
 `000001_batch_integrity.down.sql` la revierte, pero **falla sin cambiar nada** si ya hay varios lotes por
 terminal y fecha o filas `REVERSAL`, porque el schema anterior no los admite. Resolver esos datos es una
-decisión financiera, y el script no los borra.
+decisión financiera, y el script no los borra. `000003_outbox.down.sql` también falla sin cambiar nada si
+quedan eventos sin publicar: hay que esperar a que salgan.
 
 ### Costo por aprobación
 
@@ -507,8 +524,8 @@ NOTHING`. El costo por evento crece con el tamaño del lote, y con él el costo 
 
 ### Apagado
 
-Ante `SIGINT` o `SIGTERM`: detiene HTTP (hasta 10 s) y gRPC, drena y cierra NATS, y cierra el pool de
-Postgres.
+Ante `SIGINT` o `SIGTERM`: detiene HTTP (hasta 10 s) y gRPC, espera al Relay, drena y cierra NATS, y cierra
+el pool de Postgres.
 
 ## 10. Observabilidad y operación
 
@@ -522,6 +539,7 @@ Postgres.
 | `posnet_settlement_batch_duration_seconds` | Histogram | — | Duración del cierre |
 | `posnet_settlement_submissions_total` | Counter | `result` | Envíos tras un cierre: `submitted`, `unavailable` o `error`. No incluye `resubmit` |
 | `posnet_settlement_batches_attention` | Gauge | `reason` | Lotes que requieren atención (ver abajo). Consulta la base en cada scrape |
+| `posnet_settlement_outbox_stuck` | Gauge | — | Eventos en el outbox desde hace más de 1 minuto |
 
 También se exponen métricas del pool de Postgres y de mensajes NATS, incluida
 `posnet_nats_messages_failed_total{kind="exhausted"}` para los eventos que agotaron las entregas.
@@ -532,13 +550,14 @@ También se exponen métricas del pool de Postgres y de mensajes NATS, incluida
 | `closed_unsent` | Lotes con transacciones en `CLOSED` hace más de 1 hora |
 | `open_overdue` | Lotes `OPEN` de días de negocio anteriores |
 
-Si la consulta falla, la serie no se informa en ese scrape, y las alertas que dependen de ella no se evalúan.
+Si la consulta falla, estas series no se informan en ese scrape, y las alertas que dependen de ellas no se evalúan.
 
 ### Alertas
 
 | Alerta | Severidad | Se activa cuando | Qué hacer |
 |---|---|---|---|
 | `EventoSettlementPerdido` | Crítica | Un evento agotó las entregas. Sigue activa hasta reiniciar el servicio | [Reprocesar el evento](../runbooks/nats-dlq-reprocess.md) |
+| `OutboxSettlementTrabado` | Warning | Hay eventos en el outbox hace más de 1 minuto, durante 5 min | Revisar NATS y el log `outbox relay`. Se publican solos al resolver la causa |
 | `LotesEnDisputa` | Warning | Hay lotes en disputa durante 15 min | [Escenario A](../runbooks/batch-close-failure.md#escenario-a--lote-en-disputed) |
 | `LotesCerradosSinEnviar` | Warning | `closed_unsent` > 0 durante 15 min | [Escenario C](../runbooks/batch-close-failure.md#escenario-c--lote-en-closed-sin-enviar) |
 | `LotesAbiertosVencidos` | Warning | `open_overdue` > 0 durante 30 min | [Escenario F](../runbooks/batch-close-failure.md#escenario-f--lotes-abiertos-de-días-anteriores) |
@@ -560,7 +579,8 @@ ORDER BY batch_date DESC;
 ```
 
 En los logs, `modified concurrently` indica conflictos de versión, que son esperables con tráfico simultáneo,
-`no open batch found` indica cierres sin efecto y `deliveries exhausted` indica un evento perdido. `batch closed automatically` identifica los cierres sin
+`no open batch found` indica cierres sin efecto, `deliveries exhausted` un evento perdido y
+`outbox relay: publish cycle failed` que el Relay no puede publicar. `batch closed automatically` identifica los cierres sin
 conciliar, y `no settlement processor configured` los lotes que quedaron sin enviar.
 
 ### Variables de entorno
@@ -670,8 +690,7 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | No hay procesador real | `mock` marca `SUBMITTED` sin enviar nada. Falta el adaptador y el archivo de remesa, que requieren la especificación del procesador. `SETTLEMENT_SUBMIT_RETRIES` y `SETTLEMENT_SUBMIT_TIMEOUT` siguen sin efecto | `st_mock_processor.go` |
 | La confirmación de liquidación es manual | Un operador debe llamar a `settle`, sin una referencia del procesador | `SettleBatch` |
 | Nadie consume `settlement.completed` | El comercio no recibe el neto liquidado: Notification no se suscribe | `nt_nats_subscriber.go` |
-| `settlement.completed` sin outbox | Si falla la publicación, nada la reintenta y el lote ya está `SETTLED` | `publishCompletedIfDone` |
-| Evento adicional por lotes tardíos | Un lote abierto después de la liquidación diaria genera otro evento con el total acumulado | `publishCompletedIfDone` |
+| Evento adicional por lotes tardíos | Un lote abierto después de la liquidación diaria genera otro evento con el total acumulado | `enqueueCompletedIfDone` |
 | El cierre automático no concilia | Los lotes se envían con los totales del backend, sin comparar con el terminal | `CloseStaleBatches` |
 | `force-close` no concilia | El operador asume que los totales del backend son correctos | `ForceClose` |
 | Doble envío posible | Si el procesador acepta y falla el guardado, el lote queda `CLOSED`, y `resubmit` lo enviaría otra vez | `submitBatch`, `ResubmitBatch` |
@@ -694,7 +713,8 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 |---|---|---|
 | Las alertas no avisan a nadie | Alertmanager las envía a `webhook-mock`: hay que mirarlas en Prometheus o Alertmanager | Alertmanager |
 | Costo creciente por aprobación | Cada venta carga y reinserta todas las transacciones del lote. Los índices evitan recorrer toda la tabla, pero el costo sigue creciendo con el tamaño del lote | `Save`, `loadTransactions` |
-| `batch-closed` se publica sin outbox | Si falla, Notification no se entera y nada lo reintenta | `ProcessBatchClose` |
+| Los eventos publicados no llevan la traza | El Relay publica sin el contexto del pedido: la traza del cierre no continúa en Notification. Se correlaciona por `correlation_id` | `pkg/outbox` |
+| Una fila que no se puede publicar frena a las demás | El ciclo se revierte ante el primer fallo. Hoy solo ocurre si NATS o el stream no están disponibles | `pkg/outbox` |
 | Un cierre sin lote no recibe respuesta | Terminal Gateway ya respondió `202`, y Settlement solo deja un `WARN` | `ProcessBatchClose` |
 | Sin DLQ ni reintento pasados unos 12 minutos | Una caída más larga agota las 5 entregas: el evento queda sin registrar hasta que alguien lo reprocesa | `nak` |
 | Un reintento puede llegar después del cierre | Si una venta está esperando su reentrega cuando el terminal cierra, el cierre da `DISPUTED` y la venta entra en un lote nuevo | `retryDelays` |

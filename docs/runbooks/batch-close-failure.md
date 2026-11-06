@@ -23,8 +23,8 @@ export AUTH="Authorization: Bearer <token>"
 | `401 UNAUTHORIZED` | Falta el token o es incorrecto. Queda `rejected admin request` en el log |
 | `503 ADMIN_API_DISABLED` | El servicio no tiene `SETTLEMENT_ADMIN_API_KEY`. Hay que configurarla y reiniciarlo |
 
-**Si Settlement falla justo después de un despliegue con errores sobre `version`,** falta aplicar la
-[migración](../technical/SETTLEMENT.md#aplicar-la-migración).
+**Si Settlement falla justo después de un despliegue con errores sobre `version` o `settlement.outbox`,**
+falta aplicar las [migraciones](../technical/SETTLEMENT.md#aplicar-la-migración).
 
 Revisado contra el código el 2026-11-05. Detalle técnico en
 [SETTLEMENT.md](../technical/SETTLEMENT.md). Puerto HTTP en Docker Compose: `8084`.
@@ -46,10 +46,12 @@ Terminal Gateway publica `posnet.transaction.batch-close.v1`, y `settlement-batc
 
 1. Busca el lote `OPEN` del terminal para `batch_date`. Si no hay ninguno, registra un `WARN` y confirma.
 2. Calcula los totales del backend y los compara con los del terminal.
-3. Marca el evento y **guarda el lote en `CLOSED`**.
-4. Publica `settlement.batch-closed`. Si falla, solo queda un log.
-5. Con discrepancias: guarda `DISPUTED` y termina.
-6. Sin discrepancias: lo envía al procesador. Sin procesador, queda en `CLOSED`.
+3. En una transacción, marca el evento, **guarda el lote en `CLOSED`, o en `DISPUTED` si hay discrepancias**,
+   y encola `settlement.batch-closed` en el outbox. Si algo falla, el lote sigue `OPEN` y se reintenta.
+4. Con discrepancias, termina.
+5. Sin discrepancias: lo envía al procesador. Sin procesador, queda en `CLOSED`.
+
+El Relay publica el evento a NATS por separado, con reintentos.
 
 ```
                                  reopen
@@ -88,7 +90,7 @@ BEGIN;
 ## Escenario A — Lote en `DISPUTED`
 
 **Síntoma:** `GET /batches/{id}` devuelve `"State": "DISPUTED"`. En logs: `batch has discrepancies —
-marking as disputed` o `resubmit blocked by discrepancies`.
+marked as disputed` o `resubmit blocked by discrepancies`.
 
 **Causa:** la cantidad o el monto del terminal no coinciden con el backend. Las más comunes:
 
@@ -193,7 +195,7 @@ FROM settlement.settlement_batches WHERE id = '<batch_id>';
 |---|---|
 | `no settlement processor configured` | `SETTLEMENT_PROCESSOR=none`. También aumenta `posnet_settlement_submissions_total{result="unavailable"}` |
 | `submitBatch: processor submit` | Falló el procesador. La reentrega no reintenta el envío, porque ya no hay un lote `OPEN` |
-| `discrepancies` mayor que 0 | Viene de un `force-close` anterior a la corrección, o falló el guardado de `DISPUTED` durante el cierre |
+| `discrepancies` mayor que 0 | Viene de una versión anterior: un `force-close` antes de la corrección, o un fallo al guardar `DISPUTED` durante el cierre |
 | Pasó por `force-close` | Un cierre forzado no envía el lote: hay que hacer `resubmit` |
 | Lote sin transacciones | Lote vacío cerrado por el job. No requiere acción |
 
@@ -296,7 +298,7 @@ cierra.
 
 **Cómo funciona el job:** corre desde las **03:00 UTC (00:00 en Argentina)** y al arrancar el servicio.
 Cierra los lotes de días de negocio anteriores con los totales del backend, **sin conciliar con el terminal**,
-publica `batch-closed` y los envía al procesador. Log: `batch closed automatically without terminal
+encola `batch-closed` y los envía al procesador. Log: `batch closed automatically without terminal
 totals`.
 
 **Diagnóstico:**
@@ -338,7 +340,7 @@ curl -X POST http://<host>:8084/batches/<batch_id>/settle -H "$AUTH" -d '{"opera
 
 Responde `200` y pasa a `SETTLED`, que es un estado final. Sobre otro estado responde `400`.
 
-Al liquidar el último lote con transacciones del comercio en esa fecha, se publica
+Al liquidar el último lote con transacciones del comercio en esa fecha, se encola
 `settlement.completed`, con el bruto, el neto y el MDR. **Hoy ningún servicio lo consume,** así que el
 comercio no recibe ese aviso.
 
@@ -350,7 +352,8 @@ WHERE merchant_id = '<merchant_id>' AND batch_date = '<batch_date>' AND state <>
 
 Los lotes vacíos no impiden que se publique el evento.
 
-Si falla la publicación, queda `failed to publish SettlementCompleted` en el log, y nada la reintenta.
+El evento se guarda junto con la liquidación. Si no se puede guardar, `settle` responde `500`, el lote sigue
+en `SUBMITTED` y se puede repetir. Con NATS caído, el evento espera en el outbox y sale solo.
 
 ---
 
@@ -374,7 +377,7 @@ que consultarlo y repetir. Un `{id}` que no sea un UUID responde `400 INVALID_ID
 **Sobre `force-close`:**
 
 - Cierra con los totales del backend, **sin conciliar**: asumís que son correctos.
-- Publica `batch-closed`, salvo que el lote esté vacío.
+- Encola `batch-closed`, salvo que el lote esté vacío.
 - No envía el lote: hay que hacer `resubmit`.
 - Las ventas posteriores del terminal abren un lote nuevo, que hay que volver a cerrar.
 

@@ -116,3 +116,15 @@ groups:
         annotations:
           summary: "Envíos al procesador con resultado {{ $labels.result }}"
           description: "unavailable: sin procesador configurado. error: el procesador falló. Los lotes quedan en CLOSED hasta un resubmit (batch-close-failure.md, Escenario C)."
+
+      # Outbox de Settlement sin avanzar: los eventos no se pierden, pero no salen.
+      # Investigar: conexión a NATS y logs "outbox relay".
+      - alert: OutboxSettlementTrabado
+        expr: max(posnet_settlement_outbox_stuck) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} eventos trabados en el outbox de Settlement"
+          description: "batch-closed y settlement.completed no llegan a NATS. Se publicarán solos cuando se resuelva la causa. Revisar NATS y los logs 'outbox relay'."
+

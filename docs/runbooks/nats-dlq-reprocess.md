@@ -221,14 +221,15 @@ pueden procesarla.
 ## 6. Si el evento no está en el stream
 
 Las publicaciones directas no usan outbox: si fallaron, el servicio registró `failed to publish`, siguió
-adelante, y el evento no existe. Salvo `transaction.received`, esto aplica a todos los eventos.
+adelante, y el evento no existe. Esto aplica a todos los eventos, salvo `transaction.received` y los de
+Settlement (`settlement.batch-closed` y `settlement.completed`), que esperan en el outbox hasta publicarse.
 
 | Evento perdido | Cómo se ve | Recuperación |
 |---|---|---|
 | `fraud.check-requested` | Transacción en `FRAUD_CHECKING`, sin caso de fraude | Borrar la fila en `pn_authorization` y republicar el `transaction.received` original |
 | `fraud.score-calculated` | Transacción en `FRAUD_CHECKING`, con caso de fraude | Borrar la fila en `fraud_detection` y republicar el `check-requested` original |
 | `auth.approved`, `auth.rejected` | Transacción en estado final, sin efecto en los demás servicios | **No hay procedimiento seguro.** Reconstruir el evento a mano es delicado: coordinalo con el equipo |
-| `settlement.batch-closed` | Lote cerrado, sin notificación | Avisar al comercio por otro medio |
+| `settlement.batch-closed` anterior al outbox | Lote cerrado, sin notificación | Avisar al comercio por otro medio |
 
 Al republicar `transaction.received`, el `Save` de Authorization reescribe la transacción como
 `FRAUD_CHECKING`, y su estado anterior se pierde. **Hacelo solo si sigue en `FRAUD_CHECKING`.**

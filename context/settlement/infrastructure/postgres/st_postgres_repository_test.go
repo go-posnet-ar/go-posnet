@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pashagolub/pgxmock/v4"
 
+	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	"github.com/juantevez/go-posnet/context/settlement/infrastructure/postgres"
@@ -819,17 +820,18 @@ func TestCountBatchesNeedingAttention(t *testing.T) {
 	repo := postgres.NewSettlementBatchRepo(pool)
 	today := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	closedBefore := today.Add(-time.Hour)
+	outboxBefore := today.Add(-time.Minute)
 
 	pool.ExpectQuery("FROM settlement.settlement_batches").
-		WithArgs(closedBefore, "2026-11-05").
-		WillReturnRows(pgxmock.NewRows([]string{"disputed", "closed", "open"}).AddRow(int64(3), int64(2), int64(1)))
+		WithArgs(closedBefore, "2026-11-05", outboxBefore).
+		WillReturnRows(pgxmock.NewRows([]string{"disputed", "closed", "open", "outbox"}).AddRow(int64(3), int64(2), int64(1), int64(4)))
 
-	got, err := repo.CountBatchesNeedingAttention(context.Background(), today, closedBefore)
+	got, err := repo.CountBatchesNeedingAttention(context.Background(), today, closedBefore, outboxBefore)
 	if err != nil {
 		t.Fatalf("CountBatchesNeedingAttention() error = %v", err)
 	}
-	if got.Disputed != 3 || got.ClosedUnsent != 2 || got.OpenOverdue != 1 {
-		t.Errorf("counts = %+v, want {3 2 1}", got)
+	if got.Disputed != 3 || got.ClosedUnsent != 2 || got.OpenOverdue != 1 || got.OutboxStuck != 4 {
+		t.Errorf("counts = %+v, want {3 2 1 4}", got)
 	}
 }
 
@@ -838,10 +840,95 @@ func TestCountBatchesNeedingAttention_QueryError(t *testing.T) {
 	repo := postgres.NewSettlementBatchRepo(pool)
 
 	pool.ExpectQuery("FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnError(errors.New("db down"))
 
-	if _, err := repo.CountBatchesNeedingAttention(context.Background(), time.Now(), time.Now()); err == nil {
+	if _, err := repo.CountBatchesNeedingAttention(context.Background(), time.Now(), time.Now(), time.Now()); err == nil {
 		t.Fatal("CountBatchesNeedingAttention() error = nil, want error")
+	}
+}
+
+func TestSaveTx_UsesCallerTransaction(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	b := aggregate.Reconstitute(aggregate.ReconstituteParams{
+		ID: "batch-1", TerminalID: domain.NewTerminalID(), MerchantID: domain.NewMerchantID(),
+		State: valueobject.BatchStateOpen, Currency: "ARS", Version: 3,
+	})
+
+	pool.ExpectBegin()
+	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
+		WithArgs(anyArgs(18)...).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	pool.ExpectCommit()
+
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	// Sin BeginTx esperado: si SaveTx abriera su propia transacción, pgxmock fallaría.
+	if err := repo.SaveTx(context.Background(), tx, b); err != nil {
+		t.Fatalf("SaveTx() error = %v", err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	if b.Version() != 4 {
+		t.Errorf("Version() = %d, want 4", b.Version())
+	}
+}
+
+func TestMerchantDayBatchesTx_LocksBeforeReading(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	merchantID := domain.NewMerchantID()
+	date := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+
+	pool.ExpectBegin()
+	pool.ExpectExec("pg_advisory_xact_lock").
+		WithArgs("settlement-completed:" + merchantID.String() + ":2026-11-05").
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
+	pool.ExpectQuery("FROM settlement.settlement_batches").
+		WithArgs(merchantID.String(), "2026-11-05").
+		WillReturnRows(pgxmock.NewRows([]string{"currency", "settled", "total"}).
+			AddRow("ARS", true, int64(1000)).
+			AddRow("USD", false, int64(0)))
+	pool.ExpectRollback()
+
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	got, err := repo.MerchantDayBatchesTx(context.Background(), tx, merchantID, date)
+	if err != nil {
+		t.Fatalf("MerchantDayBatchesTx() error = %v", err)
+	}
+	want := []repository.MerchantDayBatch{
+		{Currency: "ARS", Settled: true, TotalAmount: 1000},
+		{Currency: "USD", Settled: false, TotalAmount: 0},
+	}
+	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("batches = %+v, want %+v", got, want)
+	}
+}
+
+func TestMerchantDayBatchesTx_LockError(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+
+	pool.ExpectBegin()
+	pool.ExpectExec("pg_advisory_xact_lock").WithArgs(pgxmock.AnyArg()).WillReturnError(errors.New("db down"))
+	pool.ExpectRollback()
+
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	if _, err := repo.MerchantDayBatchesTx(context.Background(), tx, domain.NewMerchantID(), time.Now()); err == nil {
+		t.Fatal("MerchantDayBatchesTx() error = nil, want error")
 	}
 }

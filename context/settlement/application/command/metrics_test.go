@@ -63,7 +63,7 @@ func newMetricsHandler(t *testing.T, repo *fakeBatchRepo) (*command.BatchHandler
 		t.Fatalf("NewMetrics() error = %v", err)
 	}
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedWithEvent(pool)
 	h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{confirmationID: "conf-1"})
 	h.SetMetrics(metrics)
 	return h, reader
@@ -104,10 +104,11 @@ type fakeAttentionCounter struct {
 	err          error
 	today        time.Time
 	closedBefore time.Time
+	outboxBefore time.Time
 }
 
-func (f *fakeAttentionCounter) CountBatchesNeedingAttention(_ context.Context, today, closedBefore time.Time) (repository.BatchAttentionCounts, error) {
-	f.today, f.closedBefore = today, closedBefore
+func (f *fakeAttentionCounter) CountBatchesNeedingAttention(_ context.Context, today, closedBefore, outboxBefore time.Time) (repository.BatchAttentionCounts, error) {
+	f.today, f.closedBefore, f.outboxBefore = today, closedBefore, outboxBefore
 	return f.counts, f.err
 }
 
@@ -127,13 +128,20 @@ func attentionByReason(t *testing.T, reader *sdkmetric.ManualReader) map[string]
 
 func TestBatchAttentionGauge_ReportsEveryReason(t *testing.T) {
 	reader := newTestReader(t)
-	counter := &fakeAttentionCounter{counts: repository.BatchAttentionCounts{Disputed: 2, OpenOverdue: 1}}
+	counter := &fakeAttentionCounter{counts: repository.BatchAttentionCounts{Disputed: 2, OpenOverdue: 1, OutboxStuck: 4}}
 	loc := time.FixedZone("BA", -3*60*60)
 	if err := command.RegisterBatchAttentionGauge(counter, loc); err != nil {
 		t.Fatalf("RegisterBatchAttentionGauge() error = %v", err)
 	}
 
 	before := time.Now()
+	metrics := collectMetrics(t, reader)
+	if dps := metrics["posnet_settlement_outbox_stuck"].Data.(metricdata.Gauge[int64]).DataPoints; len(dps) != 1 || dps[0].Value != 4 {
+		t.Errorf("outbox stuck data points = %+v, want a single value of 4", dps)
+	}
+	if counter.outboxBefore.After(before.Add(-time.Minute + time.Second)) {
+		t.Errorf("outboxBefore = %v, want about one minute ago", counter.outboxBefore)
+	}
 	got := attentionByReason(t, reader)
 
 	// closed_unsent en 0 también se informa: sin la serie, la alerta no podría resolverse.

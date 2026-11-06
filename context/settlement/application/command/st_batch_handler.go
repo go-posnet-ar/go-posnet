@@ -20,6 +20,7 @@ import (
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
 	"github.com/juantevez/go-posnet/pkg/observability"
+	"github.com/juantevez/go-posnet/pkg/outbox"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 )
 
@@ -29,6 +30,7 @@ type BatchHandler struct {
 	batchRepo   repository.SettlementBatchRepository
 	publisher   service.EventPublisher
 	processor   service.SettlementProcessor
+	outbox      *outbox.Store
 	idempotency *natsutil.IdempotencyStore
 	pool        pgutil.PgxPool
 	mdrPercent  float64
@@ -60,6 +62,7 @@ func (h *BatchHandler) SetMetrics(m *Metrics) {
 func NewBatchHandler(
 	batchRepo repository.SettlementBatchRepository,
 	publisher service.EventPublisher,
+	outboxStore *outbox.Store,
 	processor service.SettlementProcessor,
 	idempotency *natsutil.IdempotencyStore,
 	pool pgutil.PgxPool,
@@ -68,6 +71,7 @@ func NewBatchHandler(
 	return &BatchHandler{
 		batchRepo:   batchRepo,
 		publisher:   publisher,
+		outbox:      outboxStore,
 		processor:   processor,
 		idempotency: idempotency,
 		pool:        pool,
@@ -253,6 +257,12 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 		if err := batch.Close(cmd.TerminalCount, cmd.TerminalAmount); err != nil {
 			return fmt.Errorf("close batch: %w", err)
 		}
+		// Con discrepancias, el lote no se envía: pasa a DISPUTED en el mismo guardado.
+		if batch.Discrepancies() > 0 {
+			if err := batch.MarkDisputed("terminal count/amount mismatch"); err != nil {
+				return fmt.Errorf("mark disputed: %w", err)
+			}
+		}
 
 		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
 			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
@@ -264,7 +274,10 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 				return nil
 			}
 			processed = true
-			return h.batchRepo.Save(ctx, batch)
+			if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
+				return err
+			}
+			return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch)
 		})
 	})
 	if err != nil {
@@ -277,40 +290,33 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 	if !processed {
 		return nil
 	}
-	closeDuration := time.Since(closeStart)
-
-	// Publicar BatchClosed a NATS → Notification BC
-	if err := h.publisher.PublishBatchClosed(ctx, batch); err != nil {
-		log.Error("failed to publish BatchClosed", slog.String("error", err.Error()))
-	}
+	h.metrics.RecordBatchClosed(ctx, batch.Currency(), batch.State().String(), time.Since(closeStart))
 
 	log.Info("batch closed successfully",
 		slog.String("batch_id", batch.ID()),
+		slog.String("state", batch.State().String()),
 		slog.Int("discrepancies", batch.Discrepancies()),
 	)
 
-	// Si hay discrepancias, marcar como DISPUTED en lugar de continuar
-	if batch.Discrepancies() > 0 {
-		log.Warn("batch has discrepancies — marking as disputed",
+	if batch.State() == valueobject.BatchStateDisputed {
+		log.Warn("batch has discrepancies — marked as disputed",
+			slog.String("batch_id", batch.ID()),
 			slog.Int("discrepancies", batch.Discrepancies()),
 		)
-		closedState := batch.State().String()
-		if err := batch.MarkDisputed("terminal count/amount mismatch"); err != nil {
-			h.metrics.RecordBatchClosed(ctx, batch.Currency(), closedState, closeDuration)
-			return fmt.Errorf("ProcessBatchClose: mark disputed: %w", err)
-		}
-		if err := h.batchRepo.Save(ctx, batch); err != nil {
-			// La disputa no se guardó: el lote sigue en CLOSED.
-			h.metrics.RecordBatchClosed(ctx, batch.Currency(), closedState, closeDuration)
-			return err
-		}
-		h.metrics.RecordBatchClosed(ctx, batch.Currency(), batch.State().String(), closeDuration)
 		return nil
 	}
-	h.metrics.RecordBatchClosed(ctx, batch.Currency(), batch.State().String(), closeDuration)
 
 	// Sin discrepancias → enviar al procesador externo
 	return h.submitBatch(ctx, batch)
+}
+
+// enqueueBatchClosed guarda el evento BatchClosed en el outbox, dentro de tx.
+func enqueueBatchClosed(ctx context.Context, tx pgx.Tx, publisher service.EventPublisher, store *outbox.Store, batch *aggregate.SettlementBatch) error {
+	subject, eventID, payload, err := publisher.BuildBatchClosed(ctx, batch)
+	if err != nil {
+		return fmt.Errorf("build BatchClosed: %w", err)
+	}
+	return store.InsertTx(ctx, tx, subject, eventID, payload)
 }
 
 // Reintentos ante un conflicto de versión. Son internos porque las entregas de NATS
@@ -417,7 +423,14 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 			return nil
 		}
 		processed = true
-		return h.batchRepo.Save(ctx, batch)
+		if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
+			return err
+		}
+		// Un lote vacío (lo crea una reversa de otra fecha) no tiene nada que informar.
+		if len(batch.Transactions()) == 0 {
+			return nil
+		}
+		return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch)
 	})
 	if err != nil {
 		return false, fmt.Errorf("persist batch: %w", err)
@@ -431,14 +444,11 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 		slog.Int("tx_count", len(batch.Transactions())),
 	)
 
-	// Un lote vacío (lo crea una reversa de otra fecha) no tiene nada que informar ni enviar.
+	// Un lote vacío no tiene nada que enviar.
 	if len(batch.Transactions()) == 0 {
 		return true, nil
 	}
 
-	if err := h.publisher.PublishBatchClosed(ctx, batch); err != nil {
-		log.Error("failed to publish BatchClosed", slog.String("error", err.Error()))
-	}
 	// El lote ya quedó CLOSED: si el envío falla, se reintenta con ResubmitBatch.
 	if err := h.submitBatch(ctx, batch); err != nil {
 		log.Error("automatic batch submit failed", slog.String("error", err.Error()))

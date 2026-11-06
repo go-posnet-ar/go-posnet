@@ -23,6 +23,7 @@ import (
 //	posnet_settlement_batch_duration → posnet_settlement_batch_duration_seconds
 //	posnet_settlement_submissions   → posnet_settlement_submissions_total{result}
 //	posnet_settlement_batches_attention → posnet_settlement_batches_attention{reason}
+//	posnet_settlement_outbox_stuck → posnet_settlement_outbox_stuck
 //
 // El label "bc" lo inyecta Prometheus como target label (prometheus.yml).
 type Metrics struct {
@@ -44,6 +45,9 @@ const (
 	// closedUnsentAfter es cuánto puede seguir un lote en CLOSED antes de considerarlo
 	// trabado: da margen a un operador que está resolviendo una disputa o reenviando.
 	closedUnsentAfter = time.Hour
+	// outboxStuckAfter es cuánto puede esperar un evento en el outbox: el Relay lo
+	// publica en segundos, salvo que NATS no esté disponible.
+	outboxStuckAfter = time.Minute
 	// attentionQueryTimeout acota la consulta para no demorar el scrape de /metrics.
 	attentionQueryTimeout = 2 * time.Second
 )
@@ -136,6 +140,13 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 	if err != nil {
 		return err
 	}
+	outboxGauge, err := observability.Meter("posnet.settlement").Int64ObservableGauge(
+		"posnet_settlement_outbox_stuck",
+		metric.WithDescription("Eventos que esperan en el outbox desde hace más de un minuto."),
+	)
+	if err != nil {
+		return err
+	}
 	_, err = observability.Meter("posnet.settlement").RegisterCallback(
 		func(ctx context.Context, o metric.Observer) error {
 			ctx, cancel := context.WithTimeout(ctx, attentionQueryTimeout)
@@ -145,7 +156,7 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 			y, m, d := now.In(loc).Date()
 			today := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 
-			counts, err := counter.CountBatchesNeedingAttention(ctx, today, now.Add(-closedUnsentAfter))
+			counts, err := counter.CountBatchesNeedingAttention(ctx, today, now.Add(-closedUnsentAfter), now.Add(-outboxStuckAfter))
 			if err != nil {
 				slog.ErrorContext(ctx, "failed to count batches needing attention", slog.String("error", err.Error()))
 				return nil
@@ -156,9 +167,10 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 			observe("disputed", counts.Disputed)
 			observe("closed_unsent", counts.ClosedUnsent)
 			observe("open_overdue", counts.OpenOverdue)
+			o.ObserveInt64(outboxGauge, counts.OutboxStuck)
 			return nil
 		},
-		gauge,
+		gauge, outboxGauge,
 	)
 	return err
 }
