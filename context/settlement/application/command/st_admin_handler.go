@@ -2,10 +2,12 @@ package command
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
 	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/juantevez/go-posnet/context/settlement/application/port"
@@ -13,6 +15,7 @@ import (
 	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
 	"github.com/juantevez/go-posnet/context/settlement/domain/service"
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
+	"github.com/juantevez/go-posnet/pkg/domain"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
 	"github.com/juantevez/go-posnet/pkg/observability"
 	"github.com/juantevez/go-posnet/pkg/outbox"
@@ -28,6 +31,18 @@ type AdminHandler struct {
 	outbox     *outbox.Store
 	pool       pgutil.PgxPool
 	mdrPercent float64
+	reviews    repository.ReversalReviewLog // opcional; nil = no considera las revisiones
+	timezones  repository.MerchantTimezones // opcional
+}
+
+// SetReversalReviews habilita las revisiones de reversas: frenan el envío de sus lotes.
+func (h *AdminHandler) SetReversalReviews(reviews repository.ReversalReviewLog) {
+	h.reviews = reviews
+}
+
+// SetMerchantTimezones habilita la configuración de la zona de negocio por comercio.
+func (h *AdminHandler) SetMerchantTimezones(timezones repository.MerchantTimezones) {
+	h.timezones = timezones
 }
 
 func NewAdminHandler(batchRepo repository.SettlementBatchRepository, processor service.SettlementProcessor) *AdminHandler {
@@ -159,22 +174,27 @@ func (h *AdminHandler) ResubmitBatch(ctx context.Context, cmd port.ResubmitBatch
 		Action: repository.AuditActionResubmit, OperatorID: cmd.OperatorID,
 		FromState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
 	}
-	if batch.Discrepancies() > 0 {
-		if err := batch.MarkDisputed("resubmit blocked: batch has discrepancies"); err != nil {
+	openReviews, err := h.openReviews(ctx, batch.ID())
+	if err != nil {
+		return fmt.Errorf("ResubmitBatch: %w", err)
+	}
+	if batch.Discrepancies() > 0 || openReviews > 0 {
+		if err := batch.MarkDisputed("resubmit blocked: batch has discrepancies or reversals under review"); err != nil {
 			return fmt.Errorf("ResubmitBatch: %w", err)
 		}
 		entry.Action = repository.AuditActionResubmitBlocked
 		if err := h.persist(ctx, batch, entry, nil); err != nil {
 			return fmt.Errorf("ResubmitBatch: save: %w", err)
 		}
-		observability.FromContext(ctx).Warn("resubmit blocked by discrepancies — batch moved to DISPUTED",
+		observability.FromContext(ctx).Warn("resubmit blocked — batch moved to DISPUTED",
 			slog.String("batch_id", batch.ID()),
 			slog.String("operator_id", cmd.OperatorID),
 			slog.Int("discrepancies", batch.Discrepancies()),
+			slog.Int("open_reviews", openReviews),
 		)
 		return pkgerrors.NewValidationError(fmt.Sprintf(
-			"batch has %d discrepancies and was moved to DISPUTED; use reopen or resolve-dispute",
-			batch.Discrepancies(),
+			"batch has %d discrepancies and %d reversals under review and was moved to DISPUTED; resolve the reviews, then use reopen or resolve-dispute",
+			batch.Discrepancies(), openReviews,
 		))
 	}
 
@@ -259,6 +279,16 @@ func (h *AdminHandler) ResolveDispute(ctx context.Context, cmd port.ResolveDispu
 	batch, err := h.loadDisputed(ctx, cmd.BatchID, cmd.OperatorID, cmd.Reason)
 	if err != nil {
 		return fmt.Errorf("ResolveDispute: %w", err)
+	}
+	// Aceptar los totales no puede saltear una revisión: el lote se enviaría con esa reversa.
+	openReviews, err := h.openReviews(ctx, batch.ID())
+	if err != nil {
+		return fmt.Errorf("ResolveDispute: %w", err)
+	}
+	if openReviews > 0 {
+		return pkgerrors.NewValidationError(fmt.Sprintf(
+			"batch has %d reversals under review; resolve them first", openReviews,
+		))
 	}
 
 	previousDiscrepancies := batch.Discrepancies()
@@ -376,6 +406,144 @@ func (h *AdminHandler) enqueueCompletedIfDone(ctx context.Context, tx pgx.Tx, se
 			return err
 		}
 	}
+	return nil
+}
+
+// openReviews cuenta las revisiones abiertas de las reversas del lote.
+func (h *AdminHandler) openReviews(ctx context.Context, batchID string) (int, error) {
+	if h.reviews == nil {
+		return 0, nil
+	}
+	n, err := h.reviews.CountOpenReversalReviews(ctx, batchID)
+	if err != nil {
+		return 0, fmt.Errorf("count open reviews: %w", err)
+	}
+	return n, nil
+}
+
+// reviewAuditActions indica qué acción de auditoría deja cada forma de cerrar una revisión.
+var reviewAuditActions = map[string]string{
+	repository.ReviewActionAccept:            repository.AuditActionReviewAccept,
+	repository.ReviewActionUsePurchaseAmount: repository.AuditActionReviewUsePurchaseAmount,
+	repository.ReviewActionExclude:           repository.AuditActionReviewExclude,
+}
+
+// ResolveReversalReview cierra la revisión de una reversa y, si corresponde, corrige el
+// lote. Solo se corrige un lote que no se envió: en OPEN o DISPUTED. Los totales se
+// recalculan al volver a cerrarlo. La corrección, el cierre y la auditoría son atómicos.
+func (h *AdminHandler) ResolveReversalReview(ctx context.Context, cmd port.ResolveReversalReviewCommand) error {
+	ctx, span := observability.StartSpan(ctx, "command.ResolveReversalReview")
+	defer span.End()
+
+	if cmd.TransactionID == "" {
+		return pkgerrors.NewValidationError("transaction_id cannot be empty")
+	}
+	if cmd.OperatorID == "" {
+		return pkgerrors.NewValidationError("operator_id cannot be empty for audit")
+	}
+	if cmd.Resolution == "" {
+		return pkgerrors.NewValidationError("resolution cannot be empty for audit")
+	}
+	auditAction, ok := reviewAuditActions[cmd.Action]
+	if !ok {
+		return pkgerrors.NewValidationError(fmt.Sprintf(
+			"action must be %s, %s or %s", repository.ReviewActionAccept, repository.ReviewActionUsePurchaseAmount, repository.ReviewActionExclude,
+		))
+	}
+	if h.reviews == nil || h.pool == nil {
+		return fmt.Errorf("ResolveReversalReview: reviews are not configured")
+	}
+
+	var batchID string
+	err := pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
+		review, err := h.reviews.LockReversalReviewTx(ctx, tx, cmd.TransactionID)
+		if err != nil {
+			return err
+		}
+		if review == nil {
+			return pkgerrors.NewNotFoundError("ReversalReview", cmd.TransactionID)
+		}
+		if review.Resolved {
+			return pkgerrors.NewValidationError("review is already resolved")
+		}
+		batchID = review.BatchID
+		if err := h.applyReviewAction(ctx, tx, review, cmd.Action); err != nil {
+			return err
+		}
+		if err := h.reviews.CloseReversalReviewTx(ctx, tx, cmd.TransactionID, cmd.OperatorID, cmd.Resolution); err != nil {
+			return err
+		}
+		return h.audit.InsertAuditTx(ctx, tx, repository.BatchAuditEntry{
+			BatchID: review.BatchID, Action: auditAction, OperatorID: cmd.OperatorID, Reason: cmd.Resolution,
+			FromState: review.BatchState, ToState: review.BatchState, PreviousDiscrepancies: review.Discrepancies,
+		})
+	})
+	if err != nil {
+		return fmt.Errorf("ResolveReversalReview: %w", err)
+	}
+
+	observability.FromContext(ctx).Warn("reversal review resolved by operator",
+		slog.String("transaction_id", cmd.TransactionID),
+		slog.String("batch_id", batchID),
+		slog.String("operator_id", cmd.OperatorID),
+		slog.String("action", cmd.Action),
+	)
+	return nil
+}
+
+// applyReviewAction corrige la reversa en el lote, si la acción lo pide y el lote lo permite.
+func (h *AdminHandler) applyReviewAction(ctx context.Context, tx pgx.Tx, review *repository.StoredReversalReview, action string) error {
+	if action == repository.ReviewActionAccept {
+		return nil
+	}
+	if review.BatchState != valueobject.BatchStateOpen.String() && review.BatchState != valueobject.BatchStateDisputed.String() {
+		return pkgerrors.NewValidationError(fmt.Sprintf(
+			"batch must be OPEN or DISPUTED to correct it, current state is %s; use ACCEPT and adjust it with the processor", review.BatchState,
+		))
+	}
+	if action == repository.ReviewActionExclude {
+		return h.reviews.DeleteReversalTx(ctx, tx, review.BatchID, review.TransactionID)
+	}
+	if review.Reason != repository.ReversalReviewAmountMismatch || review.Purchase == nil {
+		return pkgerrors.NewValidationError(fmt.Sprintf(
+			"%s only applies to %s, this review is %s", repository.ReviewActionUsePurchaseAmount, repository.ReversalReviewAmountMismatch, review.Reason,
+		))
+	}
+	return h.reviews.UpdateReversalAmountTx(ctx, tx, review.BatchID, review.TransactionID, review.Purchase.AmountCents)
+}
+
+// SetMerchantTimezone define la zona del día de negocio de un comercio. Rige para las
+// operaciones siguientes: los lotes ya creados conservan su fecha.
+func (h *AdminHandler) SetMerchantTimezone(ctx context.Context, cmd port.SetMerchantTimezoneCommand) error {
+	ctx, span := observability.StartSpan(ctx, "command.SetMerchantTimezone")
+	defer span.End()
+
+	merchantID, err := domain.ParseMerchantID(cmd.MerchantID)
+	if err != nil {
+		return pkgerrors.NewValidationError("invalid merchant_id")
+	}
+	if cmd.OperatorID == "" {
+		return pkgerrors.NewValidationError("operator_id cannot be empty for audit")
+	}
+	// LoadLocation también acepta "" y "Local", que no significan lo mismo en cada servidor.
+	if _, err := time.LoadLocation(cmd.Timezone); err != nil || cmd.Timezone == "" || cmd.Timezone == "Local" {
+		return pkgerrors.NewValidationError("timezone must be a valid IANA name")
+	}
+	if h.timezones == nil {
+		return fmt.Errorf("SetMerchantTimezone: timezones are not configured")
+	}
+	err = h.timezones.SetMerchantTimezone(ctx, merchantID.String(), cmd.Timezone, cmd.OperatorID)
+	if errors.Is(err, repository.ErrUnknownTimezone) {
+		return pkgerrors.NewValidationError("timezone must be a valid IANA name")
+	}
+	if err != nil {
+		return fmt.Errorf("SetMerchantTimezone: %w", err)
+	}
+	observability.FromContext(ctx).Warn("merchant business timezone changed by operator",
+		slog.String("merchant_id", merchantID.String()),
+		slog.String("timezone", cmd.Timezone),
+		slog.String("operator_id", cmd.OperatorID),
+	)
 	return nil
 }
 

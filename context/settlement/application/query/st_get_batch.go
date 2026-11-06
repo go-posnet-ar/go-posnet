@@ -15,7 +15,21 @@ import (
 
 // BatchQueryHandler implementa las consultas de solo lectura del BC Settlement.
 type BatchQueryHandler struct {
-	batchRepo repository.SettlementBatchRepository
+	batchRepo       repository.SettlementBatchRepository
+	reviews         repository.ReversalReviewLog
+	timezones       repository.MerchantTimezones
+	defaultTimezone string
+}
+
+// ConfigureReviews habilita la consulta de las revisiones de reversas.
+func (h *BatchQueryHandler) ConfigureReviews(reviews repository.ReversalReviewLog) {
+	h.reviews = reviews
+}
+
+// ConfigureTimezones habilita la consulta de la zona de negocio de un comercio.
+func (h *BatchQueryHandler) ConfigureTimezones(timezones repository.MerchantTimezones, defaultTimezone string) {
+	h.timezones = timezones
+	h.defaultTimezone = defaultTimezone
 }
 
 func NewBatchQueryHandler(batchRepo repository.SettlementBatchRepository) *BatchQueryHandler {
@@ -112,4 +126,64 @@ func (h *BatchQueryHandler) ListBatchesByMerchant(
 	}
 
 	return results, nil
+}
+
+// maxListedReviews limita la respuesta de ListOpenReversalReviews. Muchas revisiones
+// abiertas apuntan a un problema general, que no se resuelve de a una.
+const maxListedReviews = 200
+
+// ListOpenReversalReviews lista las revisiones abiertas, de la más antigua a la más nueva.
+func (h *BatchQueryHandler) ListOpenReversalReviews(ctx context.Context) ([]port.ReversalReviewResult, error) {
+	ctx, span := observability.StartSpan(ctx, "query.ListOpenReversalReviews")
+	defer span.End()
+
+	if h.reviews == nil {
+		return nil, fmt.Errorf("ListOpenReversalReviews: reviews are not configured")
+	}
+	reviews, err := h.reviews.ListOpenReversalReviews(ctx, maxListedReviews)
+	if err != nil {
+		return nil, fmt.Errorf("ListOpenReversalReviews: %w", err)
+	}
+	results := make([]port.ReversalReviewResult, 0, len(reviews))
+	for _, v := range reviews {
+		r := port.ReversalReviewResult{
+			TransactionID:  v.TransactionID,
+			BatchID:        v.BatchID,
+			BatchState:     v.BatchState,
+			Reason:         v.Reason,
+			MerchantID:     v.MerchantID,
+			ReversalAmount: v.AmountCents,
+			Currency:       v.Currency,
+			CreatedAt:      v.CreatedAt.UTC().Format(time.RFC3339),
+		}
+		if p := v.Purchase; p != nil {
+			r.PurchaseMerchantID = &p.MerchantID
+			r.PurchaseAmount = &p.AmountCents
+			r.PurchaseCurrency = &p.Currency
+		}
+		results = append(results, r)
+	}
+	return results, nil
+}
+
+// MerchantTimezone devuelve la zona de negocio vigente de un comercio.
+func (h *BatchQueryHandler) MerchantTimezone(ctx context.Context, merchantID string) (*port.MerchantTimezoneResult, error) {
+	ctx, span := observability.StartSpan(ctx, "query.MerchantTimezone")
+	defer span.End()
+
+	merchant, err := domain.ParseMerchantID(merchantID)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError("invalid merchant_id")
+	}
+	if h.timezones == nil {
+		return nil, fmt.Errorf("MerchantTimezone: timezones are not configured")
+	}
+	name, err := h.timezones.MerchantTimezone(ctx, merchant.String())
+	if err != nil {
+		return nil, fmt.Errorf("MerchantTimezone: %w", err)
+	}
+	if name == "" {
+		return &port.MerchantTimezoneResult{MerchantID: merchant.String(), Timezone: h.defaultTimezone, Source: "default"}, nil
+	}
+	return &port.MerchantTimezoneResult{MerchantID: merchant.String(), Timezone: name, Source: "merchant"}, nil
 }

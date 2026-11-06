@@ -200,6 +200,12 @@ func (b *SettlementBatch) ResolveDispute() error {
 	return nil
 }
 
+// BackendTotals devuelve la cantidad y el monto neto de las transacciones actuales del lote.
+func (b *SettlementBatch) BackendTotals() (int, int64, error) {
+	_, count, amount, err := b.calculateSummary()
+	return count, amount, err
+}
+
 // calculateSummary calcula los totales del backend a partir de las transacciones.
 func (b *SettlementBatch) calculateSummary() (valueobject.BatchSummary, int, int64, error) {
 	var purchaseCount, reversalCount int

@@ -54,8 +54,12 @@ func (f *fakeBatchRepo) ListByMerchantDate(context.Context, domain.MerchantID, t
 	return f.listResult, f.listErr
 }
 
-func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, error) {
+func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time, string) ([]string, error) {
 	return nil, nil
+}
+
+func (f *fakeBatchRepo) ClosedTotalsForTerminalDay(context.Context, domain.TerminalID, time.Time, string, string) (int, int64, error) {
+	return 0, 0, nil
 }
 
 // panickyBatchRepo simula un bug en la capa de aplicación para probar que
@@ -90,8 +94,12 @@ func (p *panickyBatchRepo) ListByMerchantDate(context.Context, domain.MerchantID
 	return nil, nil
 }
 
-func (p *panickyBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, error) {
+func (p *panickyBatchRepo) FindStaleOpenIDs(context.Context, time.Time, string) ([]string, error) {
 	return nil, nil
+}
+
+func (p *panickyBatchRepo) ClosedTotalsForTerminalDay(context.Context, domain.TerminalID, time.Time, string, string) (int, int64, error) {
+	return 0, 0, nil
 }
 
 // ─── fakeProcessor ───────────────────────────────────────────────────────────

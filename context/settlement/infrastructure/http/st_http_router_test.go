@@ -23,7 +23,7 @@ func newRouterFor(repo repository.SettlementBatchRepository, pool *fakePool) htt
 func newRouterWithKey(repo repository.SettlementBatchRepository, pool *fakePool, key string) http.Handler {
 	queryHandler := query.NewBatchQueryHandler(repo)
 	adminHandler := command.NewAdminHandler(repo, &fakeProcessor{})
-	return NewRouter(queryHandler, adminHandler, pool, key, nil)
+	return NewRouter(queryHandler, adminHandler, pool, key, nil, nil)
 }
 
 func TestNewRouter_Routes(t *testing.T) {

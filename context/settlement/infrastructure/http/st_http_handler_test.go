@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -78,6 +79,43 @@ func TestHandleReady_DatabaseUnavailable(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestHandleReady_Schema(t *testing.T) {
+	cases := []struct {
+		name       string
+		missing    []string
+		err        error
+		want       int
+		wantReason string
+	}{
+		{"completo", nil, nil, http.StatusOK, ""},
+		{"falta una tabla", []string{"settlement.merchant_timezones"}, nil, http.StatusServiceUnavailable, "database schema incomplete"},
+		{"no se puede consultar", nil, errors.New("connection reset"), http.StatusServiceUnavailable, "database unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTestHandler(&fakeBatchRepo{}, &fakePool{})
+			h.missingTables = func(context.Context) ([]string, error) { return tc.missing, tc.err }
+
+			rec := httptest.NewRecorder()
+			newTestMux(h).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
+			}
+			if tc.wantReason == "" {
+				return
+			}
+			body := decodeJSON(t, rec.Body.Bytes())
+			if body["reason"] != tc.wantReason {
+				t.Errorf("reason = %v, want %q", body["reason"], tc.wantReason)
+			}
+			if strings.Contains(rec.Body.String(), "settlement.") {
+				t.Errorf("body = %s: the endpoint has no token, it should not name tables", rec.Body)
+			}
+		})
 	}
 }
 

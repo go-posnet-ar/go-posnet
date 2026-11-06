@@ -42,6 +42,10 @@ type fakeBatchRepo struct {
 
 	staleIDs []string
 	staleErr error
+
+	priorCount  int
+	priorAmount int64
+	priorErr    error
 }
 
 var _ repository.SettlementBatchRepository = (*fakeBatchRepo)(nil)
@@ -93,8 +97,12 @@ func (f *fakeBatchRepo) ListByMerchantDate(context.Context, domain.MerchantID, t
 	return f.listResult, f.listErr
 }
 
-func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, error) {
+func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time, string) ([]string, error) {
 	return f.staleIDs, f.staleErr
+}
+
+func (f *fakeBatchRepo) ClosedTotalsForTerminalDay(context.Context, domain.TerminalID, time.Time, string, string) (int, int64, error) {
+	return f.priorCount, f.priorAmount, f.priorErr
 }
 
 // ─── fakePublisher / fakeProcessor ───────────────────────────────────────────

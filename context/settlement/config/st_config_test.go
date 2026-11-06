@@ -424,3 +424,12 @@ func TestValidate_AdminAPIKey(t *testing.T) {
 		})
 	}
 }
+
+func TestValidate_CloseMaxAgeDays(t *testing.T) {
+	for days, wantErr := range map[int]bool{-1: true, 0: false, 7: false} {
+		cfg := Config{Settlement: SettlementConfig{CloseMaxAgeDays: days, BusinessTimezone: "UTC"}}
+		if err := cfg.validate(); (err != nil) != wantErr {
+			t.Errorf("validate(%d) error = %v, wantErr %v", days, err, wantErr)
+		}
+	}
+}

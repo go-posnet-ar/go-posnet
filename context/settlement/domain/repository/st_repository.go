@@ -46,9 +46,15 @@ type SettlementBatchRepository interface {
 	// Usado para generar el reporte de liquidación diaria.
 	ListByMerchantDate(ctx context.Context, merchantID domain.MerchantID, date time.Time) ([]*aggregate.SettlementBatch, error)
 
-	// FindStaleOpenIDs lista los batches OPEN de fechas anteriores a before.
+	// FindStaleOpenIDs lista los batches OPEN de días de negocio anteriores al de now, en
+	// la zona de cada comercio o, si no tiene una, en defaultTimezone.
 	// Usado por el job de cierre automático.
-	FindStaleOpenIDs(ctx context.Context, before time.Time) ([]string, error)
+	FindStaleOpenIDs(ctx context.Context, now time.Time, defaultTimezone string) ([]string, error)
+
+	// ClosedTotalsForTerminalDay suma los totales de los lotes ya cerrados del terminal en
+	// esa fecha y moneda, sin contar excludeBatchID. Los lotes en DISPUTED no cuentan: sus
+	// totales no están conciliados.
+	ClosedTotalsForTerminalDay(ctx context.Context, terminalID domain.TerminalID, date time.Time, currency, excludeBatchID string) (count int, amountCents int64, err error)
 }
 
 // MerchantDayBatch resume un batch para decidir si se completó la liquidación diaria.
@@ -66,6 +72,11 @@ const (
 	AuditActionReopen          = "REOPEN"
 	AuditActionResolveDispute  = "RESOLVE_DISPUTE"
 	AuditActionSettle          = "SETTLE"
+	AuditActionRecoverReversal = "RECOVER_REVERSAL"
+
+	AuditActionReviewAccept            = "REVIEW_ACCEPT"
+	AuditActionReviewUsePurchaseAmount = "REVIEW_USE_PURCHASE_AMOUNT"
+	AuditActionReviewExclude           = "REVIEW_EXCLUDE"
 )
 
 // BatchAuditEntry registra un cambio de estado hecho por un operador. OperatorID lo
@@ -96,6 +107,16 @@ const (
 	ReversalReviewAmountMismatch   = "AMOUNT_MISMATCH"
 )
 
+// Formas de cerrar una revisión.
+const (
+	// ReviewActionAccept deja la reversa como está: el monto del evento es correcto.
+	ReviewActionAccept = "ACCEPT"
+	// ReviewActionUsePurchaseAmount cambia el monto de la reversa por el de la compra.
+	ReviewActionUsePurchaseAmount = "USE_PURCHASE_AMOUNT"
+	// ReviewActionExclude quita la reversa del lote: no debe descontarse.
+	ReviewActionExclude = "EXCLUDE"
+)
+
 // ReversalPurchase es la compra registrada a la que apunta una reversa.
 type ReversalPurchase struct {
 	MerchantID  string
@@ -115,10 +136,20 @@ type ReversalReview struct {
 	Purchase      *ReversalPurchase
 }
 
-// ReversalReviewLog valida las reversas contra sus compras. Todos los métodos corren en
-// la transacción que registra la reversa o la compra.
+// StoredReversalReview es una revisión guardada, con el estado actual de su lote.
+type StoredReversalReview struct {
+	ReversalReview
+	BatchState    string
+	Discrepancies int
+	Resolved      bool
+	CreatedAt     time.Time
+}
+
+// ReversalReviewLog valida las reversas contra sus compras y gestiona sus revisiones.
 type ReversalReviewLog interface {
 	// FindPurchaseTx devuelve la compra de la transacción, o nil si no está registrada.
+	// Espera a que termine cualquier otra compra o reversa de la misma transacción: quien
+	// llama ve lo que esa confirmó.
 	FindPurchaseTx(ctx context.Context, tx pgx.Tx, transactionID string) (*ReversalPurchase, error)
 
 	// InsertReversalReviewTx abre la revisión. Una transacción tiene una sola revisión.
@@ -126,9 +157,43 @@ type ReversalReviewLog interface {
 
 	// ReconcileReversalReviewTx actualiza la revisión de una reversa que llegó antes que
 	// su compra: la cierra si coinciden o cambia el motivo si no. Devuelve el resultado
-	// (vacío si no había revisión abierta, o el motivo vigente) y si quedó cerrada.
+	// (vacío si no había revisión abierta, o el motivo vigente) y si quedó cerrada. Se
+	// serializa con FindPurchaseTx por transacción.
 	ReconcileReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID string, purchase ReversalPurchase) (reason string, resolved bool, err error)
+
+	// CountOpenReversalReviews cuenta las revisiones abiertas de las reversas de un lote.
+	CountOpenReversalReviews(ctx context.Context, batchID string) (int, error)
+
+	// ListOpenReversalReviews lista las revisiones abiertas, de la más antigua a la más nueva.
+	ListOpenReversalReviews(ctx context.Context, limit int) ([]StoredReversalReview, error)
+
+	// LockReversalReviewTx bloquea el lote y la revisión hasta el fin de tx, y la devuelve.
+	// Retorna nil si no existe.
+	LockReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID string) (*StoredReversalReview, error)
+
+	// UpdateReversalAmountTx cambia el monto de la reversa en su lote. Avanza la versión del
+	// lote: quien lo haya cargado antes recibe ErrStaleBatch y no pisa el cambio.
+	UpdateReversalAmountTx(ctx context.Context, tx pgx.Tx, batchID, transactionID string, amountCents int64) error
+
+	// DeleteReversalTx quita la reversa de su lote. Avanza la versión, igual que UpdateReversalAmountTx.
+	DeleteReversalTx(ctx context.Context, tx pgx.Tx, batchID, transactionID string) error
+
+	// CloseReversalReviewTx cierra la revisión con el operador y la resolución indicados.
+	CloseReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID, operatorID, resolution string) error
 }
+
+// MerchantTimezones guarda la zona del día de negocio de cada comercio.
+type MerchantTimezones interface {
+	// MerchantTimezone devuelve la zona del comercio, o vacío si no tiene una propia.
+	MerchantTimezone(ctx context.Context, merchantID string) (string, error)
+
+	// SetMerchantTimezone guarda la zona. Retorna ErrUnknownTimezone si Postgres no la
+	// reconoce: las consultas por día de negocio fallarían para todos los comercios.
+	SetMerchantTimezone(ctx context.Context, merchantID, timezone, operatorID string) error
+}
+
+// ErrUnknownTimezone indica que la base de datos no reconoce la zona horaria.
+var ErrUnknownTimezone = errors.New("timezone is not known to the database")
 
 // BatchAttentionCounts son los lotes que requieren atención de un operador.
 type BatchAttentionCounts struct {
@@ -142,5 +207,7 @@ type BatchAttentionCounts struct {
 // BatchAttentionCounter cuenta los lotes que requieren atención. Es un puerto aparte
 // porque solo lo usan las métricas.
 type BatchAttentionCounter interface {
-	CountBatchesNeedingAttention(ctx context.Context, today, closedBefore, outboxBefore, reviewBefore time.Time) (BatchAttentionCounts, error)
+	// El vencimiento de los lotes OPEN se calcula con el día de negocio de now, en la zona
+	// de cada comercio o, si no tiene una, en defaultTimezone.
+	CountBatchesNeedingAttention(ctx context.Context, now time.Time, defaultTimezone string, closedBefore, outboxBefore, reviewBefore time.Time) (BatchAttentionCounts, error)
 }

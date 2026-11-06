@@ -118,6 +118,8 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	}
 	batchHandler.SetMetrics(settlementMetrics)
 	batchHandler.SetReversalReviews(batchRepo)
+	batchHandler.SetMerchantTimezones(batchRepo)
+	batchHandler.SetMaxCloseAge(cfg.Settlement.CloseMaxAgeDays)
 	businessLocation, err := time.LoadLocation(cfg.Settlement.BusinessTimezone)
 	if err != nil {
 		return nil, fmt.Errorf("wire: load business timezone: %w", err)
@@ -128,7 +130,11 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	}
 	adminHandler := command.NewAdminHandler(batchRepo, processor)
 	adminHandler.ConfigureSettlement(pool, batchRepo, eventPub, outboxStore, cfg.Settlement.MDRPercent)
+	adminHandler.SetReversalReviews(batchRepo)
+	adminHandler.SetMerchantTimezones(batchRepo)
 	queryHandler := query.NewBatchQueryHandler(batchRepo)
+	queryHandler.ConfigureReviews(batchRepo)
+	queryHandler.ConfigureTimezones(batchRepo, cfg.Settlement.BusinessTimezone)
 
 	// ── Adaptadores de entrada ─────────────────────────────────────────────────
 
@@ -142,7 +148,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	if cfg.Settlement.AdminAPIKey == "" {
 		slog.Warn("SETTLEMENT_ADMIN_API_KEY is not configured — admin write operations are disabled")
 	}
-	router := httpinfra.NewRouter(queryHandler, adminHandler, pool, cfg.Settlement.AdminAPIKey, natsConn.IsConnected)
+	router := httpinfra.NewRouter(queryHandler, adminHandler, pool, cfg.Settlement.AdminAPIKey, natsConn.IsConnected, batchRepo.MissingTables)
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,
@@ -212,16 +218,20 @@ func (a *app) start(ctx context.Context) error {
 	}()
 	slog.Info("HTTP server starting", slog.String("addr", a.httpSrv.Addr))
 
-	// Job de cierre automático de lotes — corre a BatchCloseHour UTC cada día
+	// Job de cierre automático de lotes — revisa cada 15 minutos desde BatchCloseHour UTC
 	go a.runBatchCloser(ctx)
 	slog.Info("batch closer job active")
 
 	return nil
 }
 
-// runBatchCloser es el job periódico de cierre automático de lotes. Revisa cada
+// batchCloseSweep es cada cuánto se buscan lotes vencidos desde BatchCloseHour. Cada
+// comercio puede tener otra medianoche: hay zonas con desfasajes de 15, 30 y 45 minutos.
+const batchCloseSweep = 15 * time.Minute
+
+// runBatchCloser es el job periódico de cierre automático de lotes. Comprueba cada
 // minuto, y también al arrancar, para no perder la corrida si el servicio estaba
-// caído a la hora de cierre. Reintenta mientras alguna corrida del día tenga fallas.
+// caído a la hora de cierre. Reintenta mientras la última corrida tenga fallas.
 func (a *app) runBatchCloser(ctx context.Context) {
 	if a.batchCloseHour == 0 {
 		slog.Info("automatic batch close disabled")
@@ -231,11 +241,11 @@ func (a *app) runBatchCloser(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
-	var lastRunDate string
+	var lastSweep time.Time
 	run := func(now time.Time) {
 		utc := now.UTC()
-		today := utc.Format("2006-01-02")
-		if utc.Hour() < a.batchCloseHour || lastRunDate == today {
+		sweep := utc.Truncate(batchCloseSweep)
+		if utc.Hour() < a.batchCloseHour || sweep.Equal(lastSweep) {
 			return
 		}
 
@@ -244,13 +254,15 @@ func (a *app) runBatchCloser(ctx context.Context) {
 			slog.Error("automatic batch close failed", slog.String("error", err.Error()))
 			return
 		}
-		slog.Info("automatic batch close finished",
-			slog.String("date", today),
-			slog.Int("closed", closed),
-			slog.Int("failed", failed),
-		)
+		if closed > 0 || failed > 0 {
+			slog.Info("automatic batch close finished",
+				slog.Time("sweep", sweep),
+				slog.Int("closed", closed),
+				slog.Int("failed", failed),
+			)
+		}
 		if failed == 0 {
-			lastRunDate = today
+			lastSweep = sweep
 		}
 	}
 

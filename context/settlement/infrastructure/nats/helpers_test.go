@@ -103,8 +103,12 @@ func (f *fakeBatchRepo) ListByMerchantDate(context.Context, domain.MerchantID, t
 	return nil, nil
 }
 
-func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, error) {
+func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time, string) ([]string, error) {
 	return nil, nil
+}
+
+func (f *fakeBatchRepo) ClosedTotalsForTerminalDay(context.Context, domain.TerminalID, time.Time, string, string) (int, int64, error) {
+	return 0, 0, nil
 }
 
 // ─── fakeDomainPublisher / fakeProcessor ─────────────────────────────────────

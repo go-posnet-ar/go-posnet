@@ -53,7 +53,7 @@ type SettlementConfig struct {
 
 	// BatchCloseHour es la hora UTC desde la que corre el cierre automático, que
 	// alcanza a los lotes OPEN de días de negocio anteriores. Default: 3 = 00:00 en
-	// Argentina. Debe ser posterior a la medianoche de BusinessTimezone.
+	// Argentina. Desde esa hora, y hasta el fin del día UTC, revisa cada 15 minutos.
 	// Si es 0, el cierre es solo por pedido del terminal o de un operador.
 	BatchCloseHour int
 
@@ -67,8 +67,13 @@ type SettlementConfig struct {
 	// Processor selecciona el procesador externo: ProcessorNone o ProcessorMock.
 	Processor string
 
-	// BusinessTimezone es la zona IANA que define a qué día pertenece una transacción.
+	// BusinessTimezone es la zona IANA que define a qué día pertenece una transacción, para
+	// los comercios sin una zona propia en settlement.merchant_timezones.
 	BusinessTimezone string
+
+	// CloseMaxAgeDays es la antigüedad máxima, en días, del batch_date que puede pedir un
+	// terminal. Un lote más viejo lo cierra el job automático o un operador. 0 = sin límite.
+	CloseMaxAgeDays int
 
 	// AdminAPIKey es el token que exigen las operaciones de escritura de la API HTTP.
 	// Vacío = esas operaciones quedan deshabilitadas.
@@ -125,6 +130,7 @@ func Load() (*Config, error) {
 			Processor:      envStr("SETTLEMENT_PROCESSOR", ProcessorNone),
 
 			BusinessTimezone: envStr("SETTLEMENT_BUSINESS_TIMEZONE", "America/Argentina/Buenos_Aires"),
+			CloseMaxAgeDays:  envInt("SETTLEMENT_CLOSE_MAX_AGE_DAYS", 7),
 			AdminAPIKey:      envStr("SETTLEMENT_ADMIN_API_KEY", ""),
 		},
 	}
@@ -144,6 +150,9 @@ func (c *Config) validate() error {
 	if c.Settlement.BatchCloseHour < 0 || c.Settlement.BatchCloseHour > 23 {
 		return fmt.Errorf("config: SETTLEMENT_BATCH_CLOSE_HOUR %d out of range [0, 23]",
 			c.Settlement.BatchCloseHour)
+	}
+	if c.Settlement.CloseMaxAgeDays < 0 {
+		return fmt.Errorf("config: SETTLEMENT_CLOSE_MAX_AGE_DAYS %d cannot be negative", c.Settlement.CloseMaxAgeDays)
 	}
 	switch c.Settlement.Processor {
 	case "", ProcessorNone, ProcessorMock:

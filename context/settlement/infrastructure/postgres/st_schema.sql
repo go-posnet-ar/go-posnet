@@ -119,3 +119,12 @@ CREATE TABLE IF NOT EXISTS settlement.reversal_reviews (
 );
 CREATE INDEX IF NOT EXISTS idx_reversal_reviews_open ON settlement.reversal_reviews (created_at)
     WHERE resolved_at IS NULL;
+
+-- ─── merchant_timezones (zona del día de negocio, por comercio) ──────────────
+
+CREATE TABLE IF NOT EXISTS settlement.merchant_timezones (
+    merchant_id UUID        PRIMARY KEY,
+    timezone    TEXT        NOT NULL,
+    updated_by  TEXT        NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);

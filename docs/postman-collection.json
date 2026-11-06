@@ -92,6 +92,10 @@
     {
       "key": "poll_attempts",
       "value": ""
+    },
+    {
+      "key": "tz_merchant_id",
+      "value": ""
     }
   ],
   "item": [
@@ -2942,12 +2946,31 @@
               "name": "SF-05 Forzar el cierre",
               "event": [
                 {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// El lote se crea vacío antes de que se confirme la venta, y un lote OPEN informa totales en 0:",
+                      "// no hay forma de consultarlo. Se espera a que entre la venta, para no cerrarlo sin ella.",
+                      "setTimeout(function () {}, 1000);"
+                    ]
+                  }
+                },
+                {
                   "listen": "test",
                   "script": {
                     "type": "text/javascript",
                     "exec": [
-                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
-                      "pm.test('status = closed', function () { pm.expect(pm.response.json().status).to.eql('closed'); });"
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "// 409: otro proceso modificó el lote. La API indica consultarlo y repetir.",
+                      "if (pm.response.code === 409 && n < 5) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "  pm.test('status = closed', function () { pm.expect(pm.response.json().status).to.eql('closed'); });",
+                      "}"
                     ]
                   }
                 }
@@ -3132,6 +3155,300 @@
             "method": "GET",
             "url": "{{base_url_st}}/batches/{{batch_id}}"
           }
+        },
+        {
+          "name": "Revisiones de reversas y zona horaria",
+          "description": "Generar una revisión real requiere una reversa que no coincida con su compra, que Authorization no produce: el cierre de revisiones con cambios se valida en los tests.",
+          "item": [
+            {
+              "name": "RV-A1 Listar las revisiones abiertas",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('Lista y cantidad coinciden', function () { var b = pm.response.json(); pm.expect(b.reviews).to.be.an('array'); pm.expect(b.count).to.eql(b.reviews.length); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/reversal-reviews"
+              }
+            },
+            {
+              "name": "RV-A2 Cerrar una revisión sin token",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 401', function () { pm.response.to.have.status(401); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/reversal-reviews/00000000-0000-4000-8000-000000000001/resolve",
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\",\n  \"resolution\": \"Prueba de Postman\",\n  \"action\": \"ACCEPT\"\n}"
+                },
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "RV-A3 Cerrar una revisión inexistente",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 404', function () { pm.response.to.have.status(404); });",
+                      "pm.test('Código NOT_FOUND', function () { pm.expect(pm.response.json().error).to.eql('NOT_FOUND'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/reversal-reviews/00000000-0000-4000-8000-000000000001/resolve",
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\",\n  \"resolution\": \"Prueba de Postman\",\n  \"action\": \"ACCEPT\"\n}"
+                },
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  },
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "RV-A4 Cerrar con un ID inválido",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 400', function () { pm.response.to.have.status(400); });",
+                      "pm.test('Código INVALID_ID', function () { pm.expect(pm.response.json().error).to.eql('INVALID_ID'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/reversal-reviews/no-es-uuid/resolve",
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\",\n  \"resolution\": \"Prueba de Postman\",\n  \"action\": \"ACCEPT\"\n}"
+                },
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  },
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "RV-A5 Cerrar con una acción inválida",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 400', function () { pm.response.to.have.status(400); });",
+                      "pm.test('Código VALIDATION_ERROR', function () { pm.expect(pm.response.json().error).to.eql('VALIDATION_ERROR'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/reversal-reviews/00000000-0000-4000-8000-000000000001/resolve",
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\",\n  \"resolution\": \"Prueba de Postman\",\n  \"action\": \"BORRAR\"\n}"
+                },
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  },
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "TZ-01 Comercio sin zona propia",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "// Un comercio nuevo en cada corrida: no cambia la zona de los comercios de prueba.",
+                      "pm.collectionVariables.set('tz_merchant_id', pm.variables.replaceIn('{{$guid}}'));"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('Usa la zona general', function () { pm.expect(pm.response.json().source).to.eql('default'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/merchants/{{tz_merchant_id}}/timezone"
+              }
+            },
+            {
+              "name": "TZ-02 Definir la zona sin token",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 401', function () { pm.response.to.have.status(401); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "PUT",
+                "url": "{{base_url_st}}/merchants/{{tz_merchant_id}}/timezone",
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"timezone\": \"America/Mexico_City\",\n  \"operator_id\": \"postman\"\n}"
+                },
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "TZ-03 Definir una zona inválida",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 400', function () { pm.response.to.have.status(400); });",
+                      "pm.test('Código VALIDATION_ERROR', function () { pm.expect(pm.response.json().error).to.eql('VALIDATION_ERROR'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "PUT",
+                "url": "{{base_url_st}}/merchants/{{tz_merchant_id}}/timezone",
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"timezone\": \"Marte/Base\",\n  \"operator_id\": \"postman\"\n}"
+                },
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  },
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "TZ-04 Definir la zona del comercio",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('Queda actualizada', function () { pm.expect(pm.response.json().status).to.eql('updated'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "PUT",
+                "url": "{{base_url_st}}/merchants/{{tz_merchant_id}}/timezone",
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"timezone\": \"America/Mexico_City\",\n  \"operator_id\": \"postman\"\n}"
+                },
+                "header": [
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  },
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ]
+              }
+            },
+            {
+              "name": "TZ-05 Comercio con zona propia",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('Usa su zona', function () { var b = pm.response.json(); pm.expect(b.source).to.eql('merchant'); pm.expect(b.timezone).to.eql('America/Mexico_City'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/merchants/{{tz_merchant_id}}/timezone"
+              }
+            }
+          ]
         }
       ]
     },
@@ -3328,7 +3645,8 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                  "pm.test('Responde 202', function () { pm.response.to.have.status(202); });",
+                  "pm.test('status = retry_dispatched', function () { pm.expect(pm.response.json().status).to.eql('retry_dispatched'); });"
                 ]
               }
             }

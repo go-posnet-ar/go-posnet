@@ -102,14 +102,15 @@ func TestProcessBatchClose_MetricCountsClosedBatch(t *testing.T) {
 type fakeAttentionCounter struct {
 	counts       repository.BatchAttentionCounts
 	err          error
-	today        time.Time
+	now          time.Time
+	timezone     string
 	closedBefore time.Time
 	outboxBefore time.Time
 	reviewBefore time.Time
 }
 
-func (f *fakeAttentionCounter) CountBatchesNeedingAttention(_ context.Context, today, closedBefore, outboxBefore, reviewBefore time.Time) (repository.BatchAttentionCounts, error) {
-	f.today, f.closedBefore, f.outboxBefore, f.reviewBefore = today, closedBefore, outboxBefore, reviewBefore
+func (f *fakeAttentionCounter) CountBatchesNeedingAttention(_ context.Context, now time.Time, timezone string, closedBefore, outboxBefore, reviewBefore time.Time) (repository.BatchAttentionCounts, error) {
+	f.now, f.timezone, f.closedBefore, f.outboxBefore, f.reviewBefore = now, timezone, closedBefore, outboxBefore, reviewBefore
 	return f.counts, f.err
 }
 
@@ -162,9 +163,8 @@ func TestBatchAttentionGauge_ReportsEveryReason(t *testing.T) {
 		}
 	}
 
-	y, m, d := before.In(loc).Date()
-	if wantToday := time.Date(y, m, d, 0, 0, 0, 0, time.UTC); !counter.today.Equal(wantToday) {
-		t.Errorf("today = %v, want business date %v", counter.today, wantToday)
+	if counter.now.Before(before) || counter.timezone != loc.String() {
+		t.Errorf("now, timezone = %v, %q, want the scrape time and %q", counter.now, counter.timezone, loc.String())
 	}
 	if counter.closedBefore.After(before.Add(-time.Hour + time.Minute)) {
 		t.Errorf("closedBefore = %v, want about one hour ago", counter.closedBefore)

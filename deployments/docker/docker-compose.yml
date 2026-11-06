@@ -223,7 +223,8 @@ services:
       nats:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:8084/healthz || exit 1"]
+      # /readyz: Docker lo marca unhealthy si falta una migración o se pierde Postgres o NATS.
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8084/readyz || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5

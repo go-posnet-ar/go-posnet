@@ -7,7 +7,7 @@ Este runbook describe el estado **actual** del sistema, no el previsto. Revisado
 
 | Herramienta | Dónde (Docker Compose) | Estado |
 |---|---|---|
-| Health checks | `/healthz` y `/readyz` de cada servicio | Funcionan; `readyz` verifica Postgres, y en Settlement también NATS |
+| Health checks | `/healthz` y `/readyz` de cada servicio | Funcionan; `readyz` verifica Postgres, y en Settlement también las tablas requeridas y NATS |
 | Logs JSON | `docker logs posnet-<servicio>` | Funcionan; primera herramienta para un caso puntual |
 | Métricas | Prometheus en `localhost:9099`, `/metrics` de cada servicio | Funcionan |
 | Dashboards | Grafana en `localhost:3000` | Saga, detalle por servicio, SLO, runtime e infraestructura |
@@ -43,7 +43,7 @@ Detection 8082, Settlement 8083 y Notification 8084.
 
 ```bash
 curl -s http://localhost:<port>/healthz   # 200 si el proceso está vivo
-curl -s http://localhost:<port>/readyz    # hace ping a Postgres (en Settlement, también NATS)
+curl -s http://localhost:<port>/readyz    # hace ping a Postgres (en Settlement, también tablas y NATS)
 curl -s http://localhost:8222/healthz     # estado del servidor NATS
 
 docker ps --filter name=posnet- --format '{{.Names}}\t{{.Status}}'
@@ -52,6 +52,11 @@ docker inspect -f '{{.RestartCount}}' posnet-settlement
 
 `readyz` en `503` con `{"reason": "database unavailable"}` indica que el proceso está vivo pero no
 alcanza Postgres: andá a la [sección 4](#4-postgres).
+
+En Settlement, `503` con `{"reason": "database schema incomplete"}` indica que falta aplicar una
+[migración](../technical/SETTLEMENT.md#aplicar-la-migración); el log `required tables are missing` nombra la tabla.
+Settlement es el único servicio cuyo `healthcheck` de Docker usa `readyz`: un contenedor `posnet-settlement` en
+`unhealthy` puede indicar eso o una caída de Postgres o NATS, aunque el proceso esté vivo.
 
 **`readyz` no verifica NATS, salvo en Settlement,** donde responde `503` con `{"reason": "nats unavailable"}`.
 Los demás servicios pueden responder `200` sin poder consumir ni publicar eventos, por eso conviene

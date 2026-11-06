@@ -2,8 +2,10 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -28,6 +30,8 @@ type Handler struct {
 	pool         pgutil.PgxPool
 	// natsConnected informa el estado de la conexión a NATS; nil = sin verificar.
 	natsConnected func() bool
+	// missingTables informa las tablas que faltan en la base; nil = sin verificar.
+	missingTables func(ctx context.Context) ([]string, error)
 }
 
 func NewHandler(
@@ -49,6 +53,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /batches/{id}/reopen", requireBatchID(h.handleReopenBatch))
 	mux.HandleFunc("POST /batches/{id}/resolve-dispute", requireBatchID(h.handleResolveDispute))
 	mux.HandleFunc("POST /batches/{id}/settle", requireBatchID(h.handleSettleBatch))
+	mux.HandleFunc("GET  /reversal-reviews", h.handleListReversalReviews)
+	mux.HandleFunc("POST /reversal-reviews/{transaction_id}/resolve", h.handleResolveReversalReview)
+	mux.HandleFunc("GET  /merchants/{merchant_id}/timezone", h.handleGetMerchantTimezone)
+	mux.HandleFunc("PUT  /merchants/{merchant_id}/timezone", h.handleSetMerchantTimezone)
 }
 
 // requireBatchID rechaza un {id} que no sea un UUID canónico. Sin esto llega a
@@ -74,6 +82,26 @@ func (h *Handler) handleReady(w http.ResponseWriter, r *http.Request) {
 			"status": "not ready", "reason": "database unavailable",
 		})
 		return
+	}
+	if h.missingTables != nil {
+		missing, err := h.missingTables(r.Context())
+		if err != nil {
+			observability.FromContext(r.Context()).Error("readiness: could not check the schema", slog.String("error", err.Error()))
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"status": "not ready", "reason": "database unavailable",
+			})
+			return
+		}
+		// Los nombres van al log: este endpoint no pide token.
+		if len(missing) > 0 {
+			observability.FromContext(r.Context()).Error("readiness: required tables are missing — apply the migrations",
+				slog.Any("tables", missing),
+			)
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"status": "not ready", "reason": "database schema incomplete",
+			})
+			return
+		}
 	}
 	if h.natsConnected != nil && !h.natsConnected() {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
@@ -297,6 +325,94 @@ func (h *Handler) writeAdminResult(w http.ResponseWriter, r *http.Request, err e
 	}
 	observability.RecordError(r.Context(), err)
 	writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", "internal error"))
+}
+
+// GET /reversal-reviews
+func (h *Handler) handleListReversalReviews(w http.ResponseWriter, r *http.Request) {
+	ctx, span := observability.StartSpan(r.Context(), "http.ListReversalReviews")
+	defer span.End()
+
+	reviews, err := h.queryHandler.ListOpenReversalReviews(ctx)
+	if err != nil {
+		observability.RecordError(ctx, err)
+		writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", "internal error"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"reviews": reviews, "count": len(reviews)})
+}
+
+// POST /reversal-reviews/{transaction_id}/resolve
+func (h *Handler) handleResolveReversalReview(w http.ResponseWriter, r *http.Request) {
+	ctx, span := observability.StartSpan(r.Context(), "http.ResolveReversalReview")
+	defer span.End()
+
+	transactionID := r.PathValue("transaction_id")
+	if len(transactionID) != canonicalUUIDLength || uuid.Validate(transactionID) != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("INVALID_ID", "transaction id must be a UUID"))
+		return
+	}
+	var body struct {
+		OperatorID string `json:"operator_id"`
+		Resolution string `json:"resolution"`
+		Action     string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("INVALID_BODY", "invalid request body"))
+		return
+	}
+
+	err := h.adminHandler.ResolveReversalReview(ctx, port.ResolveReversalReviewCommand{
+		TransactionID: transactionID,
+		OperatorID:    body.OperatorID,
+		Resolution:    body.Resolution,
+		Action:        body.Action,
+	})
+	var notFound *pkgerrors.NotFoundError
+	if errors.As(err, &notFound) {
+		writeJSON(w, http.StatusNotFound, errResp("NOT_FOUND", "reversal review not found"))
+		return
+	}
+	h.writeAdminResult(w, r, err, "resolved")
+}
+
+// GET /merchants/{merchant_id}/timezone
+func (h *Handler) handleGetMerchantTimezone(w http.ResponseWriter, r *http.Request) {
+	ctx, span := observability.StartSpan(r.Context(), "http.GetMerchantTimezone")
+	defer span.End()
+
+	result, err := h.queryHandler.MerchantTimezone(ctx, r.PathValue("merchant_id"))
+	if err != nil {
+		var validationErr *pkgerrors.ValidationError
+		if errors.As(err, &validationErr) {
+			writeJSON(w, http.StatusBadRequest, errResp("VALIDATION_ERROR", err.Error()))
+			return
+		}
+		observability.RecordError(ctx, err)
+		writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", "internal error"))
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// PUT /merchants/{merchant_id}/timezone
+func (h *Handler) handleSetMerchantTimezone(w http.ResponseWriter, r *http.Request) {
+	ctx, span := observability.StartSpan(r.Context(), "http.SetMerchantTimezone")
+	defer span.End()
+
+	var body struct {
+		Timezone   string `json:"timezone"`
+		OperatorID string `json:"operator_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("INVALID_BODY", "invalid request body"))
+		return
+	}
+	err := h.adminHandler.SetMerchantTimezone(ctx, port.SetMerchantTimezoneCommand{
+		MerchantID: r.PathValue("merchant_id"),
+		Timezone:   body.Timezone,
+		OperatorID: body.OperatorID,
+	})
+	h.writeAdminResult(w, r, err, "updated")
 }
 
 func writeJSON(w http.ResponseWriter, code int, body any) {

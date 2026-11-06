@@ -58,8 +58,12 @@ func (f *fakeBatchRepo) ListByMerchantDate(_ context.Context, merchantID domain.
 	return f.listResult, f.listErr
 }
 
-func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time) ([]string, error) {
+func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time, string) ([]string, error) {
 	return nil, nil
+}
+
+func (f *fakeBatchRepo) ClosedTotalsForTerminalDay(context.Context, domain.TerminalID, time.Time, string, string) (int, int64, error) {
+	return 0, 0, nil
 }
 
 // ─── builders ────────────────────────────────────────────────────────────────

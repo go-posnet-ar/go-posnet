@@ -138,5 +138,5 @@ groups:
           severity: warning
         annotations:
           summary: "{{ $value }} reversas en revisión"
-          description: "Hay reversas sin compra o que no coinciden con ella. Se descontaron con el monto del evento (batch-close-failure.md, Escenario H)."
+          description: "Hay reversas sin compra o que no coinciden con ella. Sus lotes no se envían hasta cerrar la revisión (batch-close-failure.md, Escenario H)."
 

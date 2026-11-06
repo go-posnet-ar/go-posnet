@@ -134,7 +134,8 @@ func (m *Metrics) RecordBatchClosed(ctx context.Context, currency, state string,
 }
 
 // RegisterBatchAttentionGauge publica los lotes que requieren atención, consultando la
-// base en cada scrape. El cálculo es por zona de negocio, igual que el cierre automático.
+// base en cada scrape. Loc es la zona de los comercios sin una propia, igual que en el cierre
+// automático.
 // Si la consulta falla, la serie no se informa en ese scrape: un cero ocultaría los lotes.
 func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *time.Location) error {
 	gauge, err := observability.Meter("posnet.settlement").Int64ObservableGauge(
@@ -164,10 +165,7 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 			defer cancel()
 
 			now := time.Now()
-			y, m, d := now.In(loc).Date()
-			today := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
-
-			counts, err := counter.CountBatchesNeedingAttention(ctx, today, now.Add(-closedUnsentAfter), now.Add(-outboxStuckAfter), now.Add(-reversalReviewAfter))
+			counts, err := counter.CountBatchesNeedingAttention(ctx, now, loc.String(), now.Add(-closedUnsentAfter), now.Add(-outboxStuckAfter), now.Add(-reversalReviewAfter))
 			if err != nil {
 				slog.ErrorContext(ctx, "failed to count batches needing attention", slog.String("error", err.Error()))
 				return nil

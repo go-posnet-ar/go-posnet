@@ -112,6 +112,21 @@ type SettleBatchCommand struct {
 	OperatorID string // Para auditoría
 }
 
+// ResolveReversalReviewCommand cierra la revisión de una reversa.
+type ResolveReversalReviewCommand struct {
+	TransactionID string
+	OperatorID    string // Para auditoría
+	Resolution    string // Qué se hizo y por qué; ticket si lo hay
+	Action        string // ACCEPT, USE_PURCHASE_AMOUNT o EXCLUDE
+}
+
+// SetMerchantTimezoneCommand define la zona del día de negocio de un comercio.
+type SetMerchantTimezoneCommand struct {
+	MerchantID string
+	Timezone   string // Zona IANA
+	OperatorID string // Para auditoría
+}
+
 // ListBatchesCommand filtra batches por comercio y fecha.
 type ListBatchesCommand struct {
 	MerchantID string
@@ -134,4 +149,26 @@ type BatchResult struct {
 	ClosedAt      string
 	SubmittedAt   string
 	SettledAt     string
+}
+
+// ReversalReviewResult es una revisión abierta de una reversa.
+type ReversalReviewResult struct {
+	TransactionID      string  `json:"transaction_id"`
+	BatchID            string  `json:"batch_id"`
+	BatchState         string  `json:"batch_state"`
+	Reason             string  `json:"reason"`
+	MerchantID         string  `json:"merchant_id"`
+	ReversalAmount     int64   `json:"reversal_amount"`
+	Currency           string  `json:"currency"`
+	PurchaseMerchantID *string `json:"purchase_merchant_id"`
+	PurchaseAmount     *int64  `json:"purchase_amount"`
+	PurchaseCurrency   *string `json:"purchase_currency"`
+	CreatedAt          string  `json:"created_at"`
+}
+
+// MerchantTimezoneResult es la zona de negocio vigente de un comercio.
+type MerchantTimezoneResult struct {
+	MerchantID string `json:"merchant_id"`
+	Timezone   string `json:"timezone"`
+	Source     string `json:"source"` // "merchant" o "default"
 }

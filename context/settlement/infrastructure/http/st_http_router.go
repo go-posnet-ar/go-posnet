@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/juantevez/go-posnet/context/settlement/application/command"
@@ -16,11 +17,13 @@ func NewRouter(
 	pool pgutil.PgxPool,
 	adminAPIKey string,
 	natsConnected func() bool,
+	missingTables func(ctx context.Context) ([]string, error),
 ) http.Handler {
 	mux := http.NewServeMux()
 
 	h := NewHandler(queryHandler, adminHandler, pool)
 	h.natsConnected = natsConnected
+	h.missingTables = missingTables
 	h.RegisterRoutes(mux)
 
 	mux.Handle("GET /metrics", observability.MetricsHandler())

@@ -24,10 +24,11 @@ export AUTH="Authorization: Bearer <token>"
 | `503 ADMIN_API_DISABLED` | El servicio no tiene `SETTLEMENT_ADMIN_API_KEY`. Hay que configurarla y reiniciarlo |
 
 **Si Settlement falla justo después de un despliegue con errores sobre `version`, `settlement.outbox`, `settlement.batch_audit_log` o
-`settlement.reversal_reviews`,**
-falta aplicar las [migraciones](../technical/SETTLEMENT.md#aplicar-la-migración).
+`settlement.reversal_reviews` o `settlement.merchant_timezones`,**
+falta aplicar las [migraciones](../technical/SETTLEMENT.md#aplicar-la-migración). `/readyz` lo confirma: responde `503`
+con `database schema incomplete`, y Docker muestra el contenedor `unhealthy`.
 
-Revisado contra el código el 2026-11-05. Detalle técnico en
+Revisado contra el código el 2026-11-06. Detalle técnico en
 [SETTLEMENT.md](../technical/SETTLEMENT.md). Puerto HTTP en Docker Compose: `8084`.
 
 | Síntoma | Escenario |
@@ -70,8 +71,11 @@ El Relay publica el evento a NATS por separado, con reintentos.
 
 - Hay **un solo lote `OPEN` por terminal, día de negocio y moneda**. Puede haber otros lotes de esa misma
   combinación en otros estados: un terminal que sigue vendiendo tras un cierre abre un lote nuevo.
-- El día de negocio se calcula con `SETTLEMENT_BUSINESS_TIMEZONE` (Argentina por defecto).
-- El cierre usa el `batch_date` del pedido. Sin él, usa el día de negocio del pedido.
+- El día de negocio se calcula con la zona del comercio o, si no tiene una, con `SETTLEMENT_BUSINESS_TIMEZONE`
+  (Argentina por defecto). Se consulta con `GET /merchants/{merchant_id}/timezone`.
+- El cierre usa el `batch_date` del pedido. Sin él, usa el día de negocio del pedido. Un `batch_date` futuro o más
+  antiguo que `SETTLEMENT_CLOSE_MAX_AGE_DAYS` se descarta: en el log, `permanent error` y `batch_date ...`.
+- Un lote con una reversa en revisión no se envía: queda en `DISPUTED`.
 - `terminal_count` cuenta compras y reversas, y `terminal_amount` es el monto neto.
 
 ### Modificar un lote a mano
@@ -91,7 +95,10 @@ BEGIN;
 ## Escenario A — Lote en `DISPUTED`
 
 **Síntoma:** `GET /batches/{id}` devuelve `"State": "DISPUTED"`. En logs: `batch has discrepancies —
-marked as disputed` o `resubmit blocked by discrepancies`.
+marked as disputed`, `batch held — reversals under review` o `resubmit blocked — batch moved to DISPUTED`.
+
+**Si `Discrepancies` es 0, el lote está retenido por una reversa en revisión:** ir al
+[Escenario H](#escenario-h--reversas-en-revisión).
 
 **Causa:** la cantidad o el monto del terminal no coinciden con el backend. Las más comunes:
 
@@ -99,7 +106,7 @@ marked as disputed` o `resubmit blocked by discrepancies`.
 |---|---|
 | Reversa de antes de la corrección | [Escenario E](#escenario-e--reversas-anteriores-sin-descontar) |
 | Aprobaciones que no llegaron al lote | [Escenario D](#escenario-d--aprobaciones-fuera-de-todo-lote) |
-| El terminal no reinició sus contadores | Un cierre anterior ese día, con el mismo total acumulado |
+| El terminal no reinició sus contadores, y un lote anterior de ese día está en `DISPUTED` | El acumulado exacto se concilia solo, salvo que incluya un lote en disputa, que no cuenta. Resolver primero ese lote |
 | El terminal contó solo las compras | La diferencia de cantidad coincide con las reversas del lote |
 | Totales enviados incorrectamente por el terminal | El backend coincide con `pn_authorization.transactions` |
 | Un `force-close` anterior a la corrección | Discrepancias falsas: comparaba contra 0. Los actuales no generan discrepancias |
@@ -261,34 +268,33 @@ ORDER BY t.authorized_at DESC;
 su monto real.
 
 **Causa:** antes, la fila `REVERSAL` se descartaba sin error. Su evento quedó en
-`settlement.processed_events`, de modo que republicarlo no tiene efecto.
+`settlement.processed_events`, de modo que republicarlo no tiene efecto, y puede ya no estar en el stream.
 
-**Diagnóstico:**
+**Diagnóstico:** el comando lista las ventas `REVERSED` en Authorization sin reversa en Settlement, con el lote y
+el estado de su compra. **Sin `-apply`, no cambia nada.** Necesita leer `pn_authorization.transactions`.
 
-```sql
--- Transacciones revertidas sin fila de reversa
-SELECT p.batch_id, b.state AS batch_state, p.transaction_id, p.amount_cents, t.state AS tx_state
-FROM settlement.batch_transactions p
-JOIN settlement.settlement_batches b ON b.id = p.batch_id
-JOIN pn_authorization.transactions t ON t.id = p.transaction_id
-LEFT JOIN settlement.batch_transactions r
-       ON r.transaction_id = p.transaction_id AND r.tx_type = 'REVERSAL'
-WHERE t.state = 'REVERSED' AND p.tx_type = 'PURCHASE' AND r.transaction_id IS NULL
-ORDER BY b.batch_date DESC;
+```bash
+POSTGRES_DSN=... go run ./cmd/settlement-recover-reversals
 ```
 
-**Resolución:** para registrarla, con aprobación, borrá la marca del evento y republicá el
-`auth.reversal-completed` original con [nats-dlq-reprocess.md](nats-dlq-reprocess.md). La reversa entra en
-el lote abierto del momento.
+**Resolución:** registrar las reversas es una decisión financiera y **requiere aprobación**. Revisá antes la lista:
+si la compra ya está en un lote `SUBMITTED` o `SETTLED`, confirmá con el equipo que el tratamiento sea el correcto.
 
-```sql
-BEGIN;
-DELETE FROM settlement.processed_events WHERE event_id = '<event_id>' RETURNING *;
--- COMMIT;  o ROLLBACK;
+```bash
+POSTGRES_DSN=... go run ./cmd/settlement-recover-reversals -apply -operator <tu_usuario> -reason "<ticket>"
 ```
 
-Si la compra ya estaba en un lote `SUBMITTED` o `SETTLED`, el descuento recién impacta en un lote posterior:
-confirmá con el equipo que ese sea el tratamiento correcto.
+Usá la misma `SETTLEMENT_BUSINESS_TIMEZONE` que el servicio, si no es la de Argentina. Cada reversa entra por el flujo
+normal, **en el día de negocio de la compra**, y no en el lote de hoy, cuyo cierre no la espera:
+
+| Lote de ese día | Resultado |
+|---|---|
+| Hay uno `OPEN` | La reversa entra ahí, y el lote queda con el monto neto |
+| Ya no hay uno `OPEN` | Abre un lote nuevo de esa fecha, que **el job automático cierra y envía sin conciliar**, con total negativo. Dentro de `SETTLEMENT_CLOSE_MAX_AGE_DAYS`, también se puede cerrar con un pedido del terminal |
+
+Se puede repetir: lo ya registrado deja de aparecer. Procesa hasta 500 por ejecución, o lo que indique `-limit`.
+Cada reversa queda en la auditoría como `RECOVER_REVERSAL`. Si el comando informa `reversal registered but not
+audited`, la reversa está registrada y falta asentarla a mano en el ticket.
 
 ---
 
@@ -297,8 +303,8 @@ confirmá con el equipo que ese sea el tratamiento correcto.
 **Síntoma:** lotes `OPEN` con `batch_date` pasada. Lo normal es que no persistan: el job automático los
 cierra.
 
-**Cómo funciona el job:** corre desde las **03:00 UTC (00:00 en Argentina)** y al arrancar el servicio.
-Cierra los lotes de días de negocio anteriores con los totales del backend, **sin conciliar con el terminal**,
+**Cómo funciona el job:** revisa cada 15 minutos desde las **03:00 UTC (00:00 en Argentina)** hasta el fin del día
+UTC, y al arrancar el servicio. Cierra los lotes de días de negocio anteriores, en la zona de cada comercio, con los totales del backend, **sin conciliar con el terminal**,
 encola `batch-closed` y los envía al procesador. Log: `batch closed automatically without terminal
 totals`.
 
@@ -308,7 +314,9 @@ totals`.
 SELECT b.id, b.terminal_id, b.batch_date, count(bt.id) AS tx_count, sum(bt.amount_cents) AS amount
 FROM settlement.settlement_batches b
 LEFT JOIN settlement.batch_transactions bt ON bt.batch_id = b.id
-WHERE b.state = 'OPEN' AND b.batch_date < (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::date
+LEFT JOIN settlement.merchant_timezones m ON m.merchant_id = b.merchant_id
+WHERE b.state = 'OPEN'
+  AND b.batch_date < (NOW() AT TIME ZONE COALESCE(m.timezone, 'America/Argentina/Buenos_Aires'))::date
 GROUP BY b.id, b.terminal_id, b.batch_date
 ORDER BY b.batch_date;
 ```
@@ -319,7 +327,8 @@ docker logs posnet-settlement 2>&1 | grep -E 'automatic batch close'
 
 | Si el lote sigue `OPEN` | Causa probable |
 |---|---|
-| Antes de las 03:00 UTC | Todavía no corrió el job de hoy |
+| Antes de las 03:00 UTC | El job no revisa en esa franja: le pasa a los comercios en UTC-1 y UTC-2 |
+| `automatic batch close finished` sin este lote | Todavía no es el día siguiente en la zona de su comercio |
 | `SETTLEMENT_BATCH_CLOSE_HOUR=0` | El job está desactivado |
 | `automatic batch close failed` | Error de cierre: el job reintenta cada minuto |
 | Se reabrió hoy con `reopen` | El job ya lo marcó en la corrida de hoy: lo cierra al día siguiente |
@@ -362,39 +371,41 @@ en `SUBMITTED` y se puede repetir. Con NATS caído, el evento espera en el outbo
 
 **Síntoma:** alerta `ReversasEnRevision`, o `reversal registered for review` en los logs.
 
-**Qué significa:** la reversa ya se descontó, con el monto del evento, pero no coincide con su compra. **El lote
-sigue su ciclo normal:** si el monto está mal, el total enviado también.
+**Qué significa:** la reversa se descontó con el monto del evento, pero no coincide con su compra. **El lote que
+tiene la reversa no se envía** mientras la revisión esté abierta: el cierre lo deja en `DISPUTED` y `resolve-dispute`
+responde `400`.
 
-```sql
--- Revisiones abiertas, con la compra tal como está ahora
-SELECT r.transaction_id, r.reason, r.created_at, r.batch_id, b.state AS batch_state,
-       r.merchant_id, r.reversal_amount, r.reversal_currency,
-       t.amount_cents AS purchase_amount, t.currency AS purchase_currency
-FROM settlement.reversal_reviews r
-JOIN settlement.settlement_batches b ON b.id = r.batch_id
-LEFT JOIN settlement.batch_transactions t ON t.transaction_id = r.transaction_id AND t.tx_type = 'PURCHASE'
-WHERE r.resolved_at IS NULL
-ORDER BY r.created_at;
+```bash
+curl http://<host>:8084/reversal-reviews
 ```
 
-| `reason` | Qué revisar |
-|---|---|
-| `PURCHASE_NOT_FOUND`, con `purchase_amount` completo y coincidente | **Falso positivo:** reversa y compra se procesaron a la vez. Cerrar la revisión |
-| `PURCHASE_NOT_FOUND`, sin compra | Falta la venta en Settlement: [Escenario D](#escenario-d--aprobaciones-fuera-de-todo-lote). Si llega y coincide, la revisión se cierra sola |
-| `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH` | Comparar con la transacción en Authorization: hoy siempre revierte el monto completo, así que apunta a un error |
-| `MERCHANT_MISMATCH` | **Puede descontarle a un comercio una venta de otro.** Escalar antes de enviar el lote |
+| `reason` | Qué revisar | `action` habitual |
+|---|---|---|
+| `PURCHASE_NOT_FOUND` | Falta la venta en Settlement: [Escenario D](#escenario-d--aprobaciones-fuera-de-todo-lote). Si llega y coincide, la revisión se cierra sola | Esperar la compra. Si la venta nunca existió, `EXCLUDE` |
+| `AMOUNT_MISMATCH` | Comparar con la transacción en Authorization: hoy siempre revierte el monto completo, así que apunta a un error | `USE_PURCHASE_AMOUNT` |
+| `CURRENCY_MISMATCH` | Igual que el anterior | `EXCLUDE` |
+| `MERCHANT_MISMATCH` | **Puede descontarle a un comercio una venta de otro.** Escalar antes de corregir | `EXCLUDE` |
 
-Si el lote de `batch_id` aún no se envió y el monto es incorrecto, corregirlo es una decisión financiera: ver
-[Modificar un lote a mano](#modificar-un-lote-a-mano). Después, cerrar la revisión:
+`ACCEPT` deja la reversa como está. Corregir un monto es una decisión financiera: **requiere aprobación**.
 
-```sql
-UPDATE settlement.reversal_reviews
-SET resolved_at = now(), resolved_by = '<operador>', resolution = '<qué se hizo, ticket>'
-WHERE transaction_id = '<transaction_id>' AND resolved_at IS NULL
-RETURNING transaction_id, reason, resolved_by;
+```bash
+curl -X POST http://<host>:8084/reversal-reviews/<transaction_id>/resolve -H "$AUTH" \
+  -d '{"operator_id":"<tu_usuario>","resolution":"<qué se hizo, ticket>","action":"USE_PURCHASE_AMOUNT"}'
 ```
 
-Cerrar la revisión no cambia ningún monto.
+`USE_PURCHASE_AMOUNT` y `EXCLUDE` solo funcionan si el lote está en `OPEN` o `DISPUTED`. **`EXCLUDE` no se deshace:** si
+después llega la compra, suma sin descuento. Con un lote en `CLOSED`, un `resubmit` lo pasa a `DISPUTED`. Con uno
+`SUBMITTED` o `SETTLED`, el dinero ya salió: usá `ACCEPT` y ajustalo con el procesador.
+
+**Cerrar la revisión no libera el lote.** Sigue en `DISPUTED`, también si la revisión se cerró sola. Después:
+
+```bash
+curl -X POST http://<host>:8084/batches/<batch_id>/resolve-dispute -H "$AUTH" \
+  -d '{"operator_id":"<tu_usuario>","reason":"<ticket>"}'
+curl -X POST http://<host>:8084/batches/<batch_id>/resubmit -H "$AUTH" -d '{"operator_id":"<tu_usuario>"}'
+```
+
+`resolve-dispute` recalcula los totales con la corrección. Si el terminal puede volver a cerrar, usá `reopen`.
 
 ---
 
@@ -405,12 +416,16 @@ Cerrar la revisión no cambia ningún monto.
 | `GET /batches/{id}` | Cualquiera | Estado y totales. Un lote `OPEN` muestra totales en 0. Los campos están en PascalCase (`State`, `TotalCount`) |
 | `GET /merchants/{merchant_id}/batches?date=YYYY-MM-DD` | Cualquiera | Lotes del comercio, que pueden ser varios por terminal; `date` es obligatorio |
 | `POST /batches/{id}/force-close` | Solo `OPEN`; otros, `400` | Pasa a `CLOSED` |
-| `POST /batches/{id}/resubmit` | Solo `CLOSED`; otros, `400` | Pasa a `SUBMITTED`, o a `DISPUTED` si tiene discrepancias. Sin procesador, `503` |
+| `POST /batches/{id}/resubmit` | Solo `CLOSED`; otros, `400` | Pasa a `SUBMITTED`, o a `DISPUTED` si tiene discrepancias o una reversa en revisión. Sin procesador, `503` |
 | `POST /batches/{id}/reopen` | Solo `DISPUTED`; otros, `400` | Pasa a `OPEN` |
-| `POST /batches/{id}/resolve-dispute` | Solo `DISPUTED`; otros, `400` | Pasa a `CLOSED`, con los totales del backend |
+| `POST /batches/{id}/resolve-dispute` | Solo `DISPUTED`, sin reversas en revisión; otros, `400` | Pasa a `CLOSED`, con los totales del backend |
 | `POST /batches/{id}/settle` | Solo `SUBMITTED`; otros, `400` | Pasa a `SETTLED` |
+| `GET /reversal-reviews` | — | Revisiones abiertas, hasta 200 |
+| `POST /reversal-reviews/{transaction_id}/resolve` | Revisión abierta; otras, `400` | Cierra la revisión y corrige el lote si corresponde. Inexistente, `404` |
+| `GET /merchants/{merchant_id}/timezone` | — | Zona vigente del comercio |
+| `PUT /merchants/{merchant_id}/timezone` | — | Define la zona del comercio. Rige para las operaciones siguientes |
 
-Todos los `POST` exigen el token y `operator_id`; `reopen` y `resolve-dispute`, también `reason`. Esos datos
+Todos los `POST` y `PUT` exigen el token y `operator_id`; `reopen` y `resolve-dispute`, también `reason`. Esos datos
 quedan en la [auditoría](../technical/SETTLEMENT.md#auditoría-de-operadores), pero `operator_id` lo declara
 quien llama: **anotá también en el ticket quién hizo la operación**. Un `500` puede indicar que falta la
 migración de auditoría: el lote no cambió. Un `409` indica que otro proceso modificó el lote: hay
@@ -438,6 +453,8 @@ FROM settlement.batch_audit_log WHERE batch_id = '<batch_id>' ORDER BY created_a
 SELECT id, terminal_id, merchant_id, batch_date, state, discrepancies, closed_at, submitted_at
 FROM settlement.settlement_batches
 WHERE state IN ('DISPUTED', 'CLOSED', 'SUBMITTED')
-   OR (state = 'OPEN' AND batch_date < (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::date)
+   OR (state = 'OPEN' AND batch_date < (NOW() AT TIME ZONE COALESCE(
+         (SELECT timezone FROM settlement.merchant_timezones m WHERE m.merchant_id = settlement_batches.merchant_id),
+         'America/Argentina/Buenos_Aires'))::date)
 ORDER BY batch_date DESC;
 ```

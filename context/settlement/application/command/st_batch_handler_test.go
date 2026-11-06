@@ -1115,6 +1115,45 @@ type fakeReviews struct {
 	reconcileResolved bool
 	reconcileErr      error
 	reconciled        []repository.ReversalPurchase
+
+	openCount int
+	openErr   error
+
+	stored       *repository.StoredReversalReview
+	lockErr      error
+	updateAmount int64
+	updateCalls  int
+	deleteCalls  int
+	closedBy     string
+	closedNote   string
+}
+
+func (f *fakeReviews) CountOpenReversalReviews(context.Context, string) (int, error) {
+	return f.openCount, f.openErr
+}
+
+func (f *fakeReviews) ListOpenReversalReviews(context.Context, int) ([]repository.StoredReversalReview, error) {
+	return nil, nil
+}
+
+func (f *fakeReviews) LockReversalReviewTx(context.Context, pgx.Tx, string) (*repository.StoredReversalReview, error) {
+	return f.stored, f.lockErr
+}
+
+func (f *fakeReviews) UpdateReversalAmountTx(_ context.Context, _ pgx.Tx, _, _ string, amount int64) error {
+	f.updateCalls++
+	f.updateAmount = amount
+	return nil
+}
+
+func (f *fakeReviews) DeleteReversalTx(context.Context, pgx.Tx, string, string) error {
+	f.deleteCalls++
+	return nil
+}
+
+func (f *fakeReviews) CloseReversalReviewTx(_ context.Context, _ pgx.Tx, _, operator, resolution string) error {
+	f.closedBy, f.closedNote = operator, resolution
+	return nil
 }
 
 func (f *fakeReviews) FindPurchaseTx(context.Context, pgx.Tx, string) (*repository.ReversalPurchase, error) {
