@@ -1,4 +1,6 @@
-version: "3.9"
+# Sin un nombre fijo, el proyecto toma el del directorio ("docker") y comparte
+# volúmenes con otros proyectos que usen ese mismo nombre.
+name: posnet
 
 networks:
   posnet:

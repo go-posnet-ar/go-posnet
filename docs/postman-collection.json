@@ -1,354 +1,3474 @@
 {
   "info": {
     "name": "posnet-backend — Colección Completa",
-    "description": "Colección completa de todos los endpoints del sistema POSNET.\nIncliye flujo feliz, casos de error y operaciones de soporte.\n\nVariables de entorno requeridas:\n  - base_url_auth:   http://localhost:8080\n  - base_url_tg:     http://localhost:8081\n  - base_url_fd:     http://localhost:8083\n  - base_url_st:     http://localhost:8084\n  - base_url_nt:     http://localhost:8085",
+    "description": "Colección de los endpoints de POSNET, con flujos que se pueden correr de punta a punta.\n\n**Antes de empezar**\n\n1. Levantar el stack con Docker Compose.\n2. Cargar `st_admin_api_key` en las variables de la colección, con el valor de `SETTLEMENT_ADMIN_API_KEY` de `.env.docker`. **No guardar la clave en este archivo.** Sin ella, las escrituras de Settlement responden `401`.\n\n**Cómo correrla**\n\nUsar el Runner: los pasos \"Esperar\" y \"Verificar\" se repiten hasta ver el resultado, y solo así funcionan los saltos y las esperas. Se puede correr la colección entera o una carpeta.\n\n```bash\nnpx newman@6 run docs/postman-collection.json --env-var st_admin_api_key=<clave>\n```\n\n**Efectos**\n\nCrea ventas y lotes reales en el entorno. Los flujos fuerzan el cierre del lote abierto del terminal para conocer sus totales. La carpeta de fraude cambia una regla y la restaura.\n\n**Otros valores**\n\n`business_date` se calcula en cada request con UTC-3, la zona de negocio por defecto. Si cambia `SETTLEMENT_BUSINESS_TIMEZONE`, hay que ajustar el script de la colección.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
+  "event": [
+    {
+      "listen": "prerequest",
+      "script": {
+        "type": "text/javascript",
+        "exec": [
+          "// Día de negocio: UTC-3, como SETTLEMENT_BUSINESS_TIMEZONE por defecto.",
+          "pm.collectionVariables.set('business_date', new Date(Date.now() - 3 * 3600 * 1000).toISOString().slice(0, 10));"
+        ]
+      }
+    }
+  ],
   "variable": [
-    { "key": "base_url_auth", "value": "http://localhost:8080" },
-    { "key": "base_url_tg",   "value": "http://localhost:8081" },
-    { "key": "base_url_fd",   "value": "http://localhost:8083" },
-    { "key": "base_url_st",   "value": "http://localhost:8084" },
-    { "key": "st_admin_api_key", "value": "" },
-    { "key": "base_url_nt",   "value": "http://localhost:8085" },
-    { "key": "transaction_id", "value": "" },
-    { "key": "terminal_id",    "value": "a1b2c3d4-e5f6-7890-abcd-ef1234567890" },
-    { "key": "merchant_id",    "value": "b2c3d4e5-f6a7-8901-bcde-f12345678901" },
-    { "key": "batch_id",       "value": "" },
-    { "key": "notification_id","value": "" }
+    {
+      "key": "base_url_auth",
+      "value": "http://localhost:8080"
+    },
+    {
+      "key": "base_url_tg",
+      "value": "http://localhost:8081"
+    },
+    {
+      "key": "base_url_fd",
+      "value": "http://localhost:8083"
+    },
+    {
+      "key": "base_url_st",
+      "value": "http://localhost:8084"
+    },
+    {
+      "key": "st_admin_api_key",
+      "value": ""
+    },
+    {
+      "key": "base_url_nt",
+      "value": "http://localhost:8085"
+    },
+    {
+      "key": "transaction_id",
+      "value": ""
+    },
+    {
+      "key": "terminal_id",
+      "value": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+    },
+    {
+      "key": "merchant_id",
+      "value": "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+    },
+    {
+      "key": "batch_id",
+      "value": ""
+    },
+    {
+      "key": "notification_id",
+      "value": ""
+    },
+    {
+      "key": "business_date",
+      "value": ""
+    },
+    {
+      "key": "tx_amount",
+      "value": ""
+    },
+    {
+      "key": "close_count",
+      "value": ""
+    },
+    {
+      "key": "close_amount",
+      "value": ""
+    },
+    {
+      "key": "open_batch_id",
+      "value": ""
+    },
+    {
+      "key": "dead_notification_id",
+      "value": ""
+    },
+    {
+      "key": "cancel_session_id",
+      "value": ""
+    },
+    {
+      "key": "poll_attempts",
+      "value": ""
+    }
   ],
   "item": [
-
     {
       "name": "🏥 Health Checks — Todos los BCs",
       "item": [
         {
           "name": "Authorization — /healthz",
-          "request": { "method": "GET", "url": "{{base_url_auth}}/healthz" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_auth}}/healthz"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Authorization — /readyz",
-          "request": { "method": "GET", "url": "{{base_url_auth}}/readyz" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_auth}}/readyz"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Terminal Gateway — /healthz",
-          "request": { "method": "GET", "url": "{{base_url_tg}}/healthz" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_tg}}/healthz"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Terminal Gateway — /readyz",
-          "request": { "method": "GET", "url": "{{base_url_tg}}/readyz" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_tg}}/readyz"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Fraud Detection — /healthz",
-          "request": { "method": "GET", "url": "{{base_url_fd}}/healthz" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_fd}}/healthz"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Fraud Detection — /readyz",
-          "request": { "method": "GET", "url": "{{base_url_fd}}/readyz" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_fd}}/readyz"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Settlement — /healthz",
-          "request": { "method": "GET", "url": "{{base_url_st}}/healthz" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/healthz"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Settlement — /readyz",
-          "request": { "method": "GET", "url": "{{base_url_st}}/readyz" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/readyz"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Notification — /healthz",
-          "request": { "method": "GET", "url": "{{base_url_nt}}/healthz" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_nt}}/healthz"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Notification — /readyz",
-          "request": { "method": "GET", "url": "{{base_url_nt}}/readyz" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_nt}}/readyz"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         }
       ]
     },
-
     {
       "name": "✅ Flujo Feliz — Compra Aprobada E2E",
-      "description": "Simula una transacción aprobada completa.\nEl flujo real es asíncrono vía NATS — estos endpoints representan\ncada paso del ciclo desde el punto de vista de operaciones.",
+      "description": "Del pago a la liquidación. Exige `st_admin_api_key` y `SETTLEMENT_PROCESSOR=mock`, el valor de Docker Compose. Correr con el Runner: los pasos de espera se repiten solos.",
       "item": [
         {
-          "name": "1. Verificar estado de sesión activa del terminal",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url_tg}}/sessions/{{transaction_id}}",
-            "description": "Antes de iniciar, verificar que no hay sesión activa en el terminal"
-          }
-        },
-        {
-          "name": "2. Consultar transacción en Authorization (después de procesar)",
-          "event": [{
-            "listen": "test",
-            "script": {
-              "exec": [
-                "var json = pm.response.json();",
-                "if (json.transaction_id) {",
-                "  pm.collectionVariables.set('transaction_id', json.transaction_id);",
-                "}"
-              ]
+          "name": "FF-00 Preparar: buscar un lote abierto de ejecuciones anteriores",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                  "var lot = (pm.response.json().batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; });",
+                  "pm.collectionVariables.set('open_batch_id', lot ? lot.ID : '');",
+                  "if (!lot) { postman.setNextRequest(\"FF-01 Crear sesión QR\"); }"
+                ]
+              }
             }
-          }],
+          ],
           "request": {
             "method": "GET",
-            "url": "{{base_url_auth}}/transactions/{{transaction_id}}",
-            "description": "Consultar estado APPROVED de la transacción"
+            "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date={{business_date}}"
           }
         },
         {
-          "name": "3. Verificar FraudCase creado",
+          "name": "FF-00 Preparar: cerrar ese lote",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
           "request": {
-            "method": "GET",
-            "url": "{{base_url_fd}}/fraud-cases/{{transaction_id}}",
-            "description": "Verificar que el score de fraude fue calculado (APPROVE)"
+            "method": "POST",
+            "url": "{{base_url_st}}/batches/{{open_batch_id}}/force-close",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{st_admin_api_key}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operator_id\": \"postman\"\n}"
+            },
+            "description": "Los lotes abiertos no informan sus totales: sin este paso, el cierre no podría coincidir."
           }
         },
         {
-          "name": "4. Verificar transacción en batch de Settlement",
+          "name": "FF-01 Crear sesión QR",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('tx_amount', 10000 + Math.floor(Math.random() * 90000));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                  "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                ]
+              }
+            }
+          ],
           "request": {
-            "method": "GET",
-            "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date=2025-06-04",
-            "description": "Verificar que la tx fue incluida en el batch OPEN del día"
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/create",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+            }
           }
         },
         {
-          "name": "5. Verificar notificaciones generadas",
+          "name": "FF-02 Pagar",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                ]
+              }
+            }
+          ],
           "request": {
-            "method": "GET",
-            "url": "{{base_url_nt}}/transactions/{{transaction_id}}/notifications",
-            "description": "Debe haber 2 notificaciones: TERMINAL_WEBSOCKET + WEBHOOK"
-          }
-        }
-      ]
-    },
-
-    {
-      "name": "❌ Flujo Error — Transacción Rechazada",
-      "item": [
-        {
-          "name": "Consultar transacción rechazada",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url_auth}}/transactions/{{transaction_id}}",
-            "description": "State debe ser REJECTED con rejection_code y rejection_reason"
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+            }
           }
         },
         {
-          "name": "Verificar FraudCase — score APPROVE pero rechazo del emisor",
+          "name": "FF-03 Esperar el resultado de la Saga",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.state === 'APPROVED'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"La sesión termina en APPROVED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status",
+            "description": "Reintenta hasta 40 veces cada 500 ms. En una request suelta, muestra solo el estado actual."
+          }
+        },
+        {
+          "name": "FF-04 Verificar la sesión en Terminal Gateway",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Sesión APPROVED', function () { pm.expect(pm.response.json().State).to.eql('APPROVED'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_tg}}/sessions/{{transaction_id}}"
+          }
+        },
+        {
+          "name": "FF-05 Consultar la transacción en Authorization",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.State === 'APPROVED'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"Transacción APPROVED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "    pm.test('Monto correcto', function () { pm.expect(json.AmountCents).to.eql(Number(pm.collectionVariables.get('tx_amount'))); });",
+                  "    pm.test('Tiene código de autorización', function () { pm.expect(json.AuthCode).to.not.be.empty; });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_auth}}/transactions/{{transaction_id}}"
+          }
+        },
+        {
+          "name": "FF-06 Verificar el caso de fraude",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.Decision === 'APPROVE'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"Decisión APPROVE\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "}"
+                ]
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "url": "{{base_url_fd}}/fraud-cases/{{transaction_id}}"
           }
         },
         {
-          "name": "Verificar notificación de rechazo al terminal",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url_nt}}/transactions/{{transaction_id}}/notifications",
-            "description": "Solo 1 notificación: TERMINAL_WEBSOCKET (rechazos no generan webhook)"
-          }
-        }
-      ]
-    },
-
-    {
-      "name": "🔍 Flujo Error — Rechazo por Fraude",
-      "item": [
-        {
-          "name": "Consultar transacción rechazada por fraude",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url_auth}}/transactions/{{transaction_id}}",
-            "description": "rejection_source debe ser FRAUD"
-          }
-        },
-        {
-          "name": "Ver detalle del FraudCase — score >= 70",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url_fd}}/fraud-cases/{{transaction_id}}",
-            "description": "decision=REJECT, score>=70, rules_hit mostrando reglas activadas"
-          }
-        }
-      ]
-    },
-
-    {
-      "name": "↩️ Flujo Reversal — Anulación",
-      "item": [
-        {
-          "name": "Verificar estado REVERSED en Authorization",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url_auth}}/transactions/{{transaction_id}}",
-            "description": "State debe ser REVERSED"
-          }
-        },
-        {
-          "name": "Verificar batch actualizado en Settlement",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date=2025-06-04",
-            "description": "La tx revertida debe aparecer como REVERSAL en el batch"
-          }
-        }
-      ]
-    },
-
-    {
-      "name": "📦 Settlement — Cierre de Lote",
-      "item": [
-        {
-          "name": "Listar batches del comercio por fecha",
-          "request": {
-            "method": "GET",
-            "url": {
-              "raw": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date=2025-06-04",
-              "query": [{ "key": "date", "value": "2025-06-04" }]
-            }
-          }
-        },
-        {
-          "name": "Consultar batch por ID",
-          "event": [{
-            "listen": "prerequest",
-            "script": {
-              "exec": ["// Setear batch_id desde la respuesta anterior"]
-            }
-          }],
-          "request": {
-            "method": "GET",
-            "url": "{{base_url_st}}/batches/{{batch_id}}"
-          }
-        },
-        {
-          "name": "Force Close — cierre manual de batch (operaciones)",
-          "request": {
-            "method": "POST",
-            "url": "{{base_url_st}}/batches/{{batch_id}}/force-close",
-            "header": [
-              { "key": "Content-Type", "value": "application/json" },
-              { "key": "Authorization", "value": "Bearer {{st_admin_api_key}}" }
-            ],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"operator_id\": \"ops-user-001\"\n}"
+          "name": "FF-07 Verificar las notificaciones",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
             },
-            "description": "Solo usar en soporte — el cierre normal lo hace el terminal vía NATS"
-          }
-        },
-        {
-          "name": "Verificar batch CLOSED con summary",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url_st}}/batches/{{batch_id}}",
-            "description": "State=CLOSED, total_count y total_amount calculados"
-          }
-        }
-      ]
-    },
-
-    {
-      "name": "🔔 Notification — Gestión",
-      "item": [
-        {
-          "name": "Consultar notificación por ID",
-          "request": {
-            "method": "GET",
-            "url": "{{base_url_nt}}/notifications/{{notification_id}}"
-          }
-        },
-        {
-          "name": "Listar notificaciones de una transacción",
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.count >= 1; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"Se generaron notificaciones\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "    if (json.notifications && json.notifications[0]) { pm.collectionVariables.set('notification_id', json.notifications[0].ID); }",
+                  "}"
+                ]
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "url": "{{base_url_nt}}/transactions/{{transaction_id}}/notifications"
           }
         },
         {
-          "name": "Listar notificaciones DEAD (fallidas definitivamente)",
+          "name": "FF-08 Verificar la venta en un lote abierto",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return !!(json.batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; }); })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"La venta abre un lote nuevo\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "    var lot = (json.batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; }); if (lot) { pm.collectionVariables.set('batch_id', lot.ID); }",
+                  "}"
+                ]
+              }
+            }
+          ],
           "request": {
             "method": "GET",
-            "url": {
-              "raw": "{{base_url_nt}}/notifications/dead?limit=20",
-              "query": [{ "key": "limit", "value": "20" }]
+            "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date={{business_date}}"
+          }
+        },
+        {
+          "name": "FF-09 Cerrar el lote con totales correctos",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('close_count', 1);",
+                  "pm.collectionVariables.set('close_amount', pm.collectionVariables.get('tx_amount'));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/batch-close",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"batch_date\": \"{{business_date}}\",\n  \"terminal_count\": {{close_count}},\n  \"terminal_amount\": {{close_amount}},\n  \"currency\": \"ARS\"\n}"
+            },
+            "description": "Es asíncrono: Terminal Gateway responde 202 y Settlement lo procesa por NATS."
+          }
+        },
+        {
+          "name": "FF-10 Verificar el lote SUBMITTED",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.State === 'SUBMITTED'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"El lote queda en SUBMITTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "    pm.test(\"Sin discrepancias\", function () { pm.expect(json.Discrepancies === 0).to.be.true; });",
+                  "    pm.test(\"Una transacción\", function () { pm.expect(json.TotalCount === 1).to.be.true; });",
+                  "    pm.test(\"Monto de la venta\", function () { pm.expect(json.TotalAmount === Number(pm.collectionVariables.get('tx_amount'))).to.be.true; });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/batches/{{batch_id}}"
+          }
+        },
+        {
+          "name": "FF-11 Confirmar la liquidación",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('status = settled', function () { pm.expect(pm.response.json().status).to.eql('settled'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_st}}/batches/{{batch_id}}/settle",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{st_admin_api_key}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operator_id\": \"postman\"\n}"
             }
           }
         },
         {
-          "name": "Force Retry — reintento manual de notificación DEAD",
+          "name": "FF-12 Verificar el lote SETTLED",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.State === 'SETTLED'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"El lote queda en SETTLED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "}"
+                ]
+              }
+            }
+          ],
           "request": {
-            "method": "POST",
-            "url": "{{base_url_nt}}/notifications/{{notification_id}}/force-retry",
-            "description": "Fuerza un reintento de entrega sin esperar el backoff"
+            "method": "GET",
+            "url": "{{base_url_st}}/batches/{{batch_id}}"
           }
         }
       ]
     },
-
     {
-      "name": "🛡️ Fraud Detection — Gestión de Reglas",
+      "name": "❌ Flujo Error — Rechazo del emisor y errores de API",
+      "description": "**El rechazo del emisor no se puede provocar:** `MockAcquirerGateway` siempre aprueba. Para probar un rechazo, usar la carpeta de fraude.",
       "item": [
         {
-          "name": "Listar reglas activas con umbrales",
+          "name": "ER-01 Transacción inexistente",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 404', function () { pm.response.to.have.status(404); });"
+                ]
+              }
+            }
+          ],
           "request": {
             "method": "GET",
-            "url": "{{base_url_fd}}/rules",
-            "description": "Ver todas las reglas: score_weight y threshold_value actuales"
+            "url": "{{base_url_auth}}/transactions/00000000-0000-4000-8000-000000000000"
           }
         },
         {
-          "name": "Ver FraudCase por transaction_id",
+          "name": "ER-02 ID de transacción inválido",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 400', function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_auth}}/transactions/no-es-un-uuid"
+          }
+        },
+        {
+          "name": "ER-03 Sesión con monto inválido",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 400', function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/create",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount_cents\": 0\n}"
+            }
+          }
+        },
+        {
+          "name": "ER-04 Pagar una sesión inexistente",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 404', function () { pm.response.to.have.status(404); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/00000000-0000-4000-8000-000000000000/pay",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{}"
+            }
+          }
+        },
+        {
+          "name": "ER-05 Caso de fraude inexistente",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 404', function () { pm.response.to.have.status(404); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_fd}}/fraud-cases/00000000-0000-4000-8000-000000000000"
+          }
+        },
+        {
+          "name": "ER-06 Lote inexistente",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 404', function () { pm.response.to.have.status(404); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/batches/00000000-0000-4000-8000-000000000000"
+          }
+        },
+        {
+          "name": "ER-07 ID de lote inválido",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 400', function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/batches/no-es-un-uuid"
+          }
+        },
+        {
+          "name": "ER-08 Lotes sin fecha",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 400', function () { pm.response.to.have.status(400); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches"
+          }
+        },
+        {
+          "name": "ER-09 Escritura de Settlement sin token",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 401', function () { pm.response.to.have.status(401); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_st}}/batches/00000000-0000-4000-8000-000000000000/settle",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operator_id\": \"postman\"\n}"
+            }
+          }
+        },
+        {
+          "name": "ER-10 Escritura de Settlement con token incorrecto",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 401', function () { pm.response.to.have.status(401); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_st}}/batches/00000000-0000-4000-8000-000000000000/settle",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer token-incorrecto"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operator_id\": \"postman\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "🔍 Flujo Error — Rechazo por Fraude",
+      "description": "Hace una venta normal, para que el comercio tenga un promedio; sube el peso de RULE-002 (monto inusual), para forzar el rechazo, y al final lo restaura. Si la ejecución se corta antes, correr FR-08.",
+      "item": [
+        {
+          "name": "FB-01 Crear sesión QR",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('tx_amount', 10000 + Math.floor(Math.random() * 90000));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                  "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/create",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+            }
+          }
+        },
+        {
+          "name": "FB-02 Pagar",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+            }
+          }
+        },
+        {
+          "name": "FB-03 Esperar el resultado de la Saga",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.state === 'APPROVED'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"La sesión termina en APPROVED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status",
+            "description": "Reintenta hasta 40 veces cada 500 ms. En una request suelta, muestra solo el estado actual."
+          }
+        },
+        {
+          "name": "FR-01 Subir el peso de RULE-002",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "url": "{{base_url_fd}}/rules/RULE-002/threshold",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_threshold\": 3,\n  \"new_score_weight\": 80\n}"
+            }
+          }
+        },
+        {
+          "name": "FR-02 Crear sesión QR",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('tx_amount', 900000000);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                  "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/create",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+            }
+          }
+        },
+        {
+          "name": "FR-03 Pagar",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+            }
+          }
+        },
+        {
+          "name": "FR-04 Esperar el resultado de la Saga",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.state === 'REJECTED'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"La sesión termina en REJECTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status",
+            "description": "Reintenta hasta 40 veces cada 500 ms. En una request suelta, muestra solo el estado actual."
+          }
+        },
+        {
+          "name": "FR-05 Consultar la transacción rechazada",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.State === 'REJECTED'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"Transacción REJECTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "    pm.test('Informa el código de rechazo', function () { pm.expect(json.RejectionCode).to.not.be.empty; });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_auth}}/transactions/{{transaction_id}}"
+          }
+        },
+        {
+          "name": "FR-06 Ver el caso de fraude",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                  "var c = pm.response.json();",
+                  "pm.test('Decisión REJECT', function () { pm.expect(c.Decision).to.eql('REJECT'); });",
+                  "pm.test('Score de 70 o más', function () { pm.expect(c.Score).to.be.at.least(70); });",
+                  "pm.test('Activó RULE-002', function () { pm.expect(c.RulesHit).to.include('RULE-002'); });"
+                ]
+              }
+            }
+          ],
           "request": {
             "method": "GET",
             "url": "{{base_url_fd}}/fraud-cases/{{transaction_id}}"
           }
         },
         {
-          "name": "Actualizar umbral de RULE-001 (Velocity Check)",
-          "request": {
-            "method": "PUT",
-            "url": "{{base_url_fd}}/rules/RULE-001/threshold",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
-            "body": {
-              "mode": "raw",
-              "raw": "{\n  \"new_threshold\": 30,\n  \"new_score_weight\": 25\n}"
+          "name": "FR-07 Verificar la notificación de rechazo",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
             },
-            "description": "Bajar el umbral de 60 a 30 tx/hora para ser más estricto"
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.count >= 1; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"Se generó una notificación\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_nt}}/transactions/{{transaction_id}}/notifications"
           }
         },
         {
-          "name": "Actualizar umbral de RULE-002 (Unusual Amount)",
+          "name": "FR-08 Restaurar RULE-002",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
           "request": {
             "method": "PUT",
             "url": "{{base_url_fd}}/rules/RULE-002/threshold",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"new_threshold\": 2,\n  \"new_score_weight\": 20\n}"
+              "raw": "{\n  \"new_threshold\": 3,\n  \"new_score_weight\": 15\n}"
             },
-            "description": "Bajar de 3x a 2x el promedio del comercio"
+            "description": "**No omitir:** deja el peso en el valor inicial."
+          }
+        }
+      ]
+    },
+    {
+      "name": "↩️ Flujo Reversal — Anulación",
+      "description": "Una venta y su anulación en el mismo lote. El terminal informa compras más reversas, y el monto neto.",
+      "item": [
+        {
+          "name": "RV-00 Preparar: buscar un lote abierto de ejecuciones anteriores",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                  "var lot = (pm.response.json().batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; });",
+                  "pm.collectionVariables.set('open_batch_id', lot ? lot.ID : '');",
+                  "if (!lot) { postman.setNextRequest(\"RV-01 Crear sesión QR\"); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date={{business_date}}"
           }
         },
         {
-          "name": "Actualizar umbral de RULE-003 (Multiple Rejections)",
+          "name": "RV-00 Preparar: cerrar ese lote",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
           "request": {
-            "method": "PUT",
-            "url": "{{base_url_fd}}/rules/RULE-003/threshold",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "method": "POST",
+            "url": "{{base_url_st}}/batches/{{open_batch_id}}/force-close",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{st_admin_api_key}}"
+              }
+            ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"new_threshold\": 2,\n  \"new_score_weight\": 30\n}"
+              "raw": "{\n  \"operator_id\": \"postman\"\n}"
+            },
+            "description": "Los lotes abiertos no informan sus totales: sin este paso, el cierre no podría coincidir."
+          }
+        },
+        {
+          "name": "RV-01 Crear sesión QR",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('tx_amount', 10000 + Math.floor(Math.random() * 90000));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                  "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/create",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
             }
           }
         },
         {
-          "name": "Actualizar umbral de RULE-004 (Repeated Amount)",
+          "name": "RV-02 Pagar",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+            }
+          }
+        },
+        {
+          "name": "RV-03 Esperar el resultado de la Saga",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.state === 'APPROVED'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"La sesión termina en APPROVED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status",
+            "description": "Reintenta hasta 40 veces cada 500 ms. En una request suelta, muestra solo el estado actual."
+          }
+        },
+        {
+          "name": "RV-04 Verificar la venta en un lote abierto",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return !!(json.batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; }); })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"La venta abre un lote nuevo\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "    var lot = (json.batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; }); if (lot) { pm.collectionVariables.set('batch_id', lot.ID); }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date={{business_date}}"
+          }
+        },
+        {
+          "name": "RV-05 Solicitar la anulación",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/sessions/{{transaction_id}}/reversal",
+            "header": [
+              {
+                "key": "X-Terminal-ID",
+                "value": "{{terminal_id}}"
+              }
+            ],
+            "description": "Exige el header `X-Terminal-ID`: en producción lo aporta el certificado del terminal."
+          }
+        },
+        {
+          "name": "RV-06 Verificar REVERSED en Authorization",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.State === 'REVERSED'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"Transacción REVERSED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_auth}}/transactions/{{transaction_id}}"
+          }
+        },
+        {
+          "name": "RV-07 Cerrar el lote: dos movimientos y neto cero",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('close_count', 2);",
+                  "pm.collectionVariables.set('close_amount', 0);",
+                  "setTimeout(function () {}, 1500);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/batch-close",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"batch_date\": \"{{business_date}}\",\n  \"terminal_count\": {{close_count}},\n  \"terminal_amount\": {{close_amount}},\n  \"currency\": \"ARS\"\n}"
+            },
+            "description": "Es asíncrono: Terminal Gateway responde 202 y Settlement lo procesa por NATS."
+          }
+        },
+        {
+          "name": "RV-08 Verificar el lote sin discrepancias",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.State === 'SUBMITTED'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"El lote queda en SUBMITTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "    pm.test(\"Sin discrepancias\", function () { pm.expect(json.Discrepancies === 0).to.be.true; });",
+                  "    pm.test(\"Cuenta compra y reversa\", function () { pm.expect(json.TotalCount === 2).to.be.true; });",
+                  "    pm.test(\"Neto cero\", function () { pm.expect(json.TotalAmount === 0).to.be.true; });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/batches/{{batch_id}}"
+          }
+        },
+        {
+          "name": "RV-09 Confirmar la liquidación",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('status = settled', function () { pm.expect(pm.response.json().status).to.eql('settled'); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_st}}/batches/{{batch_id}}/settle",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{st_admin_api_key}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"operator_id\": \"postman\"\n}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "📦 Settlement — Cierre de Lote",
+      "description": "Las escrituras exigen `st_admin_api_key`. Cada operación queda en `settlement.batch_audit_log`.",
+      "item": [
+        {
+          "name": "ST-01 Listar los lotes del comercio en el día de negocio",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date={{business_date}}"
+          }
+        },
+        {
+          "name": "Disputa: resolve-dispute, resubmit y settle",
+          "item": [
+            {
+              "name": "SD-00 Preparar: buscar un lote abierto de ejecuciones anteriores",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "var lot = (pm.response.json().batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; });",
+                      "pm.collectionVariables.set('open_batch_id', lot ? lot.ID : '');",
+                      "if (!lot) { postman.setNextRequest(\"SD-01 Crear sesión QR\"); }"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date={{business_date}}"
+              }
+            },
+            {
+              "name": "SD-00 Preparar: cerrar ese lote",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{open_batch_id}}/force-close",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\"\n}"
+                },
+                "description": "Los lotes abiertos no informan sus totales: sin este paso, el cierre no podría coincidir."
+              }
+            },
+            {
+              "name": "SD-01 Crear sesión QR",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('tx_amount', 10000 + Math.floor(Math.random() * 90000));"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SD-02 Pagar",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SD-03 Esperar el resultado de la Saga",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.state === 'APPROVED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La sesión termina en APPROVED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status",
+                "description": "Reintenta hasta 40 veces cada 500 ms. En una request suelta, muestra solo el estado actual."
+              }
+            },
+            {
+              "name": "SD-04 Verificar la venta en un lote abierto",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return !!(json.batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; }); })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La venta abre un lote nuevo\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "    var lot = (json.batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; }); if (lot) { pm.collectionVariables.set('batch_id', lot.ID); }",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date={{business_date}}"
+              }
+            },
+            {
+              "name": "SD-05 Cerrar el lote con totales incorrectos",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('close_count', 999);",
+                      "pm.collectionVariables.set('close_amount', 1);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/batch-close",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"batch_date\": \"{{business_date}}\",\n  \"terminal_count\": {{close_count}},\n  \"terminal_amount\": {{close_amount}},\n  \"currency\": \"ARS\"\n}"
+                },
+                "description": "Es asíncrono: Terminal Gateway responde 202 y Settlement lo procesa por NATS."
+              }
+            },
+            {
+              "name": "SD-06 Verificar el lote DISPUTED",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'DISPUTED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"El lote queda en DISPUTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "    pm.test(\"Tiene discrepancias\", function () { pm.expect(json.Discrepancies > 0).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/batches/{{batch_id}}"
+              }
+            },
+            {
+              "name": "SD-07 Aceptar los totales del backend",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('status = closed', function () { pm.expect(pm.response.json().status).to.eql('closed'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{batch_id}}/resolve-dispute",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\",\n  \"reason\": \"Prueba de Postman\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SD-08 Verificar el lote CLOSED, sin discrepancias",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'CLOSED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"El lote queda en CLOSED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "    pm.test(\"Sin discrepancias\", function () { pm.expect(json.Discrepancies === 0).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/batches/{{batch_id}}"
+              }
+            },
+            {
+              "name": "SD-09 Enviar al procesador",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('status = submitted', function () { pm.expect(pm.response.json().status).to.eql('submitted'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{batch_id}}/resubmit",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SD-10 Verificar el lote SUBMITTED",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'SUBMITTED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"El lote queda en SUBMITTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/batches/{{batch_id}}"
+              }
+            },
+            {
+              "name": "SD-11 Confirmar la liquidación",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('status = settled', function () { pm.expect(pm.response.json().status).to.eql('settled'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{batch_id}}/settle",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SD-12 Verificar el lote SETTLED",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'SETTLED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"El lote queda en SETTLED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/batches/{{batch_id}}"
+              }
+            },
+            {
+              "name": "SD-13 Liquidar otra vez: rechazado",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 400', function () { pm.response.to.have.status(400); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{batch_id}}/settle",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\"\n}"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "name": "Disputa: reopen y nuevo cierre",
+          "item": [
+            {
+              "name": "SR-00 Preparar: buscar un lote abierto de ejecuciones anteriores",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "var lot = (pm.response.json().batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; });",
+                      "pm.collectionVariables.set('open_batch_id', lot ? lot.ID : '');",
+                      "if (!lot) { postman.setNextRequest(\"SR-01 Crear sesión QR\"); }"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date={{business_date}}"
+              }
+            },
+            {
+              "name": "SR-00 Preparar: cerrar ese lote",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{open_batch_id}}/force-close",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\"\n}"
+                },
+                "description": "Los lotes abiertos no informan sus totales: sin este paso, el cierre no podría coincidir."
+              }
+            },
+            {
+              "name": "SR-01 Crear sesión QR",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('tx_amount', 10000 + Math.floor(Math.random() * 90000));"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SR-02 Pagar",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SR-03 Esperar el resultado de la Saga",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.state === 'APPROVED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La sesión termina en APPROVED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status",
+                "description": "Reintenta hasta 40 veces cada 500 ms. En una request suelta, muestra solo el estado actual."
+              }
+            },
+            {
+              "name": "SR-04 Verificar la venta en un lote abierto",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return !!(json.batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; }); })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La venta abre un lote nuevo\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "    var lot = (json.batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; }); if (lot) { pm.collectionVariables.set('batch_id', lot.ID); }",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date={{business_date}}"
+              }
+            },
+            {
+              "name": "SR-05 Cerrar el lote con totales incorrectos",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('close_count', 999);",
+                      "pm.collectionVariables.set('close_amount', 1);"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/batch-close",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"batch_date\": \"{{business_date}}\",\n  \"terminal_count\": {{close_count}},\n  \"terminal_amount\": {{close_amount}},\n  \"currency\": \"ARS\"\n}"
+                },
+                "description": "Es asíncrono: Terminal Gateway responde 202 y Settlement lo procesa por NATS."
+              }
+            },
+            {
+              "name": "SR-06 Verificar el lote DISPUTED",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'DISPUTED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"El lote queda en DISPUTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/batches/{{batch_id}}"
+              }
+            },
+            {
+              "name": "SR-07 Reabrir el lote",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('status = reopened', function () { pm.expect(pm.response.json().status).to.eql('reopened'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{batch_id}}/reopen",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\",\n  \"reason\": \"Prueba de Postman\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SR-08 Verificar el lote OPEN",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'OPEN'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"El lote queda en OPEN\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/batches/{{batch_id}}"
+              }
+            },
+            {
+              "name": "SR-09 Cerrar con los totales correctos",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('close_count', 1);",
+                      "pm.collectionVariables.set('close_amount', pm.collectionVariables.get('tx_amount'));"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/batch-close",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"batch_date\": \"{{business_date}}\",\n  \"terminal_count\": {{close_count}},\n  \"terminal_amount\": {{close_amount}},\n  \"currency\": \"ARS\"\n}"
+                },
+                "description": "Es asíncrono: Terminal Gateway responde 202 y Settlement lo procesa por NATS."
+              }
+            },
+            {
+              "name": "SR-10 Verificar el lote SUBMITTED",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'SUBMITTED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"El lote queda en SUBMITTED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "    pm.test(\"Sin discrepancias\", function () { pm.expect(json.Discrepancies === 0).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/batches/{{batch_id}}"
+              }
+            },
+            {
+              "name": "SR-11 Confirmar la liquidación",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('status = settled', function () { pm.expect(pm.response.json().status).to.eql('settled'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{batch_id}}/settle",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\"\n}"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cierre forzado: force-close, resubmit y settle",
+          "item": [
+            {
+              "name": "SF-00 Preparar: buscar un lote abierto de ejecuciones anteriores",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "var lot = (pm.response.json().batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; });",
+                      "pm.collectionVariables.set('open_batch_id', lot ? lot.ID : '');",
+                      "if (!lot) { postman.setNextRequest(\"SF-01 Crear sesión QR\"); }"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date={{business_date}}"
+              }
+            },
+            {
+              "name": "SF-00 Preparar: cerrar ese lote",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{open_batch_id}}/force-close",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\"\n}"
+                },
+                "description": "Los lotes abiertos no informan sus totales: sin este paso, el cierre no podría coincidir."
+              }
+            },
+            {
+              "name": "SF-01 Crear sesión QR",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.collectionVariables.set('tx_amount', 10000 + Math.floor(Math.random() * 90000));"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                      "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/create",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SF-02 Pagar",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SF-03 Esperar el resultado de la Saga",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.state === 'APPROVED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La sesión termina en APPROVED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status",
+                "description": "Reintenta hasta 40 veces cada 500 ms. En una request suelta, muestra solo el estado actual."
+              }
+            },
+            {
+              "name": "SF-04 Verificar la venta en un lote abierto",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return !!(json.batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; }); })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"La venta abre un lote nuevo\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "    var lot = (json.batches || []).find(function (b) { return b.State === 'OPEN' && b.Currency === 'ARS'; }); if (lot) { pm.collectionVariables.set('batch_id', lot.ID); }",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/merchants/{{merchant_id}}/batches?date={{business_date}}"
+              }
+            },
+            {
+              "name": "SF-05 Forzar el cierre",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('status = closed', function () { pm.expect(pm.response.json().status).to.eql('closed'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{batch_id}}/force-close",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SF-06 Verificar el lote CLOSED",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'CLOSED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"El lote queda en CLOSED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "    pm.test(\"Una transacción\", function () { pm.expect(json.TotalCount === 1).to.be.true; });",
+                      "    pm.test(\"Sin discrepancias\", function () { pm.expect(json.Discrepancies === 0).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/batches/{{batch_id}}"
+              }
+            },
+            {
+              "name": "SF-07 Enviar al procesador",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('status = submitted', function () { pm.expect(pm.response.json().status).to.eql('submitted'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{batch_id}}/resubmit",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SF-08 Confirmar la liquidación",
+              "event": [
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                      "pm.test('status = settled', function () { pm.expect(pm.response.json().status).to.eql('settled'); });"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "POST",
+                "url": "{{base_url_st}}/batches/{{batch_id}}/settle",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  },
+                  {
+                    "key": "Authorization",
+                    "value": "Bearer {{st_admin_api_key}}"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"operator_id\": \"postman\"\n}"
+                }
+              }
+            },
+            {
+              "name": "SF-09 Verificar el lote SETTLED",
+              "event": [
+                {
+                  "listen": "prerequest",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "if (n > 0) { setTimeout(function () {}, 500); }"
+                    ]
+                  }
+                },
+                {
+                  "listen": "test",
+                  "script": {
+                    "type": "text/javascript",
+                    "exec": [
+                      "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                      "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                      "var done = (function (json) { return json.State === 'SETTLED'; })(json);",
+                      "if (!done && n < 40) {",
+                      "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                      "  postman.setNextRequest(pm.info.requestName);",
+                      "} else {",
+                      "  pm.collectionVariables.set('poll_attempts', 0);",
+                      "  pm.test(\"El lote queda en SETTLED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                      "}"
+                    ]
+                  }
+                }
+              ],
+              "request": {
+                "method": "GET",
+                "url": "{{base_url_st}}/batches/{{batch_id}}"
+              }
+            }
+          ]
+        },
+        {
+          "name": "ST-02 Consultar un lote por ID",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/batches/{{batch_id}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "🔔 Notification — Gestión",
+      "item": [
+        {
+          "name": "NB-01 Crear sesión QR",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('tx_amount', 10000 + Math.floor(Math.random() * 90000));"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                  "pm.collectionVariables.set('transaction_id', pm.response.json().transaction_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/create",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount_cents\": {{tx_amount}},\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"currency\": \"ARS\"\n}"
+            }
+          }
+        },
+        {
+          "name": "NB-02 Pagar",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/pay",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"card_last4\": \"4242\",\n  \"card_network\": \"VISA\"\n}"
+            }
+          }
+        },
+        {
+          "name": "NB-03 Esperar el resultado de la Saga",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.state === 'APPROVED'; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"La sesión termina en APPROVED\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_tg}}/api/sessions/{{transaction_id}}/status",
+            "description": "Reintenta hasta 40 veces cada 500 ms. En una request suelta, muestra solo el estado actual."
+          }
+        },
+        {
+          "name": "NT-01 Listar las notificaciones de la venta",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "if (n > 0) { setTimeout(function () {}, 500); }"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "var n = Number(pm.collectionVariables.get('poll_attempts') || 0);",
+                  "var json = {}; try { json = pm.response.json(); } catch (e) {}",
+                  "var done = (function (json) { return json.count >= 1; })(json);",
+                  "if (!done && n < 40) {",
+                  "  pm.collectionVariables.set('poll_attempts', n + 1);",
+                  "  postman.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set('poll_attempts', 0);",
+                  "  pm.test(\"Se generaron notificaciones\", function () { pm.expect(done, JSON.stringify(json)).to.be.true; });",
+                  "    if (json.notifications && json.notifications[0]) { pm.collectionVariables.set('notification_id', json.notifications[0].ID); }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_nt}}/transactions/{{transaction_id}}/notifications"
+          }
+        },
+        {
+          "name": "NT-02 Consultar una notificación por ID",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_nt}}/notifications/{{notification_id}}"
+          }
+        },
+        {
+          "name": "NT-03 Listar las notificaciones DEAD",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                  "var dead = pm.response.json().notifications || [];",
+                  "pm.collectionVariables.set('dead_notification_id', dead[0] ? dead[0].ID : '');",
+                  "if (!dead[0]) { postman.setNextRequest('FD-01 Listar las reglas activas'); }"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_nt}}/notifications/dead?limit=20",
+            "description": "Sin notificaciones DEAD, el Runner saltea NT-04."
+          }
+        },
+        {
+          "name": "NT-04 Forzar el reintento de una notificación DEAD",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_nt}}/notifications/{{dead_notification_id}}/force-retry"
+          }
+        }
+      ]
+    },
+    {
+      "name": "🛡️ Fraud Detection — Gestión de Reglas",
+      "description": "Los PUT traen los valores iniciales de `01-init.sql`: correrlos no cambia una base recién creada. **Cambian la configuración de fraude:** para probar otro valor, editar el body y restaurarlo después. RULE-005 no se puede activar por HTTP: el flujo QR ignora `entry_mode`, y nunca informa banda magnética.",
+      "item": [
+        {
+          "name": "FD-01 Listar las reglas activas",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Hay cinco reglas', function () { pm.expect(pm.response.json().count).to.eql(5); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_fd}}/rules"
+          }
+        },
+        {
+          "name": "FD-02 Actualizar RULE-001 (Velocity Check)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "url": "{{base_url_fd}}/rules/RULE-001/threshold",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_threshold\": 60,\n  \"new_score_weight\": 20\n}"
+            }
+          }
+        },
+        {
+          "name": "FD-03 Actualizar RULE-002 (Unusual Amount)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "url": "{{base_url_fd}}/rules/RULE-002/threshold",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_threshold\": 3,\n  \"new_score_weight\": 15\n}"
+            }
+          }
+        },
+        {
+          "name": "FD-04 Actualizar RULE-003 (Multiple Rejections)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PUT",
+            "url": "{{base_url_fd}}/rules/RULE-003/threshold",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"new_threshold\": 3,\n  \"new_score_weight\": 25\n}"
+            }
+          }
+        },
+        {
+          "name": "FD-05 Actualizar RULE-004 (Repeated Amount)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
           "request": {
             "method": "PUT",
             "url": "{{base_url_fd}}/rules/RULE-004/threshold",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
               "raw": "{\n  \"new_threshold\": 1,\n  \"new_score_weight\": 20\n}"
@@ -356,90 +3476,270 @@
           }
         },
         {
-          "name": "Actualizar umbral de RULE-005 (High Amount Magstripe)",
+          "name": "FD-06 Actualizar RULE-005 (High Amount Magstripe)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
           "request": {
             "method": "PUT",
             "url": "{{base_url_fd}}/rules/RULE-005/threshold",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"new_threshold\": 2000000,\n  \"new_score_weight\": 35\n}"
-            },
-            "description": "Bajar el límite de ARS 50.000 a ARS 20.000 para magstripe"
+              "raw": "{\n  \"new_threshold\": 5000000,\n  \"new_score_weight\": 30\n}"
+            }
           }
         }
       ]
     },
-
     {
       "name": "🖥️ Terminal Gateway — Operaciones",
+      "description": "Para anular una venta, ver RV-05. TG-05 cierra el lote abierto del terminal, si hay uno: con estos totales, quedaría en `DISPUTED`.",
       "item": [
         {
-          "name": "Consultar sesión activa por ID",
+          "name": "TG-01 Crear una sesión para cancelar",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 201', function () { pm.response.to.have.status(201); });",
+                  "pm.collectionVariables.set('cancel_session_id', pm.response.json().transaction_id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "url": "{{base_url_tg}}/api/sessions/create",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"amount_cents\": 1000\n}"
+            }
+          }
+        },
+        {
+          "name": "TG-02 Consultar la sesión por ID",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ],
           "request": {
             "method": "GET",
-            "url": "{{base_url_tg}}/sessions/{{transaction_id}}"
+            "url": "{{base_url_tg}}/sessions/{{cancel_session_id}}"
           }
         },
         {
-          "name": "Cancelar sesión activa",
+          "name": "TG-03 Cancelar la sesión",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('status = cancelled', function () { pm.expect(pm.response.json().status).to.eql('cancelled'); });"
+                ]
+              }
+            }
+          ],
           "request": {
             "method": "POST",
-            "url": "{{base_url_tg}}/sessions/{{transaction_id}}/cancel",
-            "header": [{ "key": "X-Terminal-ID", "value": "{{terminal_id}}" }],
-            "description": "Cancelación manual del cajero — transiciona a CANCELLED"
+            "url": "{{base_url_tg}}/sessions/{{cancel_session_id}}/cancel",
+            "header": [
+              {
+                "key": "X-Terminal-ID",
+                "value": "{{terminal_id}}"
+              }
+            ]
           }
         },
         {
-          "name": "Solicitar anulación (reversal)",
+          "name": "TG-04 Verificar la sesión cancelada",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Estado CANCELLED', function () { pm.expect(pm.response.json().state).to.eql('CANCELLED'); });"
+                ]
+              }
+            }
+          ],
           "request": {
-            "method": "POST",
-            "url": "{{base_url_tg}}/sessions/{{transaction_id}}/reversal",
-            "header": [{ "key": "X-Terminal-ID", "value": "{{terminal_id}}" }],
-            "description": "Inicia el flujo de anulación — publica ReversalRequested a NATS"
+            "method": "GET",
+            "url": "{{base_url_tg}}/api/sessions/{{cancel_session_id}}/status"
           }
         },
         {
-          "name": "Solicitar cierre de lote",
+          "name": "TG-05 Solicitar un cierre de lote",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('close_count', 0);",
+                  "pm.collectionVariables.set('close_amount', 0);"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 202', function () { pm.response.to.have.status(202); });"
+                ]
+              }
+            }
+          ],
           "request": {
             "method": "POST",
             "url": "{{base_url_tg}}/batch-close",
-            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"batch_date\": \"2025-06-04\",\n  \"terminal_count\": 10,\n  \"terminal_amount\": 1500000,\n  \"currency\": \"ARS\"\n}"
+              "raw": "{\n  \"terminal_id\": \"{{terminal_id}}\",\n  \"merchant_id\": \"{{merchant_id}}\",\n  \"batch_date\": \"{{business_date}}\",\n  \"terminal_count\": {{close_count}},\n  \"terminal_amount\": {{close_amount}},\n  \"currency\": \"ARS\"\n}"
             },
-            "description": "Publica BatchCloseRequested a NATS → Settlement BC procesa"
+            "description": "Es asíncrono: Terminal Gateway responde 202 y Settlement lo procesa por NATS."
           }
         }
       ]
     },
-
     {
       "name": "📊 Métricas Prometheus",
       "item": [
         {
           "name": "Authorization — /metrics",
-          "request": { "method": "GET", "url": "{{base_url_auth}}/metrics" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_auth}}/metrics"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Terminal Gateway — /metrics",
-          "request": { "method": "GET", "url": "{{base_url_tg}}/metrics" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_tg}}/metrics"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Fraud Detection — /metrics",
-          "request": { "method": "GET", "url": "{{base_url_fd}}/metrics" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_fd}}/metrics"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Settlement — /metrics",
-          "request": { "method": "GET", "url": "{{base_url_st}}/metrics" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_st}}/metrics"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });",
+                  "pm.test('Expone las métricas de lotes y outbox', function () {",
+                  "  pm.expect(pm.response.text()).to.include('posnet_settlement_batches_attention');",
+                  "  pm.expect(pm.response.text()).to.include('posnet_settlement_outbox_stuck');",
+                  "  pm.expect(pm.response.text()).to.include('posnet_settlement_reversals_in_review');",
+                  "});"
+                ]
+              }
+            }
+          ]
         },
         {
           "name": "Notification — /metrics",
-          "request": { "method": "GET", "url": "{{base_url_nt}}/metrics" }
+          "request": {
+            "method": "GET",
+            "url": "{{base_url_nt}}/metrics"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Responde 200', function () { pm.response.to.have.status(200); });"
+                ]
+              }
+            }
+          ]
         }
       ]
     }
-
   ]
 }
