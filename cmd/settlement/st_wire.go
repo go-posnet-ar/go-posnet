@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -35,6 +36,7 @@ type app struct {
 
 	batchHandler   *command.BatchHandler
 	batchCloseHour int
+	adminTokens    *httpinfra.TokenStore
 
 	outboxRelay *outbox.Relay
 	// relayWG espera al Relay en el apagado, antes de cerrar NATS y Postgres.
@@ -145,16 +147,38 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	grpcSrv := grpcserver.NewSettlementServer()
 
 	// HTTP Server — healthz, readyz, metrics, gestión de batches (operaciones)
-	if cfg.Settlement.AdminAPIKey == "" {
-		slog.Warn("SETTLEMENT_ADMIN_API_KEY is not configured — admin write operations are disabled")
+	adminTokens, err := httpinfra.NewTokenStore(cfg.Settlement.AdminAPIKey, cfg.Settlement.AdminTokensFile)
+	if err != nil {
+		return nil, fmt.Errorf("wire: load admin tokens: %w", err)
 	}
-	router := httpinfra.NewRouter(queryHandler, adminHandler, pool, cfg.Settlement.AdminAPIKey, natsConn.IsConnected, batchRepo.MissingTables)
+	if !adminTokens.Configured() {
+		slog.Warn("no admin tokens configured — the batch API is disabled")
+	}
+	if adminTokens.UsesLegacyKey() {
+		slog.Warn("SETTLEMENT_ADMIN_API_KEY is enabled — it has the highest role and does not identify the operator")
+	}
+	trustedProxies, err := cfg.Settlement.TrustedProxyPrefixes()
+	if err != nil {
+		return nil, fmt.Errorf("wire: %w", err)
+	}
+	router := httpinfra.NewRouter(queryHandler, adminHandler, pool,
+		httpinfra.Security{Tokens: adminTokens, TrustedProxies: trustedProxies},
+		natsConn.IsConnected, batchRepo.MissingTables)
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
+	}
+	if cfg.Settlement.TLSCert != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.Settlement.TLSCert, cfg.Settlement.TLSKey)
+		if err != nil {
+			return nil, fmt.Errorf("wire: load TLS certificate: %w", err)
+		}
+		httpSrv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	} else if !cfg.Settlement.TLSExternal {
+		slog.Warn("the HTTP API has no TLS — admin tokens travel unencrypted")
 	}
 
 	return &app{
@@ -167,6 +191,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 
 		batchHandler:   batchHandler,
 		batchCloseHour: cfg.Settlement.BatchCloseHour,
+		adminTokens:    adminTokens,
 
 		outboxRelay: outboxRelay,
 	}, nil
@@ -212,11 +237,19 @@ func (a *app) start(ctx context.Context) error {
 
 	// HTTP server
 	go func() {
-		if err := a.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		serve := a.httpSrv.ListenAndServe
+		if a.httpSrv.TLSConfig != nil {
+			// El certificado ya está cargado en TLSConfig.
+			serve = func() error { return a.httpSrv.ListenAndServeTLS("", "") }
+		}
+		if err := serve(); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server stopped", slog.String("error", err.Error()))
 		}
 	}()
 	slog.Info("HTTP server starting", slog.String("addr", a.httpSrv.Addr))
+
+	// Tokens de la API — se pueden cambiar sin reiniciar
+	go a.adminTokens.Run(ctx, adminTokensReload)
 
 	// Job de cierre automático de lotes — revisa cada 15 minutos desde BatchCloseHour UTC
 	go a.runBatchCloser(ctx)
@@ -224,6 +257,10 @@ func (a *app) start(ctx context.Context) error {
 
 	return nil
 }
+
+// adminTokensReload es cada cuánto se relee el archivo de tokens: lo que tarda en regir una
+// baja o una rotación.
+const adminTokensReload = 30 * time.Second
 
 // batchCloseSweep es cada cuánto se buscan lotes vencidos desde BatchCloseHour. Cada
 // comercio puede tener otra medianoche: hay zonas con desfasajes de 15, 30 y 45 minutos.

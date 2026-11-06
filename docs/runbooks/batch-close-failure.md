@@ -11,8 +11,8 @@ El ciclo del lote tiene salidas por API para cada estado, pero **no hay un proce
 
 La liquidación (`SETTLED`) la confirma un operador con `settle`.
 
-**Las operaciones de escritura exigen token.** Los `curl` de este runbook asumen esta variable, con el mismo
-valor que `SETTLEMENT_ADMIN_API_KEY` en el servicio:
+**Toda la API exige token, salvo `/healthz`, `/readyz` y `/metrics`.** Los `curl` de este runbook asumen esta variable,
+con [tu token](../technical/SETTLEMENT.md#tokens-y-roles):
 
 ```bash
 export AUTH="Authorization: Bearer <token>"
@@ -20,8 +20,11 @@ export AUTH="Authorization: Bearer <token>"
 
 | Respuesta | Qué significa |
 |---|---|
-| `401 UNAUTHORIZED` | Falta el token o es incorrecto. Queda `rejected admin request` en el log |
-| `503 ADMIN_API_DISABLED` | El servicio no tiene `SETTLEMENT_ADMIN_API_KEY`. Hay que configurarla y reiniciarlo |
+| `401 UNAUTHORIZED` | Falta el token, es incorrecto o venció. Queda `rejected admin request` en el log |
+| `403 FORBIDDEN` | Tu rol no alcanza: `force-close`, `resubmit` y `reopen` piden `operator`; lo demás que modifica, `supervisor` |
+| `403 OPERATOR_MISMATCH` | El `operator_id` del body no es el de tu token. Omitilo |
+| `429 TOO_MANY_ATTEMPTS` | Demasiados tokens incorrectos desde tu IP. Esperá lo que indica `Retry-After`, hasta 5 minutos |
+| `503 ADMIN_API_DISABLED` | El servicio no tiene tokens configurados. Hay que definir `SETTLEMENT_ADMIN_TOKENS_FILE` y reiniciarlo |
 
 **Si Settlement falla justo después de un despliegue con errores sobre `version`, `settlement.outbox`, `settlement.batch_audit_log` o
 `settlement.reversal_reviews` o `settlement.merchant_timezones`,**
@@ -376,7 +379,7 @@ tiene la reversa no se envía** mientras la revisión esté abierta: el cierre l
 responde `400`.
 
 ```bash
-curl http://<host>:8084/reversal-reviews
+curl -H "$AUTH" http://<host>:8084/reversal-reviews
 ```
 
 | `reason` | Qué revisar | `action` habitual |
@@ -425,9 +428,10 @@ curl -X POST http://<host>:8084/batches/<batch_id>/resubmit -H "$AUTH" -d '{"ope
 | `GET /merchants/{merchant_id}/timezone` | — | Zona vigente del comercio |
 | `PUT /merchants/{merchant_id}/timezone` | — | Define la zona del comercio. Rige para las operaciones siguientes |
 
-Todos los `POST` y `PUT` exigen el token y `operator_id`; `reopen` y `resolve-dispute`, también `reason`. Esos datos
-quedan en la [auditoría](../technical/SETTLEMENT.md#auditoría-de-operadores), pero `operator_id` lo declara
-quien llama: **anotá también en el ticket quién hizo la operación**. Un `500` puede indicar que falta la
+Todos los `POST` y `PUT` exigen un operador, que sale del token o de `operator_id`; `reopen` y `resolve-dispute`, también `reason`. Esos datos
+quedan en la [auditoría](../technical/SETTLEMENT.md#auditoría-de-operadores). Con un token del archivo, el operador es
+el nombre del token. **Con `SETTLEMENT_ADMIN_API_KEY`, lo declara quien llama: anotá también en el ticket quién hizo la
+operación.** Un `500` puede indicar que falta la
 migración de auditoría: el lote no cambió. Un `409` indica que otro proceso modificó el lote: hay
 que consultarlo y repetir. Un `{id}` que no sea un UUID responde `400 INVALID_ID`.
 

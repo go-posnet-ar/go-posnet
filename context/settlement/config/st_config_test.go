@@ -433,3 +433,30 @@ func TestValidate_CloseMaxAgeDays(t *testing.T) {
 		}
 	}
 }
+
+func TestValidate_TLS(t *testing.T) {
+	cases := []struct {
+		name    string
+		env     string
+		set     SettlementConfig
+		wantErr bool
+	}{
+		{"desarrollo sin TLS", "development", SettlementConfig{}, false},
+		{"producción sin TLS", "production", SettlementConfig{}, true},
+		{"producción con certificado", "production", SettlementConfig{TLSCert: "c", TLSKey: "k"}, false},
+		{"producción con proxy", "production", SettlementConfig{TLSExternal: true}, false},
+		{"certificado sin clave", "development", SettlementConfig{TLSCert: "c"}, true},
+		{"clave sin certificado", "development", SettlementConfig{TLSKey: "k"}, true},
+		{"proxy inválido", "development", SettlementConfig{TrustedProxies: "10.0.0.1"}, true},
+		{"proxies válidos", "development", SettlementConfig{TrustedProxies: "10.0.0.0/8, 192.168.0.0/16"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.set.BusinessTimezone = "UTC"
+			cfg := Config{OTEL: OTELConfig{Environment: tc.env}, Settlement: tc.set}
+			if err := cfg.validate(); (err != nil) != tc.wantErr {
+				t.Errorf("validate() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}

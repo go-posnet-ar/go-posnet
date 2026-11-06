@@ -168,9 +168,14 @@ func (h *Handler) handleForceClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	op, ok := operator(w, r, body.OperatorID)
+	if !ok {
+		return
+	}
+
 	cmd := port.ForceCloseCommand{
 		BatchID:    r.PathValue("id"),
-		OperatorID: body.OperatorID,
+		OperatorID: op,
 	}
 
 	if err := h.adminHandler.ForceClose(ctx, cmd); err != nil {
@@ -208,9 +213,14 @@ func (h *Handler) handleResubmitBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	op, ok := operator(w, r, body.OperatorID)
+	if !ok {
+		return
+	}
+
 	cmd := port.ResubmitBatchCommand{
 		BatchID:    r.PathValue("id"),
-		OperatorID: body.OperatorID,
+		OperatorID: op,
 	}
 
 	if err := h.adminHandler.ResubmitBatch(ctx, cmd); err != nil {
@@ -257,9 +267,14 @@ func (h *Handler) handleReopenBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	op, ok := operator(w, r, body.OperatorID)
+	if !ok {
+		return
+	}
+
 	err := h.adminHandler.ReopenBatch(ctx, port.ReopenBatchCommand{
 		BatchID:    r.PathValue("id"),
-		OperatorID: body.OperatorID,
+		OperatorID: op,
 		Reason:     body.Reason,
 	})
 	h.writeAdminResult(w, r, err, "reopened")
@@ -276,9 +291,14 @@ func (h *Handler) handleResolveDispute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	op, ok := operator(w, r, body.OperatorID)
+	if !ok {
+		return
+	}
+
 	err := h.adminHandler.ResolveDispute(ctx, port.ResolveDisputeCommand{
 		BatchID:    r.PathValue("id"),
-		OperatorID: body.OperatorID,
+		OperatorID: op,
 		Reason:     body.Reason,
 	})
 	h.writeAdminResult(w, r, err, "closed")
@@ -297,9 +317,14 @@ func (h *Handler) handleSettleBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	op, ok := operator(w, r, body.OperatorID)
+	if !ok {
+		return
+	}
+
 	err := h.adminHandler.SettleBatch(ctx, port.SettleBatchCommand{
 		BatchID:    r.PathValue("id"),
-		OperatorID: body.OperatorID,
+		OperatorID: op,
 	})
 	h.writeAdminResult(w, r, err, "settled")
 }
@@ -361,9 +386,14 @@ func (h *Handler) handleResolveReversalReview(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	op, ok := operator(w, r, body.OperatorID)
+	if !ok {
+		return
+	}
+
 	err := h.adminHandler.ResolveReversalReview(ctx, port.ResolveReversalReviewCommand{
 		TransactionID: transactionID,
-		OperatorID:    body.OperatorID,
+		OperatorID:    op,
 		Resolution:    body.Resolution,
 		Action:        body.Action,
 	})
@@ -407,10 +437,15 @@ func (h *Handler) handleSetMerchantTimezone(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, errResp("INVALID_BODY", "invalid request body"))
 		return
 	}
+	op, ok := operator(w, r, body.OperatorID)
+	if !ok {
+		return
+	}
+
 	err := h.adminHandler.SetMerchantTimezone(ctx, port.SetMerchantTimezoneCommand{
 		MerchantID: r.PathValue("merchant_id"),
 		Timezone:   body.Timezone,
-		OperatorID: body.OperatorID,
+		OperatorID: op,
 	})
 	h.writeAdminResult(w, r, err, "updated")
 }

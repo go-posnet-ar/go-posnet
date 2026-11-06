@@ -342,10 +342,77 @@ administración responden `409`, y hay que repetirlas.
 
 Puerto `HTTP_PORT`: 8083 por defecto en el código y **8084 en Docker Compose**.
 
-**Las escrituras exigen un token,** enviado como `Authorization: Bearer <SETTLEMENT_ADMIN_API_KEY>`. Sin token
-o con uno incorrecto, responden `401`. **Sin clave configurada, responden `503`** con `ADMIN_API_DISABLED`: las
-escrituras quedan deshabilitadas, no abiertas. La regla aplica a todo lo que no sea `GET` o `HEAD`, así que una
-ruta nueva queda protegida por defecto. Las lecturas, `/metrics` y los health checks no piden token.
+**Todo exige un token, enviado como `Authorization: Bearer <token>`, salvo `GET /healthz`, `/readyz` y `/metrics`,**
+que usan Docker y Prometheus y no exponen datos de comercios. La lista de rutas públicas es exacta: una ruta nueva
+queda protegida por defecto.
+
+| Respuesta | Situación |
+|---|---|
+| `401 UNAUTHORIZED` | Sin token, con uno incorrecto o con uno vencido |
+| `403 FORBIDDEN` | El rol del token no alcanza |
+| `403 OPERATOR_MISMATCH` | El `operator_id` del body no es el del token |
+| `429 TOO_MANY_ATTEMPTS` | Demasiados tokens incorrectos desde esa IP. Indica la espera en `Retry-After` |
+| `503 ADMIN_API_DISABLED` | No hay ningún token configurado: la API queda deshabilitada, no abierta |
+
+### Tokens y roles
+
+Cada persona o sistema tiene su token, en el archivo de `SETTLEMENT_ADMIN_TOKENS_FILE`. **El archivo guarda el SHA-256,
+no el token:**
+
+```json
+[
+  { "name": "soporte-juan", "role": "operator", "sha256": "<64 caracteres hex>", "expires_at": "2027-06-30T00:00:00Z" },
+  { "name": "tesoreria-ana", "role": "supervisor", "sha256": "<64 caracteres hex>" }
+]
+```
+
+```bash
+TOKEN=$(openssl rand -hex 32)      # Se le entrega a su dueño, y no se guarda
+printf %s "$TOKEN" | sha256sum     # Va en el archivo
+```
+
+| Rol | Puede |
+|---|---|
+| `reader` | Consultar lotes, revisiones y zonas |
+| `operator` | Además, `force-close`, `resubmit` y `reopen` |
+| `supervisor` | Además, `resolve-dispute`, `settle`, cerrar revisiones de reversas y definir zonas. Una ruta nueva exige este rol hasta que se indique otro |
+
+**Con un token del archivo, el operador de la auditoría es el `name` del token.** `operator_id` se puede omitir. Si
+se envía otro, responde `403` y no cambia nada.
+
+`expires_at` es opcional. El servicio **no arranca** si el archivo no existe o es inválido.
+
+**Rotar o dar de baja un token no requiere reiniciar:** el archivo se relee cada 30 segundos. Para rotar sin
+cortes, agregá el token nuevo con otro `name`, cambiá el cliente y quitá el viejo. Si el archivo pasa a ser inválido o
+no se puede leer, se conservan los tokens vigentes y queda el log `admin tokens file not reloaded`: **una baja no rige
+hasta corregirlo**. En Docker, montá el directorio y no el archivo: un archivo montado solo no ve los reemplazos.
+
+**`SETTLEMENT_ADMIN_API_KEY` sigue funcionando,** con el rol `supervisor`, pero no identifica a nadie: `operator_id`
+sigue siendo lo que declara quien llama. El servicio lo advierte al arrancar. Conviene quitarla al crear los tokens.
+
+### Límite de intentos
+
+Con **10 tokens incorrectos en un minuto desde una IP, esa IP queda bloqueada 5 minutos**, incluso con un token
+válido. Un pedido sin token no cuenta. Las rutas públicas no se bloquean. Un acceso correcto borra los fallos.
+
+Detrás de un proxy, todos los pedidos llegan con la IP del proxy: un solo cliente bloquearía a los demás. Hay que
+declararlo en `SETTLEMENT_TRUSTED_PROXIES` para que se use `X-Forwarded-For`, que en cualquier otro caso se ignora.
+
+### TLS
+
+Con `SETTLEMENT_TLS_CERT` y `SETTLEMENT_TLS_KEY`, el puerto `HTTP_PORT` sirve solo HTTPS, desde TLS 1.2. Un certificado
+nuevo requiere reiniciar. Hay que cambiar además lo que consulta ese puerto:
+
+| Cliente | Cambio |
+|---|---|
+| `healthcheck` de Docker Compose | `wget --no-check-certificate -q --spider https://localhost:8084/readyz` |
+| Prometheus | `scheme: https` en `prometheus.yml`, con la CA del certificado |
+
+Si TLS lo termina un proxy, hay que declararlo con `SETTLEMENT_TLS_EXTERNAL=true` y limitar el acceso directo al
+puerto. **Con `ENVIRONMENT=production`, el servicio no arranca sin una de las dos opciones.** En cualquier otro
+entorno, arranca y lo advierte en el log. Docker Compose no usa TLS: es solo para desarrollo.
+
+### Rutas
 
 | Método y ruta | Uso | Éxito | Errores |
 |---|---|---|---|
@@ -364,7 +431,7 @@ ruta nueva queda protegida por defecto. Las lecturas, `/metrics` y los health ch
 | `GET /merchants/{merchant_id}/timezone` | Zona vigente del comercio | `200` | `400`, `500` |
 | `PUT /merchants/{merchant_id}/timezone` | Definir la zona del comercio | `200` | `400`, `500` |
 
-Todas las escrituras pueden responder además `401` o `503`, como se explicó arriba. Un `{id}` que no sea un UUID responde `400` con `INVALID_ID`. Los errores tienen la forma
+Todas las rutas no públicas pueden responder además `401`, `403`, `429` o `503`, como se explicó arriba. Un `{id}` que no sea un UUID responde `400` con `INVALID_ID`. Los errores tienen la forma
 `{"error": "CODIGO", "message": "..."}`.
 
 ### Consultar un lote
@@ -438,7 +505,7 @@ Ambos datos quedan en la [auditoría](#auditoría-de-operadores) y en los logs.
 ### Revisiones de reversas
 
 `GET /reversal-reviews` responde `{"reviews": [...], "count": n}`, con la reversa, la compra (`null` si no está) y
-el estado actual del lote. Como las demás lecturas, no pide token.
+el estado actual del lote.
 
 `POST /reversal-reviews/{transaction_id}/resolve` responde `{"status": "resolved"}`:
 
@@ -453,8 +520,7 @@ el estado actual del lote. Como las demás lecturas, no pide token.
 | `EXCLUDE` | Quita la reversa del lote | Si el lote está en `OPEN` o `DISPUTED` |
 
 Fuera de esos casos, o si la revisión ya está cerrada, responde `400` y no cambia nada. La corrección, el cierre de
-la revisión y la [auditoría](#auditoría-de-operadores) son atómicos. `resolved_by` es el `operator_id`, que lo declara
-quien llama. Los totales del lote se recalculan al volver a cerrarlo: **cerrar la revisión no libera el lote,** hay
+la revisión y la [auditoría](#auditoría-de-operadores) son atómicos. `resolved_by` es el operador. Los totales del lote se recalculan al volver a cerrarlo: **cerrar la revisión no libera el lote,** hay
 que usar `resolve-dispute` o `reopen`.
 
 ### Zona horaria de un comercio
@@ -617,7 +683,8 @@ lote no cambia.
 | Columna | Contenido |
 |---|---|
 | `action` | `FORCE_CLOSE`, `RESUBMIT`, `RESUBMIT_BLOCKED`, `REOPEN`, `RESOLVE_DISPUTE` o `SETTLE` |
-| `operator_id`, `reason` | Lo que declaró quien llama. `reason` solo existe en `reopen` y `resolve-dispute` |
+| `operator_id` | El `name` del token. Con `SETTLEMENT_ADMIN_API_KEY`, lo que declaró quien llama |
+| `reason` | Lo que declaró quien llama. Solo existe en `reopen`, `resolve-dispute` y las revisiones |
 | `from_state`, `to_state` | Estado antes y después |
 | `previous_discrepancies` | Discrepancias antes del cambio |
 | `total_amount` | Total después del cambio; vacío si el lote se reabrió |
@@ -725,7 +792,11 @@ conciliar, y `no settlement processor configured` los lotes que quedaron sin env
 | `SETTLEMENT_PROCESSOR` | `none` | Sí; `none` o `mock`. Docker Compose usa `mock`. Con otro valor, el servicio no arranca |
 | `SETTLEMENT_BUSINESS_TIMEZONE` | `America/Argentina/Buenos_Aires` | Sí; zona IANA del día de negocio, para los comercios sin una propia. Si es inválida, el servicio no arranca |
 | `SETTLEMENT_CLOSE_MAX_AGE_DAYS` | `7` | Sí; antigüedad máxima del `batch_date` de un cierre. `0` no limita. Si es negativo, el servicio no arranca |
-| `SETTLEMENT_ADMIN_API_KEY` | Vacía | Sí; token de las escrituras. Vacía, quedan deshabilitadas. Con menos de 32 caracteres, el servicio no arranca. Generarla con `openssl rand -hex 32` |
+| `SETTLEMENT_ADMIN_API_KEY` | Vacía | Sí; token único con el rol `supervisor`, que no identifica a nadie. Con menos de 32 caracteres, el servicio no arranca |
+| `SETTLEMENT_ADMIN_TOKENS_FILE` | Vacía | Sí; archivo de [tokens](#tokens-y-roles). Sin esto ni la clave anterior, la API queda deshabilitada. Si no existe o es inválido, el servicio no arranca |
+| `SETTLEMENT_TRUSTED_PROXIES` | Vacía | Sí; CIDR separados por coma cuyo `X-Forwarded-For` se acepta. Si alguno es inválido, el servicio no arranca |
+| `SETTLEMENT_TLS_CERT`, `SETTLEMENT_TLS_KEY` | Vacías | Sí; habilitan [HTTPS](#tls). Van juntas. Si no se pueden cargar, el servicio no arranca |
+| `SETTLEMENT_TLS_EXTERNAL` | `false` | Sí; declara que un proxy termina TLS |
 | `SETTLEMENT_SUBMIT_RETRIES` | `3` | **No**: no hay procesador real |
 | `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | **No**: no hay procesador real |
 | `MIGRATIONS_DIR` | `migrations/settlement` | **No**: `Migrate` no hace nada |
@@ -752,7 +823,7 @@ Para generar un lote, crear y pagar una sesión como se indica en
 ```bash
 MERCHANT=b2c3d4e5-f6a7-8901-bcde-f12345678901
 BUSINESS_DATE=$(TZ=America/Argentina/Buenos_Aires date +%F)
-curl -s "localhost:8084/merchants/$MERCHANT/batches?date=$BUSINESS_DATE" | jq
+curl -s -H "$AUTH" "localhost:8084/merchants/$MERCHANT/batches?date=$BUSINESS_DATE" | jq
 ```
 
 Para probar una disputa, cerrar con totales que **no** coincidan, y después resolverla:
@@ -768,7 +839,7 @@ curl -s localhost:8081/batch-close -H 'Content-Type: application/json' -d '{
 ```
 
 ```bash
-BATCH=$(curl -s "localhost:8084/merchants/$MERCHANT/batches?date=$BUSINESS_DATE" | jq -r '.batches[0].ID')
+BATCH=$(curl -s -H "$AUTH" "localhost:8084/merchants/$MERCHANT/batches?date=$BUSINESS_DATE" | jq -r '.batches[0].ID')
 OP='"operator_id":"prueba"'
 AUTH="Authorization: Bearer $SETTLEMENT_ADMIN_API_KEY"
 
@@ -828,10 +899,14 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| Token único, sin identidad | `operator_id` lo declara quien llama: ni el log ni la auditoría prueban quién hizo la operación, y cualquiera con el token puede hacerlas todas | `adminAuthMiddleware` |
-| Lecturas sin autenticación | Con acceso de red, cualquiera puede consultar lotes y montos de los comercios | `adminAuthMiddleware` |
-| Sin rotación ni límite de intentos | Cambiar el token requiere reiniciar el servicio, y no hay freno a los intentos fallidos | `adminAuthMiddleware` |
-| El token viaja sin cifrar | El servicio no usa TLS: el token debe pasar por una red de confianza o un proxy con TLS | `st_wire.go` |
+| `SETTLEMENT_ADMIN_API_KEY` no identifica | Mientras esté habilitada, quien la tenga puede hacer todo, declarando cualquier `operator_id`. Hay que crear los tokens y quitarla en cada entorno | `TokenStore` |
+| Los roles son fijos | No se puede limitar un token a un comercio ni cambiar qué permite cada rol sin tocar el código | `requiredRole` |
+| Las lecturas no se auditan | El log registra la ruta, pero no quién consultó | `authMiddleware` |
+| `/metrics` es público | Con acceso de red, se ven contadores y lotes por estado, sin datos de comercios. Hay que limitar el acceso al puerto | `publicPaths` |
+| El límite de intentos es por instancia | Vive en memoria: se reinicia con el servicio y no se comparte entre instancias | `authLimiter` |
+| Vencimientos sin aviso | Un token vencido responde `401`, sin un aviso previo ni una alerta | `TokenStore` |
+| Los certificados requieren reiniciar | No se recargan solos, como los tokens | `st_wire.go` |
+| Solo cubre la API de Settlement | Los otros BC no cambian, y Postgres y NATS tienen su propia configuración de acceso | `authMiddleware` |
 
 ### Operación y datos
 

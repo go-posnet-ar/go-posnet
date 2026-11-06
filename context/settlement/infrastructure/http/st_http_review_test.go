@@ -211,7 +211,11 @@ func TestSetMerchantTimezone_HTTP(t *testing.T) {
 
 // Una escritura nueva queda protegida por el token sin agregarla a ninguna lista.
 func TestNewWritesRequireAdminToken(t *testing.T) {
-	handler := adminAuthMiddleware(strings.Repeat("k", 32), reviewMux(t, &fakeReviewLog{}, &fakeTimezoneStore{}, false))
+	tokens, err := NewTokenStore(strings.Repeat("k", 32), "")
+	if err != nil {
+		t.Fatalf("NewTokenStore() error = %v", err)
+	}
+	handler := authMiddleware(Security{Tokens: tokens}, reviewMux(t, &fakeReviewLog{}, &fakeTimezoneStore{}, false))
 	merchant := domain.NewMerchantID().String()
 	for _, r := range []struct{ method, path string }{
 		{http.MethodPost, "/reversal-reviews/" + reviewTxID + "/resolve"},

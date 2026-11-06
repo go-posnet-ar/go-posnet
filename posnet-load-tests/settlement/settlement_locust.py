@@ -234,6 +234,10 @@ class SettlementHTTPUser(HttpUser):
     wait_time = between(0.5, 2.0)
 
     def on_start(self):
+        # Las consultas exigen token. Definir SETTLEMENT_ADMIN_API_KEY antes de correr Locust.
+        token = os.environ.get("SETTLEMENT_ADMIN_API_KEY", "")
+        if token:
+            self.client.headers["Authorization"] = f"Bearer {token}"
         with self.client.get("/healthz", catch_response=True) as resp:
             if resp.status_code != 200:
                 resp.failure(f"Settlement not ready: {resp.status_code}")

@@ -23,7 +23,11 @@ func newRouterFor(repo repository.SettlementBatchRepository, pool *fakePool) htt
 func newRouterWithKey(repo repository.SettlementBatchRepository, pool *fakePool, key string) http.Handler {
 	queryHandler := query.NewBatchQueryHandler(repo)
 	adminHandler := command.NewAdminHandler(repo, &fakeProcessor{})
-	return NewRouter(queryHandler, adminHandler, pool, key, nil, nil)
+	tokens, err := NewTokenStore(key, "")
+	if err != nil {
+		panic(err)
+	}
+	return NewRouter(queryHandler, adminHandler, pool, Security{Tokens: tokens}, nil, nil)
 }
 
 func TestNewRouter_Routes(t *testing.T) {
@@ -88,6 +92,7 @@ func TestNewRouter_RecoversFromPanicInHandler(t *testing.T) {
 	router := newRouterFor(&panickyBatchRepo{}, &fakePool{})
 
 	req := httptest.NewRequest(http.MethodGet, "/batches/11111111-1111-4111-8111-111111111111", nil)
+	req.Header.Set("Authorization", "Bearer "+testAdminKey)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -100,6 +105,7 @@ func TestNewRouter_UnknownRouteReturns404(t *testing.T) {
 	router := newRouterFor(&fakeBatchRepo{}, &fakePool{})
 
 	req := httptest.NewRequest(http.MethodGet, "/does-not-exist", nil)
+	req.Header.Set("Authorization", "Bearer "+testAdminKey)
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 
@@ -189,33 +195,39 @@ func TestNewRouter_ValidTokenReachesHandler(t *testing.T) {
 	}
 }
 
-// Las lecturas y los health checks siguen abiertos, incluso sin clave configurada.
-func TestNewRouter_ReadsDoNotRequireToken(t *testing.T) {
+// Sin clave configurada, solo quedan abiertos los health checks y las métricas.
+func TestNewRouter_PublicPaths(t *testing.T) {
 	b := newBatch(t)
 	router := newRouterWithKey(&fakeBatchRepo{findByIDResult: b}, &fakePool{}, "")
 
-	for _, path := range []string{"/healthz", "/readyz", "/metrics", "/batches/" + b.ID()} {
+	for _, path := range []string{"/healthz", "/readyz", "/metrics"} {
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusOK {
 			t.Errorf("GET %s status = %d, want %d", path, rec.Code, http.StatusOK)
 		}
 	}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/batches/"+b.ID(), nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("GET batch status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
 }
 
-// Una escritura nueva queda protegida aunque nadie la agregue a una lista.
-func TestAdminAuthMiddleware_ProtectsOtherMethods(t *testing.T) {
-	called := false
-	handler := adminAuthMiddleware(testAdminKey, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }))
+func TestNewRouter_ReadsRequireToken(t *testing.T) {
+	b := newBatch(t)
+	router := newRouterFor(&fakeBatchRepo{findByIDResult: b}, &fakePool{})
 
-	for _, method := range []string{http.MethodPut, http.MethodPatch, http.MethodDelete} {
-		rec := httptest.NewRecorder()
-		handler.ServeHTTP(rec, httptest.NewRequest(method, "/x", nil))
-		if rec.Code != http.StatusUnauthorized {
-			t.Errorf("%s status = %d, want %d", method, rec.Code, http.StatusUnauthorized)
-		}
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/batches/"+b.ID(), nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("without token = %d, want %d", rec.Code, http.StatusUnauthorized)
 	}
-	if called {
-		t.Error("el handler se ejecutó sin token")
+	req := httptest.NewRequest(http.MethodGet, "/batches/"+b.ID(), nil)
+	req.Header.Set("Authorization", "Bearer "+testAdminKey)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("with token = %d, want %d", rec.Code, http.StatusOK)
 	}
 }

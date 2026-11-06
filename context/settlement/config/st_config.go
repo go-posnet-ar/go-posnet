@@ -3,8 +3,10 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -75,9 +77,24 @@ type SettlementConfig struct {
 	// terminal. Un lote más viejo lo cierra el job automático o un operador. 0 = sin límite.
 	CloseMaxAgeDays int
 
-	// AdminAPIKey es el token que exigen las operaciones de escritura de la API HTTP.
-	// Vacío = esas operaciones quedan deshabilitadas.
+	// AdminAPIKey es un token único, con el rol máximo, que no identifica a nadie. Queda por
+	// compatibilidad: AdminTokensFile es lo que permite saber quién hizo cada operación.
 	AdminAPIKey string
+
+	// AdminTokensFile es el archivo con los tokens nombrados: nombre, rol, SHA-256 y
+	// vencimiento. Se relee sin reiniciar. Sin esto ni AdminAPIKey, la API queda deshabilitada.
+	AdminTokensFile string
+
+	// TrustedProxies son los CIDR, separados por coma, cuyo X-Forwarded-For se acepta.
+	TrustedProxies string
+
+	// TLSCert y TLSKey habilitan HTTPS en el puerto HTTP. Van juntos.
+	TLSCert string
+	TLSKey  string
+
+	// TLSExternal declara que un proxy termina TLS. Con ENVIRONMENT=production, hace falta
+	// esto o TLSCert: si no, el servicio no arranca, porque los tokens viajarían sin cifrar.
+	TLSExternal bool
 }
 
 // minAdminAPIKeyLength rechaza tokens triviales al arrancar.
@@ -132,6 +149,11 @@ func Load() (*Config, error) {
 			BusinessTimezone: envStr("SETTLEMENT_BUSINESS_TIMEZONE", "America/Argentina/Buenos_Aires"),
 			CloseMaxAgeDays:  envInt("SETTLEMENT_CLOSE_MAX_AGE_DAYS", 7),
 			AdminAPIKey:      envStr("SETTLEMENT_ADMIN_API_KEY", ""),
+			AdminTokensFile:  envStr("SETTLEMENT_ADMIN_TOKENS_FILE", ""),
+			TrustedProxies:   envStr("SETTLEMENT_TRUSTED_PROXIES", ""),
+			TLSCert:          envStr("SETTLEMENT_TLS_CERT", ""),
+			TLSKey:           envStr("SETTLEMENT_TLS_KEY", ""),
+			TLSExternal:      envStr("SETTLEMENT_TLS_EXTERNAL", "") == "true",
 		},
 	}
 
@@ -163,10 +185,35 @@ func (c *Config) validate() error {
 	if key := c.Settlement.AdminAPIKey; key != "" && len(key) < minAdminAPIKeyLength {
 		return fmt.Errorf("config: SETTLEMENT_ADMIN_API_KEY must have at least %d characters", minAdminAPIKeyLength)
 	}
+	if (c.Settlement.TLSCert == "") != (c.Settlement.TLSKey == "") {
+		return fmt.Errorf("config: SETTLEMENT_TLS_CERT and SETTLEMENT_TLS_KEY must be set together")
+	}
+	if c.OTEL.Environment == "production" && c.Settlement.TLSCert == "" && !c.Settlement.TLSExternal {
+		return fmt.Errorf("config: ENVIRONMENT=production requires SETTLEMENT_TLS_CERT or SETTLEMENT_TLS_EXTERNAL=true: admin tokens would travel unencrypted")
+	}
+	if _, err := c.Settlement.TrustedProxyPrefixes(); err != nil {
+		return err
+	}
 	if _, err := time.LoadLocation(c.Settlement.BusinessTimezone); err != nil {
 		return fmt.Errorf("config: SETTLEMENT_BUSINESS_TIMEZONE %q is invalid: %w", c.Settlement.BusinessTimezone, err)
 	}
 	return nil
+}
+
+// TrustedProxyPrefixes interpreta SETTLEMENT_TRUSTED_PROXIES.
+func (s SettlementConfig) TrustedProxyPrefixes() ([]netip.Prefix, error) {
+	if strings.TrimSpace(s.TrustedProxies) == "" {
+		return nil, nil
+	}
+	var prefixes []netip.Prefix
+	for _, part := range strings.Split(s.TrustedProxies, ",") {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(part))
+		if err != nil {
+			return nil, fmt.Errorf("config: SETTLEMENT_TRUSTED_PROXIES %q is not a CIDR: %w", part, err)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
