@@ -538,15 +538,6 @@ func newSubmittedBatch(t *testing.T, merchantID domain.MerchantID, currency stri
 	return b
 }
 
-func settledBatch(t *testing.T, merchantID domain.MerchantID, currency string, amount int64) *aggregate.SettlementBatch {
-	t.Helper()
-	b := newSubmittedBatch(t, merchantID, currency, amount)
-	if err := b.MarkSettled(); err != nil {
-		t.Fatalf("MarkSettled() error = %v", err)
-	}
-	return b
-}
-
 func TestSettleBatch_Validation(t *testing.T) {
 	h := command.NewAdminHandler(&fakeBatchRepo{}, nil)
 	for _, cmd := range []port.SettleBatchCommand{{BatchID: "", OperatorID: "op-1"}, {BatchID: "b", OperatorID: ""}} {
