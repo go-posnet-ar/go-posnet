@@ -813,3 +813,35 @@ func TestFindOrCreateOpen_SerializationFailureIsStale(t *testing.T) {
 		t.Fatalf("error = %v, want ErrStaleBatch", err)
 	}
 }
+
+func TestCountBatchesNeedingAttention(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	today := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	closedBefore := today.Add(-time.Hour)
+
+	pool.ExpectQuery("FROM settlement.settlement_batches").
+		WithArgs(closedBefore, "2026-11-05").
+		WillReturnRows(pgxmock.NewRows([]string{"disputed", "closed", "open"}).AddRow(int64(3), int64(2), int64(1)))
+
+	got, err := repo.CountBatchesNeedingAttention(context.Background(), today, closedBefore)
+	if err != nil {
+		t.Fatalf("CountBatchesNeedingAttention() error = %v", err)
+	}
+	if got.Disputed != 3 || got.ClosedUnsent != 2 || got.OpenOverdue != 1 {
+		t.Errorf("counts = %+v, want {3 2 1}", got)
+	}
+}
+
+func TestCountBatchesNeedingAttention_QueryError(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+
+	pool.ExpectQuery("FROM settlement.settlement_batches").
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnError(errors.New("db down"))
+
+	if _, err := repo.CountBatchesNeedingAttention(context.Background(), time.Now(), time.Now()); err == nil {
+		t.Fatal("CountBatchesNeedingAttention() error = nil, want error")
+	}
+}

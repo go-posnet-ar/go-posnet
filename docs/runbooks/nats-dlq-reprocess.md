@@ -20,7 +20,9 @@ Hay dos formas de que un mensaje deje de reintentarse:
 | Mensaje inválido, `ValidationError` o `ConflictError` | `msg.Term()`, sin reintentos | Solo después de corregir la causa |
 | Otro error, repetido hasta agotar `MaxDeliver` | `msg.Nak()` en cada intento, sin backoff | Sí, una vez resuelta la causa |
 
-Los reintentos son inmediatos, así que una caída de pocos segundos ya puede agotar las entregas.
+Los reintentos son inmediatos, así que una caída de pocos segundos ya puede agotar las entregas. **Settlement
+es la excepción:** espera 5 s, 30 s, 2 min y 10 min entre entregas, así que resiste una caída de unos 12
+minutos, y registra `deliveries exhausted` en el último intento.
 
 Los comandos se probaron con el CLI `nats` `v0.4.0`. Requieren también `jq`.
 

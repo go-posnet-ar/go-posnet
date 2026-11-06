@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	natsclient "github.com/nats-io/nats.go"
 
@@ -422,5 +424,70 @@ func TestNak_TransientErrorRetriesMessage(t *testing.T) {
 	}
 	if last.Message != "transient error — nacking for retry" {
 		t.Errorf("message = %q, want %q", last.Message, "transient error — nacking for retry")
+	}
+}
+
+func TestRetryDelay(t *testing.T) {
+	tests := []struct {
+		delivered uint64
+		want      time.Duration
+	}{
+		{0, 5 * time.Second},
+		{1, 5 * time.Second},
+		{2, 30 * time.Second},
+		{3, 2 * time.Minute},
+		{4, 10 * time.Minute},
+		{5, 10 * time.Minute},
+		{99, 10 * time.Minute},
+	}
+	for _, tt := range tests {
+		if got := retryDelay(tt.delivered); got != tt.want {
+			t.Errorf("retryDelay(%d) = %v, want %v", tt.delivered, got, tt.want)
+		}
+	}
+}
+
+// jsMsg arma un mensaje con la metadata de JetStream de la entrega indicada.
+func jsMsg(delivered int) *natsclient.Msg {
+	return &natsclient.Msg{
+		Subject: "test",
+		Sub:     &natsclient.Subscription{},
+		Reply:   fmt.Sprintf("$JS.ACK.STREAM.consumer.%d.10.10.1700000000000000000.0", delivered),
+	}
+}
+
+func TestDeliveryCount(t *testing.T) {
+	if got := deliveryCount(jsMsg(3)); got != 3 {
+		t.Errorf("deliveryCount() = %d, want 3", got)
+	}
+	if got := deliveryCount(&natsclient.Msg{Subject: "test"}); got != 1 {
+		t.Errorf("deliveryCount() without metadata = %d, want 1", got)
+	}
+}
+
+func TestNak_TransientErrorBeforeLastDeliveryIsWarning(t *testing.T) {
+	rec := &logRecorder{}
+	s := &Subscriber{log: slog.New(rec)}
+
+	s.nak(context.Background(), jsMsg(maxDeliveries-1), errors.New("db timeout"), "evt-3")
+
+	last := rec.last()
+	if last.Level != slog.LevelWarn {
+		t.Errorf("level = %v, want Warn", last.Level)
+	}
+}
+
+func TestNak_LastDeliveryReportsExhausted(t *testing.T) {
+	rec := &logRecorder{}
+	s := &Subscriber{log: slog.New(rec)}
+
+	s.nak(context.Background(), jsMsg(maxDeliveries), errors.New("db timeout"), "evt-4")
+
+	last := rec.last()
+	if last.Level != slog.LevelError {
+		t.Errorf("level = %v, want Error", last.Level)
+	}
+	if last.Message != "deliveries exhausted — event will not be retried" {
+		t.Errorf("message = %q", last.Message)
 	}
 }

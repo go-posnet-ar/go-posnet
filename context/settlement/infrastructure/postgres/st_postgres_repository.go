@@ -309,6 +309,26 @@ func (r *SettlementBatchRepo) ListByMerchantDate(
 	return batches, nil
 }
 
+// CountBatchesNeedingAttention cuenta los lotes en disputa, los CLOSED con transacciones
+// sin enviar desde antes de closedBefore y los OPEN de días anteriores a today. Los lotes
+// vacíos en CLOSED no cuentan: no hay nada que enviar.
+func (r *SettlementBatchRepo) CountBatchesNeedingAttention(ctx context.Context, today, closedBefore time.Time) (repository.BatchAttentionCounts, error) {
+	const q = `
+		SELECT
+			COUNT(*) FILTER (WHERE state = 'DISPUTED'),
+			COUNT(*) FILTER (WHERE state = 'CLOSED' AND COALESCE(total_count, 0) > 0 AND closed_at < $1),
+			COUNT(*) FILTER (WHERE state = 'OPEN' AND batch_date < $2::date)
+		FROM settlement.settlement_batches
+		WHERE state IN ('DISPUTED', 'CLOSED', 'OPEN')
+	`
+	var c repository.BatchAttentionCounts
+	err := r.pool.QueryRow(ctx, q, closedBefore, today.Format("2006-01-02")).Scan(&c.Disputed, &c.ClosedUnsent, &c.OpenOverdue)
+	if err != nil {
+		return repository.BatchAttentionCounts{}, fmt.Errorf("CountBatchesNeedingAttention: %w", err)
+	}
+	return c, nil
+}
+
 // FindStaleOpenIDs lista los batches OPEN de fechas anteriores a before.
 func (r *SettlementBatchRepo) FindStaleOpenIDs(ctx context.Context, before time.Time) ([]string, error) {
 	const q = `

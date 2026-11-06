@@ -277,7 +277,7 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 	if !processed {
 		return nil
 	}
-	h.metrics.RecordBatchClosed(ctx, batch.Currency(), batch.State().String(), time.Since(closeStart))
+	closeDuration := time.Since(closeStart)
 
 	// Publicar BatchClosed a NATS → Notification BC
 	if err := h.publisher.PublishBatchClosed(ctx, batch); err != nil {
@@ -294,11 +294,20 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 		log.Warn("batch has discrepancies — marking as disputed",
 			slog.Int("discrepancies", batch.Discrepancies()),
 		)
+		closedState := batch.State().String()
 		if err := batch.MarkDisputed("terminal count/amount mismatch"); err != nil {
+			h.metrics.RecordBatchClosed(ctx, batch.Currency(), closedState, closeDuration)
 			return fmt.Errorf("ProcessBatchClose: mark disputed: %w", err)
 		}
-		return h.batchRepo.Save(ctx, batch)
+		if err := h.batchRepo.Save(ctx, batch); err != nil {
+			// La disputa no se guardó: el lote sigue en CLOSED.
+			h.metrics.RecordBatchClosed(ctx, batch.Currency(), closedState, closeDuration)
+			return err
+		}
+		h.metrics.RecordBatchClosed(ctx, batch.Currency(), batch.State().String(), closeDuration)
+		return nil
 	}
+	h.metrics.RecordBatchClosed(ctx, batch.Currency(), batch.State().String(), closeDuration)
 
 	// Sin discrepancias → enviar al procesador externo
 	return h.submitBatch(ctx, batch)

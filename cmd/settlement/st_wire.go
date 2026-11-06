@@ -28,6 +28,7 @@ type app struct {
 	natsConn   *natsclient.Conn
 	subscriber *natsinfra.Subscriber
 	grpcSrv    *grpcserver.SettlementServer
+	grpcPort   int
 	httpSrv    *http.Server
 
 	batchHandler   *command.BatchHandler
@@ -112,6 +113,9 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		return nil, fmt.Errorf("wire: load business timezone: %w", err)
 	}
 	batchHandler.SetBusinessLocation(businessLocation)
+	if err := command.RegisterBatchAttentionGauge(batchRepo, businessLocation); err != nil {
+		return nil, fmt.Errorf("wire: register batch attention gauge: %w", err)
+	}
 	adminHandler := command.NewAdminHandler(batchRepo, processor)
 	adminHandler.ConfigureSettlement(eventPub, cfg.Settlement.MDRPercent)
 	queryHandler := query.NewBatchQueryHandler(batchRepo)
@@ -128,7 +132,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	if cfg.Settlement.AdminAPIKey == "" {
 		slog.Warn("SETTLEMENT_ADMIN_API_KEY is not configured — admin write operations are disabled")
 	}
-	router := httpinfra.NewRouter(queryHandler, adminHandler, pool, cfg.Settlement.AdminAPIKey)
+	router := httpinfra.NewRouter(queryHandler, adminHandler, pool, cfg.Settlement.AdminAPIKey, natsConn.IsConnected)
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,
@@ -142,6 +146,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		natsConn:   natsConn,
 		subscriber: subscriber,
 		grpcSrv:    grpcSrv,
+		grpcPort:   cfg.GRPCPort,
 		httpSrv:    httpSrv,
 
 		batchHandler:   batchHandler,
@@ -173,11 +178,11 @@ func (a *app) start(ctx context.Context) error {
 
 	// gRPC server
 	go func() {
-		if err := grpcserver.Start(a.grpcSrv, 9093); err != nil {
+		if err := grpcserver.Start(a.grpcSrv, a.grpcPort); err != nil {
 			slog.Error("gRPC server stopped", slog.String("error", err.Error()))
 		}
 	}()
-	slog.Info("gRPC server starting", slog.Int("port", 9093))
+	slog.Info("gRPC server starting", slog.Int("port", a.grpcPort))
 
 	// HTTP server
 	go func() {
@@ -248,6 +253,10 @@ func (a *app) close() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = a.httpSrv.Shutdown(ctx)
+	}
+
+	if a.grpcSrv != nil {
+		a.grpcSrv.Stop()
 	}
 
 	if a.natsConn != nil {

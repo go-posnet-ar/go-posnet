@@ -278,7 +278,8 @@ evento con el total acumulado.
 | Fallo | Resultado | ¿Se recupera solo? |
 |---|---|---|
 | IDs inválidos | `Term`; no se reintenta | No |
-| Error de base de datos al registrar | `Nak` y reintento | **Sí** |
+| Error de base de datos al registrar | `Nak` y reintento con espera (ver [§8](#8-eventos-nats)) | **Sí**, si se resuelve en unos 12 minutos |
+| Se agotan las entregas | El evento no se reintenta; log `deliveries exhausted` y alerta `EventoSettlementPerdido` | No: hay que [reprocesarlo](../runbooks/nats-dlq-reprocess.md) |
 | Conflicto con otro guardado del mismo lote | Reintento interno, y después `Nak` | **Sí** (ver [§5.10](#510-concurrencia)) |
 | Moneda inválida o monto no positivo | `Term`; no se reintenta | No |
 | Se pierde `auth.approved` en Authorization | La transacción falta en el lote; el cierre da `DISPUTED` | No |
@@ -312,7 +313,7 @@ ruta nueva queda protegida por defecto. Las lecturas, `/metrics` y los health ch
 | Método y ruta | Uso | Éxito | Errores |
 |---|---|---|---|
 | `GET /healthz` | Liveness | `200` | — |
-| `GET /readyz` | Readiness; solo verifica Postgres | `200` | `503` |
+| `GET /readyz` | Readiness; verifica Postgres y la conexión a NATS | `200` | `503` |
 | `GET /metrics` | Métricas Prometheus | `200` | — |
 | `GET /batches/{id}` | Consultar un lote | `200` | `404`, `500` |
 | `GET /merchants/{merchant_id}/batches?date=YYYY-MM-DD` | Lotes de un comercio; `date` es obligatorio | `200` | `400`, `500` |
@@ -399,8 +400,8 @@ responde `400`. El `operator_id` queda en los logs.
 
 ## 7. gRPC
 
-Hay un servidor en el puerto 9093 sin servicios registrados, y el contexto no tiene un `.proto`. Es un
-placeholder: cualquier llamada devuelve `Unimplemented`. El puerto está fijo y no respeta `GRPC_PORT`.
+Hay un servidor en `GRPC_PORT` (9093 por defecto) sin servicios registrados, y el contexto no tiene un
+`.proto`. Es un placeholder: cualquier llamada devuelve `Unimplemented`.
 
 ## 8. Eventos NATS
 
@@ -421,9 +422,13 @@ Son durables con queue group del mismo nombre, hasta 5 entregas, política `Deli
 |---|---|---|
 | Envelope o payload inválido | `Term` | No se reintenta |
 | `ValidationError` o `ConflictError` | `Term` | No se reintenta |
-| Cualquier otro error | `Nak` | Reentrega inmediata, sin backoff |
+| Cualquier otro error | `Nak` con espera | Reentrega a los 5 s, 30 s, 2 min y 10 min |
 
-Un mensaje que agota las entregas no pasa a una DLQ. Para recuperarlo, seguir el runbook
+Las esperas dan unos 12 minutos para que se recupere, por ejemplo, una base caída. Los conflictos de versión
+no llegan a este punto: se reintentan antes, como explica [§5.10](#510-concurrencia).
+
+Un mensaje que agota las entregas no pasa a una DLQ: queda el log `deliveries exhausted` y salta la alerta
+`EventoSettlementPerdido`. Para recuperarlo, seguir el runbook
 [nats-dlq-reprocess](../runbooks/nats-dlq-reprocess.md).
 
 ### Publicados
@@ -456,7 +461,7 @@ Payload de `settlement.completed`:
 
 Schema `settlement`. **La fuente real es
 [`01-init.sql`](../../deployments/docker/docker-entrypoint-initdb.d/01-init.sql):** `pgutil.Migrate` no
-hace nada, `migrations/settlement/` está vacío y
+hace nada, [`migrations/settlement/`](../../migrations/settlement/) se aplica a mano y
 [`st_schema.sql`](../../context/settlement/infrastructure/postgres/st_schema.sql) no se ejecuta.
 
 | Tabla | Propósito | Claves e índices |
@@ -502,8 +507,8 @@ NOTHING`. El costo por evento crece con el tamaño del lote, y con él el costo 
 
 ### Apagado
 
-Ante `SIGINT` o `SIGTERM`: detiene HTTP (hasta 10 s), drena y cierra NATS, y cierra el pool de Postgres.
-El servidor gRPC no se detiene de forma ordenada.
+Ante `SIGINT` o `SIGTERM`: detiene HTTP (hasta 10 s) y gRPC, drena y cierra NATS, y cierra el pool de
+Postgres.
 
 ## 10. Observabilidad y operación
 
@@ -513,16 +518,34 @@ El servidor gRPC no se detiene de forma ordenada.
 |---|---|---|---|
 | `posnet_settlement_auth_approved_total` | Counter | — | Aprobaciones registradas |
 | `posnet_settlement_reversals_total` | Counter | — | Reversas procesadas; incluye duplicados que no agregan fila |
-| `posnet_settlement_batches_total` | Counter | `currency`, `state` | Cierres; `state` siempre es `CLOSED`, porque se registra antes de marcar la disputa |
+| `posnet_settlement_batches_total` | Counter | `currency`, `state` | Cierres, por estado resultante: `CLOSED` o `DISPUTED`. Los cierres anteriores a esta versión figuran como `CLOSED` |
 | `posnet_settlement_batch_duration_seconds` | Histogram | — | Duración del cierre |
 | `posnet_settlement_submissions_total` | Counter | `result` | Envíos tras un cierre: `submitted`, `unavailable` o `error`. No incluye `resubmit` |
+| `posnet_settlement_batches_attention` | Gauge | `reason` | Lotes que requieren atención (ver abajo). Consulta la base en cada scrape |
 
-También se exponen métricas del pool de Postgres y de mensajes NATS.
+También se exponen métricas del pool de Postgres y de mensajes NATS, incluida
+`posnet_nats_messages_failed_total{kind="exhausted"}` para los eventos que agotaron las entregas.
 
-**No hay alertas sobre lotes.** Ninguna regla detecta lotes en `DISPUTED`, `CLOSED` trabados u `OPEN`
-vencidos, y `posnet_settlement_batches_total` no permite contar las disputas. `PostgresDeadlock` es la
-única alerta que menciona este contexto. **Dashboard:** `posnet-bc-detail` muestra la duración del
-cierre.
+| `reason` | Qué cuenta |
+|---|---|
+| `disputed` | Lotes en `DISPUTED` |
+| `closed_unsent` | Lotes con transacciones en `CLOSED` hace más de 1 hora |
+| `open_overdue` | Lotes `OPEN` de días de negocio anteriores |
+
+Si la consulta falla, la serie no se informa en ese scrape, y las alertas que dependen de ella no se evalúan.
+
+### Alertas
+
+| Alerta | Severidad | Se activa cuando | Qué hacer |
+|---|---|---|---|
+| `EventoSettlementPerdido` | Crítica | Un evento agotó las entregas. Sigue activa hasta reiniciar el servicio | [Reprocesar el evento](../runbooks/nats-dlq-reprocess.md) |
+| `LotesEnDisputa` | Warning | Hay lotes en disputa durante 15 min | [Escenario A](../runbooks/batch-close-failure.md#escenario-a--lote-en-disputed) |
+| `LotesCerradosSinEnviar` | Warning | `closed_unsent` > 0 durante 15 min | [Escenario C](../runbooks/batch-close-failure.md#escenario-c--lote-en-closed-sin-enviar) |
+| `LotesAbiertosVencidos` | Warning | `open_overdue` > 0 durante 30 min | [Escenario F](../runbooks/batch-close-failure.md#escenario-f--lotes-abiertos-de-días-anteriores) |
+| `EnvioAlProcesadorFallando` | Warning | Hubo envíos `unavailable` o `error` en la última hora. No detecta el primer envío tras un reinicio, pero sí lo hace `LotesCerradosSinEnviar` | [Escenario C](../runbooks/batch-close-failure.md#escenario-c--lote-en-closed-sin-enviar) |
+
+**Las alertas no avisan a nadie todavía:** Alertmanager las envía a `webhook-mock`. **Dashboard:**
+`posnet-bc-detail` muestra la duración del cierre.
 
 ### Para detectar problemas
 
@@ -530,13 +553,14 @@ cierre.
 -- Lotes que requieren atención
 SELECT id, terminal_id, batch_date, state, discrepancies, closed_at
 FROM settlement.settlement_batches
-WHERE state IN ('DISPUTED', 'CLOSED')
-   OR (state = 'OPEN' AND batch_date < CURRENT_DATE)
+WHERE state = 'DISPUTED'
+   OR (state = 'CLOSED' AND COALESCE(total_count, 0) > 0)
+   OR (state = 'OPEN' AND batch_date < (NOW() AT TIME ZONE 'America/Argentina/Buenos_Aires')::date)
 ORDER BY batch_date DESC;
 ```
 
 En los logs, `modified concurrently` indica conflictos de versión, que son esperables con tráfico simultáneo,
-y `no open batch found` indica cierres sin efecto. `batch closed automatically` identifica los cierres sin
+`no open batch found` indica cierres sin efecto y `deliveries exhausted` indica un evento perdido. `batch closed automatically` identifica los cierres sin
 conciliar, y `no settlement processor configured` los lotes que quedaron sin enviar.
 
 ### Variables de entorno
@@ -546,6 +570,7 @@ conciliar, y `no settlement processor configured` los lotes que quedaron sin env
 | `POSTGRES_DSN` | Obligatoria | Sí; sin ella, el proceso termina con `panic` |
 | `NATS_URL` | Obligatoria | Sí; sin ella, el proceso termina con `panic` |
 | `HTTP_PORT` | `8083` | Sí; Docker Compose usa `8084` |
+| `GRPC_PORT` | `9093` | Sí |
 | `POSTGRES_MAX_CONNS`, `POSTGRES_MIN_CONNS` | `15`, `2` | Sí |
 | `POSTGRES_MAX_CONN_LIFETIME`, `POSTGRES_MAX_CONN_IDLE` | `30m`, `5m` | Sí |
 | `NATS_NKEY_PATH`, `NATS_TLS_CERT`, `NATS_TLS_KEY`, `NATS_TLS_CA` | Vacías | Sí |
@@ -560,7 +585,6 @@ conciliar, y `no settlement processor configured` los lotes que quedaron sin env
 | `SETTLEMENT_ADMIN_API_KEY` | Vacía | Sí; token de las escrituras. Vacía, quedan deshabilitadas. Con menos de 32 caracteres, el servicio no arranca. Generarla con `openssl rand -hex 32` |
 | `SETTLEMENT_SUBMIT_RETRIES` | `3` | **No**: no hay procesador real |
 | `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | **No**: no hay procesador real |
-| `GRPC_PORT` | `9093` | **No**: el puerto está fijo en 9093 |
 | `MIGRATIONS_DIR` | `migrations/settlement` | **No**: `Migrate` no hace nada |
 
 ### Levantar y probar
@@ -584,7 +608,8 @@ Para generar un lote, crear y pagar una sesión como se indica en
 
 ```bash
 MERCHANT=b2c3d4e5-f6a7-8901-bcde-f12345678901
-curl -s "localhost:8084/merchants/$MERCHANT/batches?date=$(date -u +%F)" | jq
+BUSINESS_DATE=$(TZ=America/Argentina/Buenos_Aires date +%F)
+curl -s "localhost:8084/merchants/$MERCHANT/batches?date=$BUSINESS_DATE" | jq
 ```
 
 Para probar una disputa, cerrar con totales que **no** coincidan, y después resolverla:
@@ -600,7 +625,7 @@ curl -s localhost:8081/batch-close -H 'Content-Type: application/json' -d '{
 ```
 
 ```bash
-BATCH=$(curl -s "localhost:8084/merchants/$MERCHANT/batches?date=$(date -u +%F)" | jq -r '.batches[0].ID')
+BATCH=$(curl -s "localhost:8084/merchants/$MERCHANT/batches?date=$BUSINESS_DATE" | jq -r '.batches[0].ID')
 OP='"operator_id":"prueba"'
 AUTH="Authorization: Bearer $SETTLEMENT_ADMIN_API_KEY"
 
@@ -643,7 +668,7 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
 | No hay procesador real | `mock` marca `SUBMITTED` sin enviar nada. Falta el adaptador y el archivo de remesa, que requieren la especificación del procesador. `SETTLEMENT_SUBMIT_RETRIES` y `SETTLEMENT_SUBMIT_TIMEOUT` siguen sin efecto | `st_mock_processor.go` |
-| La confirmación de liquidación es manual | Un operador debe llamar a `settle`, sin autenticación ni referencia del procesador | `SettleBatch` |
+| La confirmación de liquidación es manual | Un operador debe llamar a `settle`, sin una referencia del procesador | `SettleBatch` |
 | Nadie consume `settlement.completed` | El comercio no recibe el neto liquidado: Notification no se suscribe | `nt_nats_subscriber.go` |
 | `settlement.completed` sin outbox | Si falla la publicación, nada la reintenta y el lote ya está `SETTLED` | `publishCompletedIfDone` |
 | Evento adicional por lotes tardíos | Un lote abierto después de la liquidación diaria genera otro evento con el total acumulado | `publishCompletedIfDone` |
@@ -652,7 +677,7 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Doble envío posible | Si el procesador acepta y falla el guardado, el lote queda `CLOSED`, y `resubmit` lo enviaría otra vez | `submitBatch`, `ResubmitBatch` |
 | `resolve-dispute` no notifica | Si los totales cambian, Notification solo conoce los del primer cierre | `ResolveDispute` |
 | Auditoría solo en logs | `operator_id` y `reason` no se guardan en la base | `AdminHandler` |
-| Lotes vacíos en `CLOSED` | Los lotes vacíos que cierra el job quedan en `CLOSED` y aparecen en las consultas de lotes pendientes | `autoCloseBatch` |
+| Lotes vacíos en `CLOSED` | Los lotes vacíos que cierra el job quedan en `CLOSED` para siempre y aparecen en la API. No cuentan para las alertas | `autoCloseBatch` |
 
 ### Seguridad
 
@@ -667,14 +692,12 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| Sin alertas de lotes | Los lotes trabados o en disputa solo se descubren consultando la base | Prometheus |
-| Las disputas no se ven en las métricas | `state` siempre vale `CLOSED` en `posnet_settlement_batches_total` | `ProcessBatchClose` |
-| Sin alerta para lotes sin enviar | `posnet_settlement_submissions_total{result="unavailable"}` existe, pero ninguna regla la usa | Prometheus |
+| Las alertas no avisan a nadie | Alertmanager las envía a `webhook-mock`: hay que mirarlas en Prometheus o Alertmanager | Alertmanager |
 | Costo creciente por aprobación | Cada venta carga y reinserta todas las transacciones del lote. Los índices evitan recorrer toda la tabla, pero el costo sigue creciendo con el tamaño del lote | `Save`, `loadTransactions` |
 | `batch-closed` se publica sin outbox | Si falla, Notification no se entera y nada lo reintenta | `ProcessBatchClose` |
 | Un cierre sin lote no recibe respuesta | Terminal Gateway ya respondió `202`, y Settlement solo deja un `WARN` | `ProcessBatchClose` |
-| Sin backoff en NATS | Los errores persistentes, como una base caída, consumen las 5 entregas de inmediato. Los conflictos de versión sí tienen reintento interno | `nak` |
+| Sin DLQ ni reintento pasados unos 12 minutos | Una caída más larga agota las 5 entregas: el evento queda sin registrar hasta que alguien lo reprocesa | `nak` |
+| Un reintento puede llegar después del cierre | Si una venta está esperando su reentrega cuando el terminal cierra, el cierre da `DISPUTED` y la venta entra en un lote nuevo | `retryDelays` |
 | Sin migraciones automáticas | Los cambios de schema hay que aplicarlos a mano en las bases existentes | `pkg/pgutil/migrate.go` |
-| gRPC placeholder y sin apagado ordenado | Abre un puerto que no ofrece nada y que ignora `GRPC_PORT` | `st_grpc_server.go`, `st_wire.go` |
-| `/readyz` no verifica NATS | Una instancia sin NATS sigue figurando como lista | `st_http_handler.go` |
+| gRPC placeholder | Abre un puerto que no ofrece nada | `st_grpc_server.go` |
 | Código sin uso | `port.BatchService` y `port.AdminService` no se implementan; tampoco se usan `mdrPercent`, `BatchTxOffline` ni los eventos de dominio internos | `st_port_inbound.go`, `st_batch_handler.go`, `st_settlement_batch.go` |

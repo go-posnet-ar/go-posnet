@@ -39,3 +39,16 @@ type SettlementBatchRepository interface {
 	// Usado por el job de cierre automático.
 	FindStaleOpenIDs(ctx context.Context, before time.Time) ([]string, error)
 }
+
+// BatchAttentionCounts son los lotes que requieren atención de un operador.
+type BatchAttentionCounts struct {
+	Disputed     int64 // En DISPUTED
+	ClosedUnsent int64 // En CLOSED, con transacciones, desde antes del corte
+	OpenOverdue  int64 // En OPEN, de un día de negocio anterior
+}
+
+// BatchAttentionCounter cuenta los lotes que requieren atención. Es un puerto aparte
+// porque solo lo usan las métricas.
+type BatchAttentionCounter interface {
+	CountBatchesNeedingAttention(ctx context.Context, today, closedBefore time.Time) (BatchAttentionCounts, error)
+}

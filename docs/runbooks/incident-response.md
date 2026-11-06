@@ -7,7 +7,7 @@ Este runbook describe el estado **actual** del sistema, no el previsto. Revisado
 
 | Herramienta | Dónde (Docker Compose) | Estado |
 |---|---|---|
-| Health checks | `/healthz` y `/readyz` de cada servicio | Funcionan; `readyz` solo verifica Postgres |
+| Health checks | `/healthz` y `/readyz` de cada servicio | Funcionan; `readyz` verifica Postgres, y en Settlement también NATS |
 | Logs JSON | `docker logs posnet-<servicio>` | Funcionan; primera herramienta para un caso puntual |
 | Métricas | Prometheus en `localhost:9099`, `/metrics` de cada servicio | Funcionan |
 | Dashboards | Grafana en `localhost:3000` | Saga, detalle por servicio, SLO, runtime e infraestructura |
@@ -43,7 +43,7 @@ Detection 8082, Settlement 8083 y Notification 8084.
 
 ```bash
 curl -s http://localhost:<port>/healthz   # 200 si el proceso está vivo
-curl -s http://localhost:<port>/readyz    # hace ping a Postgres
+curl -s http://localhost:<port>/readyz    # hace ping a Postgres (en Settlement, también NATS)
 curl -s http://localhost:8222/healthz     # estado del servidor NATS
 
 docker ps --filter name=posnet- --format '{{.Names}}\t{{.Status}}'
@@ -53,8 +53,9 @@ docker inspect -f '{{.RestartCount}}' posnet-settlement
 `readyz` en `503` con `{"reason": "database unavailable"}` indica que el proceso está vivo pero no
 alcanza Postgres: andá a la [sección 4](#4-postgres).
 
-**`readyz` no verifica NATS.** Un servicio puede responder `200` sin poder consumir ni publicar eventos,
-por eso conviene verificar NATS por separado.
+**`readyz` no verifica NATS, salvo en Settlement,** donde responde `503` con `{"reason": "nats unavailable"}`.
+Los demás servicios pueden responder `200` sin poder consumir ni publicar eventos, por eso conviene
+verificar NATS por separado.
 
 ### 1.2 ¿Qué tan grave es?
 
@@ -78,6 +79,10 @@ por eso conviene verificar NATS por separado.
 | `CacheRulesLow` | Volumen de tráfico: con poco tráfico puede activarse sin que haya un problema |
 | `PoolPostgresAgotado`, `PostgresDeadlock` | [Sección 4](#4-postgres) |
 | `DuplicadosNATSAltos` | Reinicios en bucle o `AckWait` insuficiente |
+| `EventoSettlementPerdido` | **Falta una venta, una reversa o un cierre en Settlement.** Buscá `deliveries exhausted` en los logs y seguí [Reprocesamiento](nats-dlq-reprocess.md) |
+| `LotesEnDisputa` | [Escenario A](batch-close-failure.md#escenario-a--lote-en-disputed) |
+| `LotesCerradosSinEnviar`, `EnvioAlProcesadorFallando` | [Escenario C](batch-close-failure.md#escenario-c--lote-en-closed-sin-enviar) |
+| `LotesAbiertosVencidos` | [Escenario F](batch-close-failure.md#escenario-f--lotes-abiertos-de-días-anteriores) |
 | `GoroutineLeakSospechoso`, `HeapCreciente` | Dashboard de runtime. En Notification, revisar envíos a Terminal Gateway, que no tienen timeout |
 
 ---
@@ -106,7 +111,8 @@ en Authorization es normal.
 |---|---|
 | `failed to unmarshal envelope`, `failed to unwrap` | Mensaje inválido: se descartó con `Term`. Revisá al productor |
 | `permanent error — terminating` | `ValidationError` o `ConflictError`: no se reintenta. Termina en `message` solo en algunos servicios |
-| `transient error — nacking for retry` | Se reintenta de inmediato, sin backoff, hasta `MaxDeliver` |
+| `transient error — nacking for retry` | Se reintenta de inmediato, sin backoff, hasta `MaxDeliver`. En Settlement, con esperas de 5 s a 10 min |
+| `deliveries exhausted` | Solo en Settlement: **el evento se agotó y no se reintenta.** Seguí [Reprocesamiento](nats-dlq-reprocess.md) |
 | `fraud score event already processed — skipping` | **Si viene después de un error, la Saga se perdió:** la reentrega se descartó (ver [Reprocesamiento](nats-dlq-reprocess.md#3-confirmar-la-causa-y-entender-processed_events)) |
 | `reversal event already processed — skipping` | Lo mismo, para una reversa |
 | `failed to publish` | **Evento perdido.** Se registró el error y se confirmó el mensaje: nadie lo reintenta |
