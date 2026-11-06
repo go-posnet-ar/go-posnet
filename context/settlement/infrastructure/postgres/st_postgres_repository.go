@@ -129,6 +129,23 @@ func (r *SettlementBatchRepo) SaveTx(ctx context.Context, tx pgx.Tx, b *aggregat
 	return nil
 }
 
+// InsertAuditTx guarda un registro de auditoría dentro de tx.
+func (r *SettlementBatchRepo) InsertAuditTx(ctx context.Context, tx pgx.Tx, e repository.BatchAuditEntry) error {
+	const q = `
+		INSERT INTO settlement.batch_audit_log (
+			batch_id, action, operator_id, reason, from_state, to_state,
+			previous_discrepancies, total_amount, confirmation_id
+		) VALUES ($1,$2,$3,NULLIF($4,''),$5,$6,$7,$8,NULLIF($9,''))
+	`
+	if _, err := tx.Exec(ctx, q,
+		e.BatchID, e.Action, e.OperatorID, e.Reason, e.FromState, e.ToState,
+		e.PreviousDiscrepancies, e.TotalAmount, e.ConfirmationID,
+	); err != nil {
+		return fmt.Errorf("InsertAuditTx: %w", err)
+	}
+	return nil
+}
+
 // MerchantDayBatchesTx lista los batches con transacciones del comercio en la fecha.
 //
 // El advisory lock serializa a quienes liquidan el mismo comercio y fecha. Sin él, los

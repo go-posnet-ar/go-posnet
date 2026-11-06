@@ -367,7 +367,7 @@ Responde `{"status": "closed"}`. El lote queda en `CLOSED` con los **totales del
 
 - Encola `batch-closed` en la misma transacción, salvo que el lote esté vacío.
 - No envía el lote: hay que usar `resubmit`.
-- Registra `operator_id` en los logs, en nivel `WARN`.
+- Registra la operación en la [auditoría](#auditoría-de-operadores) y en los logs.
 
 Solo funciona sobre lotes `OPEN`: en cualquier otro estado responde `400`. Los lotes cerrados así
 antes de esta corrección conservan sus discrepancias falsas: en el primer `resubmit` pasan a `DISPUTED`, y
@@ -394,12 +394,12 @@ Lleva el mismo body y responde `{"status": "submitted"}`.
 { "operator_id": "soporte-juan", "reason": "Conciliado con el comercio, ticket 123" }
 ```
 
-Ambos datos quedan **solo en los logs**, en nivel `WARN`.
+Ambos datos quedan en la [auditoría](#auditoría-de-operadores) y en los logs.
 
 ### Confirmar la liquidación
 
 `settle` exige `operator_id` y responde `{"status": "settled"}`. Con un lote que no esté en `SUBMITTED`,
-responde `400`. El `operator_id` queda en los logs.
+responde `400`. El `operator_id` queda en la [auditoría](#auditoría-de-operadores) y en los logs.
 
 ## 7. gRPC
 
@@ -481,6 +481,7 @@ hace nada, [`migrations/settlement/`](../../migrations/settlement/) se aplica a 
 | `batch_transactions` | Transacciones del lote | PK `id`; único `(transaction_id, tx_type)`; FK `batch_id` |
 | `processed_events` | Idempotencia | PK `event_id` |
 | `outbox` | Eventos pendientes de publicar | PK `id`; índice `created_at` |
+| `batch_audit_log` | Cambios de estado hechos por operadores | PK `id`; FK `batch_id`; índice `(batch_id, created_at)` |
 
 | Índice | Para qué sirve |
 |---|---|
@@ -493,20 +494,22 @@ Con 2.000 lotes y 400.000 transacciones, cargar un lote pasó de recorrer toda l
 
 ### Aplicar la migración
 
-**Una base existente necesita `000001` y `000003` antes de desplegar esta versión del servicio.**
+**Una base existente necesita `000001`, `000003` y `000004` antes de desplegar esta versión del servicio.**
 `01-init.sql` solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
 
 ```bash
 psql "$POSTGRES_DSN" -f migrations/settlement/000001_batch_integrity.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000002_batch_indexes.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000003_outbox.up.sql
+psql "$POSTGRES_DSN" -f migrations/settlement/000004_batch_audit.up.sql
 ```
 
 Son idempotentes y no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
 coincide con el de una base nueva.
 
 **Sin `000003`, fallan los cierres y las liquidaciones,** y `/metrics` deja de informar los lotes que
-requieren atención. Se puede aplicar con el servicio anterior en marcha, porque solo agrega una tabla.
+requieren atención. **Sin `000004`, fallan las operaciones de administración.** Las dos se pueden aplicar con
+el servicio anterior en marcha, porque solo agregan una tabla.
 
 `000002` crea los índices con `CONCURRENTLY`, sin bloquear las escrituras, y por eso no puede correr dentro de
 una transacción: no usar `psql -1`. Si se interrumpe, puede dejar un índice inválido: hay que borrarlo y volver
@@ -515,7 +518,34 @@ a ejecutarla. Se puede aplicar después del despliegue, porque el servicio no de
 `000001_batch_integrity.down.sql` la revierte, pero **falla sin cambiar nada** si ya hay varios lotes por
 terminal y fecha o filas `REVERSAL`, porque el schema anterior no los admite. Resolver esos datos es una
 decisión financiera, y el script no los borra. `000003_outbox.down.sql` también falla sin cambiar nada si
-quedan eventos sin publicar: hay que esperar a que salgan.
+quedan eventos sin publicar: hay que esperar a que salgan. `000004_batch_audit.down.sql` falla si hay
+registros de auditoría, para no perderlos.
+
+### Auditoría de operadores
+
+Cada cambio de estado hecho con `force-close`, `resubmit`, `reopen`, `resolve-dispute` o `settle` deja una fila
+en `batch_audit_log`, **en la misma transacción que el cambio:** si no se puede auditar, responde `500` y el
+lote no cambia.
+
+| Columna | Contenido |
+|---|---|
+| `action` | `FORCE_CLOSE`, `RESUBMIT`, `RESUBMIT_BLOCKED`, `REOPEN`, `RESOLVE_DISPUTE` o `SETTLE` |
+| `operator_id`, `reason` | Lo que declaró quien llama. `reason` solo existe en `reopen` y `resolve-dispute` |
+| `from_state`, `to_state` | Estado antes y después |
+| `previous_discrepancies` | Discrepancias antes del cambio |
+| `total_amount` | Total después del cambio; vacío si el lote se reabrió |
+| `confirmation_id` | Lo que devolvió el procesador en un `resubmit` |
+| `created_at` | Fecha y hora del cambio |
+
+```sql
+SELECT created_at, action, operator_id, reason, from_state, to_state, previous_discrepancies, total_amount
+FROM settlement.batch_audit_log
+WHERE batch_id = '<batch_id>'
+ORDER BY created_at;
+```
+
+**No se auditan** las operaciones rechazadas, porque no cambian nada, ni los cierres del terminal o del job
+automático, que no los hace un operador. Las operaciones anteriores a `000004` solo están en los logs.
 
 ### Costo por aprobación
 
@@ -693,16 +723,17 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Evento adicional por lotes tardíos | Un lote abierto después de la liquidación diaria genera otro evento con el total acumulado | `enqueueCompletedIfDone` |
 | El cierre automático no concilia | Los lotes se envían con los totales del backend, sin comparar con el terminal | `CloseStaleBatches` |
 | `force-close` no concilia | El operador asume que los totales del backend son correctos | `ForceClose` |
-| Doble envío posible | Si el procesador acepta y falla el guardado, el lote queda `CLOSED`, y `resubmit` lo enviaría otra vez | `submitBatch`, `ResubmitBatch` |
+| Doble envío posible | Si el procesador acepta y falla el guardado o la auditoría, el lote queda `CLOSED`, y `resubmit` lo enviaría otra vez. En `resubmit` queda el log `accepted by processor but not saved` con el `confirmation_id` | `submitBatch`, `ResubmitBatch` |
 | `resolve-dispute` no notifica | Si los totales cambian, Notification solo conoce los del primer cierre | `ResolveDispute` |
-| Auditoría solo en logs | `operator_id` y `reason` no se guardan en la base | `AdminHandler` |
+| La auditoría no tiene API ni protección propia | Se consulta por SQL, y quien tenga acceso de escritura a la base puede modificarla | `batch_audit_log` |
+| `force-close`, `resubmit` y `settle` no piden motivo | Su auditoría queda sin `reason`. Exigirlo cambiaría el contrato de la API | `st_http_handler.go` |
 | Lotes vacíos en `CLOSED` | Los lotes vacíos que cierra el job quedan en `CLOSED` para siempre y aparecen en la API. No cuentan para las alertas | `autoCloseBatch` |
 
 ### Seguridad
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| Token único, sin identidad | `operator_id` lo declara quien llama: el log no prueba quién hizo la operación, y cualquiera con el token puede hacerlas todas | `adminAuthMiddleware` |
+| Token único, sin identidad | `operator_id` lo declara quien llama: ni el log ni la auditoría prueban quién hizo la operación, y cualquiera con el token puede hacerlas todas | `adminAuthMiddleware` |
 | Lecturas sin autenticación | Con acceso de red, cualquiera puede consultar lotes y montos de los comercios | `adminAuthMiddleware` |
 | Sin rotación ni límite de intentos | Cambiar el token requiere reiniciar el servicio, y no hay freno a los intentos fallidos | `adminAuthMiddleware` |
 | El token viaja sin cifrar | El servicio no usa TLS: el token debe pasar por una red de confianza o un proxy con TLS | `st_wire.go` |

@@ -23,7 +23,7 @@ export AUTH="Authorization: Bearer <token>"
 | `401 UNAUTHORIZED` | Falta el token o es incorrecto. Queda `rejected admin request` en el log |
 | `503 ADMIN_API_DISABLED` | El servicio no tiene `SETTLEMENT_ADMIN_API_KEY`. Hay que configurarla y reiniciarlo |
 
-**Si Settlement falla justo después de un despliegue con errores sobre `version` o `settlement.outbox`,**
+**Si Settlement falla justo después de un despliegue con errores sobre `version`, `settlement.outbox` o `settlement.batch_audit_log`,**
 falta aplicar las [migraciones](../technical/SETTLEMENT.md#aplicar-la-migración).
 
 Revisado contra el código el 2026-11-05. Detalle técnico en
@@ -370,9 +370,19 @@ en `SUBMITTED` y se puede repetir. Con NATS caído, el evento espera en el outbo
 | `POST /batches/{id}/settle` | Solo `SUBMITTED`; otros, `400` | Pasa a `SETTLED` |
 
 Todos los `POST` exigen el token y `operator_id`; `reopen` y `resolve-dispute`, también `reason`. Esos datos
-solo quedan en los logs, y `operator_id` lo declara quien llama: **anotá también en el ticket quién hizo la
-operación**. Un `409` indica que otro proceso modificó el lote: hay
+quedan en la [auditoría](../technical/SETTLEMENT.md#auditoría-de-operadores), pero `operator_id` lo declara
+quien llama: **anotá también en el ticket quién hizo la operación**. Un `500` puede indicar que falta la
+migración de auditoría: el lote no cambió. Un `409` indica que otro proceso modificó el lote: hay
 que consultarlo y repetir. Un `{id}` que no sea un UUID responde `400 INVALID_ID`.
+
+**Si `resubmit` responde `500`, buscá `accepted by processor but not saved` en el log antes de repetirlo:** el
+procesador pudo haber aceptado el lote, y repetir lo enviaría dos veces.
+
+```sql
+-- Quién hizo qué sobre un lote
+SELECT created_at, action, operator_id, reason, from_state, to_state
+FROM settlement.batch_audit_log WHERE batch_id = '<batch_id>' ORDER BY created_at;
+```
 
 **Sobre `force-close`:**
 

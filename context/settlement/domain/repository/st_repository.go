@@ -58,6 +58,36 @@ type MerchantDayBatch struct {
 	TotalAmount int64
 }
 
+// Acciones de operador que quedan en la auditoría.
+const (
+	AuditActionForceClose      = "FORCE_CLOSE"
+	AuditActionResubmit        = "RESUBMIT"
+	AuditActionResubmitBlocked = "RESUBMIT_BLOCKED"
+	AuditActionReopen          = "REOPEN"
+	AuditActionResolveDispute  = "RESOLVE_DISPUTE"
+	AuditActionSettle          = "SETTLE"
+)
+
+// BatchAuditEntry registra un cambio de estado hecho por un operador. OperatorID lo
+// declara quien llama: no prueba su identidad.
+type BatchAuditEntry struct {
+	BatchID               string
+	Action                string
+	OperatorID            string
+	Reason                string // Vacío si la operación no lo pide
+	FromState             string
+	ToState               string
+	PreviousDiscrepancies int
+	TotalAmount           *int64 // Nil si el batch no tiene totales después del cambio
+	ConfirmationID        string // Vacío si no hubo envío al procesador
+}
+
+// BatchAuditLog guarda la auditoría de operador. Se escribe en la misma transacción que
+// el cambio: sin registro, el cambio no se confirma.
+type BatchAuditLog interface {
+	InsertAuditTx(ctx context.Context, tx pgx.Tx, entry BatchAuditEntry) error
+}
+
 // BatchAttentionCounts son los lotes que requieren atención de un operador.
 type BatchAttentionCounts struct {
 	Disputed     int64 // En DISPUTED

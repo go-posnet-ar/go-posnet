@@ -397,7 +397,7 @@ func newEventAdmin(t *testing.T, repo *fakeBatchRepo, publisher *fakePublisher, 
 	t.Helper()
 	pool := newMockPool(t)
 	h := command.NewAdminHandler(repo, nil)
-	h.ConfigureSettlement(pool, publisher, outbox.NewStore(idempotencySchema), mdr)
+	h.ConfigureSettlement(pool, repo, publisher, outbox.NewStore(idempotencySchema), mdr)
 	return h, pool
 }
 
@@ -727,5 +727,181 @@ func TestReopenBatch_FindOpenError(t *testing.T) {
 	err := command.NewAdminHandler(repo, nil).ReopenBatch(context.Background(), port.ReopenBatchCommand{BatchID: b.ID(), OperatorID: "op-1", Reason: "r"})
 	if err == nil || !strings.Contains(err.Error(), "ReopenBatch: find open batch") {
 		t.Fatalf("error = %v, want it to mention ReopenBatch: find open batch", err)
+	}
+}
+
+// ─── Auditoría ────────────────────────────────────────────────────────────────
+
+func onlyAuditEntry(t *testing.T, repo *fakeBatchRepo) repository.BatchAuditEntry {
+	t.Helper()
+	if len(repo.auditEntries) != 1 {
+		t.Fatalf("audit entries = %d, want 1", len(repo.auditEntries))
+	}
+	return repo.auditEntries[0]
+}
+
+func TestAudit_ForceClose(t *testing.T) {
+	b := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	repo := &fakeBatchRepo{findByIDResult: b}
+	h, pool := newEventAdmin(t, repo, &fakePublisher{}, 2.5)
+	expectEventTx(pool, 1)
+
+	if err := h.ForceClose(context.Background(), port.ForceCloseCommand{BatchID: b.ID(), OperatorID: "op-1"}); err != nil {
+		t.Fatalf("ForceClose() error = %v", err)
+	}
+
+	got := onlyAuditEntry(t, repo)
+	if got.BatchID != b.ID() || got.Action != repository.AuditActionForceClose || got.OperatorID != "op-1" {
+		t.Errorf("entry = %+v", got)
+	}
+	if got.FromState != "OPEN" || got.ToState != "CLOSED" {
+		t.Errorf("states = %s → %s, want OPEN → CLOSED", got.FromState, got.ToState)
+	}
+	if got.TotalAmount == nil || *got.TotalAmount != 1000 {
+		t.Errorf("TotalAmount = %v, want 1000", got.TotalAmount)
+	}
+}
+
+func TestAudit_ResubmitKeepsConfirmationID(t *testing.T) {
+	b := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	if err := b.CloseWithBackendTotals(); err != nil {
+		t.Fatalf("CloseWithBackendTotals() error = %v", err)
+	}
+	repo := &fakeBatchRepo{findByIDResult: b}
+	pool := newMockPool(t)
+	expectEventTx(pool, 0)
+	h := command.NewAdminHandler(repo, &fakeProcessor{confirmationID: "conf-1"})
+	h.ConfigureSettlement(pool, repo, &fakePublisher{}, outbox.NewStore(idempotencySchema), 2.5)
+
+	if err := h.ResubmitBatch(context.Background(), port.ResubmitBatchCommand{BatchID: b.ID(), OperatorID: "op-1"}); err != nil {
+		t.Fatalf("ResubmitBatch() error = %v", err)
+	}
+
+	got := onlyAuditEntry(t, repo)
+	if got.Action != repository.AuditActionResubmit || got.ConfirmationID != "conf-1" || got.ToState != "SUBMITTED" {
+		t.Errorf("entry = %+v", got)
+	}
+}
+
+func TestAudit_ResubmitBlockedRecordsDispute(t *testing.T) {
+	b := aggregate.Reconstitute(aggregate.ReconstituteParams{
+		ID: "batch-1", TerminalID: domain.NewTerminalID(), MerchantID: domain.NewMerchantID(),
+		State: valueobject.BatchStateClosed, Currency: "ARS", Discrepancies: 2,
+	})
+	repo := &fakeBatchRepo{findByIDResult: b}
+	h, pool := newEventAdmin(t, repo, &fakePublisher{}, 2.5)
+	expectEventTx(pool, 0)
+
+	err := h.ResubmitBatch(context.Background(), port.ResubmitBatchCommand{BatchID: b.ID(), OperatorID: "op-1"})
+	var ve *pkgerrors.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("error type = %T, want *pkgerrors.ValidationError", err)
+	}
+
+	got := onlyAuditEntry(t, repo)
+	if got.Action != repository.AuditActionResubmitBlocked || got.FromState != "CLOSED" || got.ToState != "DISPUTED" || got.PreviousDiscrepancies != 2 {
+		t.Errorf("entry = %+v", got)
+	}
+}
+
+func TestAudit_ReopenAndResolveKeepReason(t *testing.T) {
+	tests := []struct {
+		name       string
+		run        func(*command.AdminHandler, string) error
+		wantAction string
+		wantState  string
+	}{
+		{"reopen", func(h *command.AdminHandler, id string) error {
+			return h.ReopenBatch(context.Background(), port.ReopenBatchCommand{BatchID: id, OperatorID: "op-1", Reason: "ticket 123"})
+		}, repository.AuditActionReopen, "OPEN"},
+		{"resolve", func(h *command.AdminHandler, id string) error {
+			return h.ResolveDispute(context.Background(), port.ResolveDisputeCommand{BatchID: id, OperatorID: "op-1", Reason: "ticket 123"})
+		}, repository.AuditActionResolveDispute, "CLOSED"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newDisputedBatch(t)
+			previous := b.Discrepancies()
+			repo := &fakeBatchRepo{findByIDResult: b}
+			h, pool := newEventAdmin(t, repo, &fakePublisher{}, 2.5)
+			expectEventTx(pool, 0)
+
+			if err := tc.run(h, b.ID()); err != nil {
+				t.Fatalf("operation error = %v", err)
+			}
+
+			got := onlyAuditEntry(t, repo)
+			if got.Action != tc.wantAction || got.Reason != "ticket 123" || got.FromState != "DISPUTED" || got.ToState != tc.wantState {
+				t.Errorf("entry = %+v", got)
+			}
+			if previous == 0 || got.PreviousDiscrepancies != previous {
+				t.Errorf("PreviousDiscrepancies = %d, want %d", got.PreviousDiscrepancies, previous)
+			}
+		})
+	}
+}
+
+func TestAudit_Settle(t *testing.T) {
+	b := newSubmittedBatch(t, domain.NewMerchantID(), "ARS", 1000)
+	repo := &fakeBatchRepo{findByIDResult: b}
+	h, pool := newEventAdmin(t, repo, &fakePublisher{}, 2.5)
+	expectEventTx(pool, 0)
+
+	if err := h.SettleBatch(context.Background(), port.SettleBatchCommand{BatchID: b.ID(), OperatorID: "op-1"}); err != nil {
+		t.Fatalf("SettleBatch() error = %v", err)
+	}
+
+	got := onlyAuditEntry(t, repo)
+	if got.Action != repository.AuditActionSettle || got.FromState != "SUBMITTED" || got.ToState != "SETTLED" {
+		t.Errorf("entry = %+v", got)
+	}
+}
+
+// Sin el registro de auditoría, el cambio de estado no se confirma.
+func TestAudit_InsertErrorRollsBack(t *testing.T) {
+	b := newSubmittedBatch(t, domain.NewMerchantID(), "ARS", 1000)
+	publisher := &fakePublisher{}
+	repo := &fakeBatchRepo{findByIDResult: b, auditErr: errors.New("connection reset")}
+	h, pool := newEventAdmin(t, repo, publisher, 2.5)
+	expectRolledBackTx(pool)
+
+	if err := h.SettleBatch(context.Background(), port.SettleBatchCommand{BatchID: b.ID(), OperatorID: "op-1"}); err == nil {
+		t.Fatal("SettleBatch() error = nil, want the audit error")
+	}
+	if len(publisher.completed) != 0 {
+		t.Errorf("completed events = %d, want 0", len(publisher.completed))
+	}
+}
+
+func TestAudit_SaveErrorRecordsNothing(t *testing.T) {
+	b := newSubmittedBatch(t, domain.NewMerchantID(), "ARS", 1000)
+	repo := &fakeBatchRepo{findByIDResult: b, saveErr: errors.New("connection reset")}
+	h, pool := newEventAdmin(t, repo, &fakePublisher{}, 2.5)
+	expectRolledBackTx(pool)
+
+	if err := h.SettleBatch(context.Background(), port.SettleBatchCommand{BatchID: b.ID(), OperatorID: "op-1"}); err == nil {
+		t.Fatal("SettleBatch() error = nil, want the Save error")
+	}
+	if len(repo.auditEntries) != 0 {
+		t.Errorf("audit entries = %d, want 0", len(repo.auditEntries))
+	}
+}
+
+// Una validación rechazada no cambia nada y no se audita.
+func TestAudit_RejectedOperationRecordsNothing(t *testing.T) {
+	repo := &fakeBatchRepo{findByIDResult: newClosedBatch(t)}
+	h, _ := newEventAdmin(t, repo, &fakePublisher{}, 2.5)
+
+	if err := h.SettleBatch(context.Background(), port.SettleBatchCommand{BatchID: "batch-1", OperatorID: "op-1"}); err == nil {
+		t.Fatal("SettleBatch() error = nil, want a validation error")
+	}
+	if len(repo.auditEntries) != 0 {
+		t.Errorf("audit entries = %d, want 0", len(repo.auditEntries))
 	}
 }

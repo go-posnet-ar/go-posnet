@@ -23,6 +23,7 @@ import (
 type AdminHandler struct {
 	batchRepo  repository.SettlementBatchRepository
 	processor  service.SettlementProcessor
+	audit      repository.BatchAuditLog
 	publisher  service.EventPublisher // opcional; nil = no genera eventos
 	outbox     *outbox.Store
 	pool       pgutil.PgxPool
@@ -33,24 +34,37 @@ func NewAdminHandler(batchRepo repository.SettlementBatchRepository, processor s
 	return &AdminHandler{batchRepo: batchRepo, processor: processor}
 }
 
-// ConfigureSettlement inyecta lo necesario para generar BatchClosed y
-// SettlementCompleted (desde el wiring).
-func (h *AdminHandler) ConfigureSettlement(pool pgutil.PgxPool, publisher service.EventPublisher, outboxStore *outbox.Store, mdrPercent float64) {
+// ConfigureSettlement inyecta lo necesario para auditar las operaciones y generar
+// BatchClosed y SettlementCompleted (desde el wiring).
+func (h *AdminHandler) ConfigureSettlement(pool pgutil.PgxPool, audit repository.BatchAuditLog, publisher service.EventPublisher, outboxStore *outbox.Store, mdrPercent float64) {
 	h.pool = pool
+	h.audit = audit
 	h.publisher = publisher
 	h.outbox = outboxStore
 	h.mdrPercent = mdrPercent
 }
 
-// saveWithEvents guarda el batch y encola sus eventos en una sola transacción. Sin
-// publisher configurado, solo lo guarda.
-func (h *AdminHandler) saveWithEvents(ctx context.Context, batch *aggregate.SettlementBatch, enqueue func(tx pgx.Tx) error) error {
-	if h.publisher == nil {
+// persist guarda el batch, su registro de auditoría y sus eventos (enqueue, opcional) en
+// una sola transacción. Sin ConfigureSettlement, solo guarda el batch.
+func (h *AdminHandler) persist(ctx context.Context, batch *aggregate.SettlementBatch, entry repository.BatchAuditEntry, enqueue func(tx pgx.Tx) error) error {
+	if h.pool == nil {
 		return h.batchRepo.Save(ctx, batch)
+	}
+	entry.BatchID = batch.ID()
+	entry.ToState = batch.State().String()
+	if s := batch.Summary(); s != nil {
+		total := s.TotalAmount().Cents()
+		entry.TotalAmount = &total
 	}
 	return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
 		if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
 			return err
+		}
+		if err := h.audit.InsertAuditTx(ctx, tx, entry); err != nil {
+			return err
+		}
+		if enqueue == nil {
+			return nil
 		}
 		return enqueue(tx)
 	})
@@ -83,10 +97,14 @@ func (h *AdminHandler) ForceClose(ctx context.Context, cmd port.ForceCloseComman
 			fmt.Sprintf("batch must be OPEN to force-close, current state is %s", batch.State()),
 		)
 	}
+	entry := repository.BatchAuditEntry{
+		Action: repository.AuditActionForceClose, OperatorID: cmd.OperatorID,
+		FromState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
+	}
 	if err := batch.CloseWithBackendTotals(); err != nil {
 		return fmt.Errorf("ForceClose: close: %w", err)
 	}
-	err = h.saveWithEvents(ctx, batch, func(tx pgx.Tx) error {
+	err = h.persist(ctx, batch, entry, func(tx pgx.Tx) error {
 		// Un lote vacío no tiene nada que informar, igual que en el cierre automático.
 		if len(batch.Transactions()) == 0 {
 			return nil
@@ -137,11 +155,16 @@ func (h *AdminHandler) ResubmitBatch(ctx context.Context, cmd port.ResubmitBatch
 	// Un lote con discrepancias no se envía: pasa a DISPUTED, de donde el operador
 	// lo saca con ReopenBatch o ResolveDispute. Cubre los lotes de ForceClose y los
 	// que quedaron en CLOSED porque falló el guardado de DISPUTED durante el cierre.
+	entry := repository.BatchAuditEntry{
+		Action: repository.AuditActionResubmit, OperatorID: cmd.OperatorID,
+		FromState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
+	}
 	if batch.Discrepancies() > 0 {
 		if err := batch.MarkDisputed("resubmit blocked: batch has discrepancies"); err != nil {
 			return fmt.Errorf("ResubmitBatch: %w", err)
 		}
-		if err := h.batchRepo.Save(ctx, batch); err != nil {
+		entry.Action = repository.AuditActionResubmitBlocked
+		if err := h.persist(ctx, batch, entry, nil); err != nil {
 			return fmt.Errorf("ResubmitBatch: save: %w", err)
 		}
 		observability.FromContext(ctx).Warn("resubmit blocked by discrepancies — batch moved to DISPUTED",
@@ -162,7 +185,15 @@ func (h *AdminHandler) ResubmitBatch(ctx context.Context, cmd port.ResubmitBatch
 	if err := batch.Submit(); err != nil {
 		return fmt.Errorf("ResubmitBatch: %w", err)
 	}
-	if err := h.batchRepo.Save(ctx, batch); err != nil {
+	entry.ConfirmationID = confirmationID
+	if err := h.persist(ctx, batch, entry, nil); err != nil {
+		// El procesador ya aceptó: esta es la única copia del confirmation_id.
+		observability.FromContext(ctx).Error("batch accepted by processor but not saved — do not resubmit without checking",
+			slog.String("batch_id", batch.ID()),
+			slog.String("operator_id", cmd.OperatorID),
+			slog.String("confirmation_id", confirmationID),
+			slog.String("error", err.Error()),
+		)
 		return fmt.Errorf("ResubmitBatch: save: %w", err)
 	}
 
@@ -198,10 +229,14 @@ func (h *AdminHandler) ReopenBatch(ctx context.Context, cmd port.ReopenBatchComm
 	}
 
 	previousDiscrepancies := batch.Discrepancies()
+	entry := repository.BatchAuditEntry{
+		Action: repository.AuditActionReopen, OperatorID: cmd.OperatorID, Reason: cmd.Reason,
+		FromState: batch.State().String(), PreviousDiscrepancies: previousDiscrepancies,
+	}
 	if err := batch.Reopen(); err != nil {
 		return fmt.Errorf("ReopenBatch: %w", err)
 	}
-	if err := h.batchRepo.Save(ctx, batch); err != nil {
+	if err := h.persist(ctx, batch, entry, nil); err != nil {
 		return fmt.Errorf("ReopenBatch: save: %w", err)
 	}
 
@@ -227,10 +262,14 @@ func (h *AdminHandler) ResolveDispute(ctx context.Context, cmd port.ResolveDispu
 	}
 
 	previousDiscrepancies := batch.Discrepancies()
+	entry := repository.BatchAuditEntry{
+		Action: repository.AuditActionResolveDispute, OperatorID: cmd.OperatorID, Reason: cmd.Reason,
+		FromState: batch.State().String(), PreviousDiscrepancies: previousDiscrepancies,
+	}
 	if err := batch.ResolveDispute(); err != nil {
 		return fmt.Errorf("ResolveDispute: %w", err)
 	}
-	if err := h.batchRepo.Save(ctx, batch); err != nil {
+	if err := h.persist(ctx, batch, entry, nil); err != nil {
 		return fmt.Errorf("ResolveDispute: save: %w", err)
 	}
 
@@ -271,10 +310,14 @@ func (h *AdminHandler) SettleBatch(ctx context.Context, cmd port.SettleBatchComm
 		)
 	}
 
+	entry := repository.BatchAuditEntry{
+		Action: repository.AuditActionSettle, OperatorID: cmd.OperatorID,
+		FromState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
+	}
 	if err := batch.MarkSettled(); err != nil {
 		return fmt.Errorf("SettleBatch: %w", err)
 	}
-	err = h.saveWithEvents(ctx, batch, func(tx pgx.Tx) error {
+	err = h.persist(ctx, batch, entry, func(tx pgx.Tx) error {
 		return h.enqueueCompletedIfDone(ctx, tx, batch)
 	})
 	if err != nil {

@@ -126,7 +126,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		return nil, fmt.Errorf("wire: register batch attention gauge: %w", err)
 	}
 	adminHandler := command.NewAdminHandler(batchRepo, processor)
-	adminHandler.ConfigureSettlement(pool, eventPub, outboxStore, cfg.Settlement.MDRPercent)
+	adminHandler.ConfigureSettlement(pool, batchRepo, eventPub, outboxStore, cfg.Settlement.MDRPercent)
 	queryHandler := query.NewBatchQueryHandler(batchRepo)
 
 	// ── Adaptadores de entrada ─────────────────────────────────────────────────

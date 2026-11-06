@@ -932,3 +932,51 @@ func TestMerchantDayBatchesTx_LockError(t *testing.T) {
 		t.Fatal("MerchantDayBatchesTx() error = nil, want error")
 	}
 }
+
+func TestInsertAuditTx(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	total := int64(1000)
+	entry := repository.BatchAuditEntry{
+		BatchID: "batch-1", Action: repository.AuditActionResubmit, OperatorID: "op-1",
+		FromState: "CLOSED", ToState: "SUBMITTED", PreviousDiscrepancies: 2,
+		TotalAmount: &total, ConfirmationID: "conf-1",
+	}
+
+	pool.ExpectBegin()
+	pool.ExpectExec("INSERT INTO settlement.batch_audit_log").
+		WithArgs("batch-1", repository.AuditActionResubmit, "op-1", "", "CLOSED", "SUBMITTED", 2, &total, "conf-1").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectRollback()
+
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	if err := repo.InsertAuditTx(context.Background(), tx, entry); err != nil {
+		t.Fatalf("InsertAuditTx() error = %v", err)
+	}
+}
+
+func TestInsertAuditTx_Error(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+
+	pool.ExpectBegin()
+	pool.ExpectExec("INSERT INTO settlement.batch_audit_log").
+		WithArgs(anyArgs(9)...).
+		WillReturnError(errors.New("db down"))
+	pool.ExpectRollback()
+
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+
+	if err := repo.InsertAuditTx(context.Background(), tx, repository.BatchAuditEntry{}); err == nil {
+		t.Fatal("InsertAuditTx() error = nil, want error")
+	}
+}

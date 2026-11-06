@@ -203,6 +203,20 @@ CREATE TABLE IF NOT EXISTS settlement.outbox (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_settlement_outbox_created_at ON settlement.outbox (created_at);
+CREATE TABLE IF NOT EXISTS settlement.batch_audit_log (
+    id                     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    batch_id               UUID        NOT NULL REFERENCES settlement.settlement_batches(id),
+    action                 VARCHAR(30) NOT NULL,
+    operator_id            TEXT        NOT NULL,
+    reason                 TEXT,
+    from_state             VARCHAR(20) NOT NULL,
+    to_state               VARCHAR(20) NOT NULL,
+    previous_discrepancies INTEGER     NOT NULL,
+    total_amount           BIGINT,
+    confirmation_id        TEXT,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_batch_audit_log_batch ON settlement.batch_audit_log (batch_id, created_at);
 
 -- notification
 CREATE TABLE IF NOT EXISTS notification.notifications (

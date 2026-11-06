@@ -206,7 +206,7 @@ consulta puntual.
 **Migraciones manuales:** no se aplican solas. Sin la de la
 [blocklist](../technical/AUTHORIZATION.md#aplicar-la-migración-de-blocklist), todas las transacciones fallan
 por la falta de `card_token`. Sin la de
-[lotes](../technical/SETTLEMENT.md#aplicar-la-migración), Settlement falla por la falta de `version` o de `settlement.outbox`.
+[lotes](../technical/SETTLEMENT.md#aplicar-la-migración), Settlement falla por la falta de `version`, `settlement.outbox` o `settlement.batch_audit_log`.
 
 ---
 

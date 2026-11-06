@@ -37,6 +37,9 @@ type fakeBatchRepo struct {
 	dayResult []repository.MerchantDayBatch
 	dayErr    error
 
+	auditEntries []repository.BatchAuditEntry
+	auditErr     error
+
 	staleIDs []string
 	staleErr error
 }
@@ -55,6 +58,14 @@ func (f *fakeBatchRepo) SaveTx(ctx context.Context, _ pgx.Tx, b *aggregate.Settl
 
 func (f *fakeBatchRepo) MerchantDayBatchesTx(context.Context, pgx.Tx, domain.MerchantID, time.Time) ([]repository.MerchantDayBatch, error) {
 	return f.dayResult, f.dayErr
+}
+
+func (f *fakeBatchRepo) InsertAuditTx(_ context.Context, _ pgx.Tx, e repository.BatchAuditEntry) error {
+	if f.auditErr != nil {
+		return f.auditErr
+	}
+	f.auditEntries = append(f.auditEntries, e)
+	return nil
 }
 
 func (f *fakeBatchRepo) lastSaved() *aggregate.SettlementBatch {
