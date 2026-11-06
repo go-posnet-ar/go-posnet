@@ -146,6 +146,86 @@ func (r *SettlementBatchRepo) InsertAuditTx(ctx context.Context, tx pgx.Tx, e re
 	return nil
 }
 
+// FindPurchaseTx busca la compra de una transacción, en cualquier lote.
+func (r *SettlementBatchRepo) FindPurchaseTx(ctx context.Context, tx pgx.Tx, transactionID string) (*repository.ReversalPurchase, error) {
+	const q = `
+		SELECT b.merchant_id::text, t.amount_cents, t.currency
+		FROM settlement.batch_transactions t
+		JOIN settlement.settlement_batches b ON b.id = t.batch_id
+		WHERE t.transaction_id = $1 AND t.tx_type = 'PURCHASE'
+	`
+	var p repository.ReversalPurchase
+	err := tx.QueryRow(ctx, q, transactionID).Scan(&p.MerchantID, &p.AmountCents, &p.Currency)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("FindPurchaseTx: %w", err)
+	}
+	return &p, nil
+}
+
+// InsertReversalReviewTx abre la revisión. Si la transacción ya tiene una, no hace nada.
+func (r *SettlementBatchRepo) InsertReversalReviewTx(ctx context.Context, tx pgx.Tx, v repository.ReversalReview) error {
+	const q = `
+		INSERT INTO settlement.reversal_reviews (
+			transaction_id, batch_id, reason, merchant_id, reversal_amount, reversal_currency,
+			purchase_merchant_id, purchase_amount, purchase_currency
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		ON CONFLICT (transaction_id) DO NOTHING
+	`
+	var (
+		purchaseMerchant, purchaseCurrency *string
+		purchaseAmount                     *int64
+	)
+	if v.Purchase != nil {
+		purchaseMerchant, purchaseAmount, purchaseCurrency = &v.Purchase.MerchantID, &v.Purchase.AmountCents, &v.Purchase.Currency
+	}
+	if _, err := tx.Exec(ctx, q,
+		v.TransactionID, v.BatchID, v.Reason, v.MerchantID, v.AmountCents, v.Currency,
+		purchaseMerchant, purchaseAmount, purchaseCurrency,
+	); err != nil {
+		return fmt.Errorf("InsertReversalReviewTx: %w", err)
+	}
+	return nil
+}
+
+// ReconcileReversalReviewTx compara la compra recién llegada con la reversa que la esperaba.
+func (r *SettlementBatchRepo) ReconcileReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID string, p repository.ReversalPurchase) (string, bool, error) {
+	const q = `
+		WITH checked AS (
+			SELECT transaction_id,
+			       CASE WHEN merchant_id <> $2::uuid THEN 'MERCHANT_MISMATCH'
+			            WHEN reversal_currency <> $4 THEN 'CURRENCY_MISMATCH'
+			            WHEN reversal_amount <> $3 THEN 'AMOUNT_MISMATCH'
+			       END AS mismatch
+			FROM settlement.reversal_reviews
+			WHERE transaction_id = $1 AND reason = 'PURCHASE_NOT_FOUND' AND resolved_at IS NULL
+		)
+		UPDATE settlement.reversal_reviews r
+		SET purchase_merchant_id = $2::uuid, purchase_amount = $3, purchase_currency = $4,
+		    reason      = COALESCE(c.mismatch, r.reason),
+		    resolved_at = CASE WHEN c.mismatch IS NULL THEN now() END,
+		    resolved_by = CASE WHEN c.mismatch IS NULL THEN 'system' END,
+		    resolution  = CASE WHEN c.mismatch IS NULL THEN 'La compra llegó después y coincide' END
+		FROM checked c
+		WHERE r.transaction_id = c.transaction_id
+		RETURNING r.reason, r.resolved_at IS NOT NULL
+	`
+	var (
+		reason   string
+		resolved bool
+	)
+	err := tx.QueryRow(ctx, q, transactionID, p.MerchantID, p.AmountCents, p.Currency).Scan(&reason, &resolved)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("ReconcileReversalReviewTx: %w", err)
+	}
+	return reason, resolved, nil
+}
+
 // MerchantDayBatchesTx lista los batches con transacciones del comercio en la fecha.
 //
 // El advisory lock serializa a quienes liquidan el mismo comercio y fecha. Sin él, los
@@ -368,21 +448,22 @@ func (r *SettlementBatchRepo) ListByMerchantDate(
 
 // CountBatchesNeedingAttention cuenta los lotes en disputa, los CLOSED con transacciones
 // sin enviar desde antes de closedBefore, los OPEN de días anteriores a today y los eventos
-// en el outbox desde antes de outboxBefore. Los lotes vacíos en CLOSED no cuentan: no hay
-// nada que enviar.
-func (r *SettlementBatchRepo) CountBatchesNeedingAttention(ctx context.Context, today, closedBefore, outboxBefore time.Time) (repository.BatchAttentionCounts, error) {
+// en el outbox desde antes de outboxBefore y las revisiones de reversas abiertas desde antes
+// de reviewBefore. Los lotes vacíos en CLOSED no cuentan: no hay nada que enviar.
+func (r *SettlementBatchRepo) CountBatchesNeedingAttention(ctx context.Context, today, closedBefore, outboxBefore, reviewBefore time.Time) (repository.BatchAttentionCounts, error) {
 	const q = `
 		SELECT
 			COUNT(*) FILTER (WHERE state = 'DISPUTED'),
 			COUNT(*) FILTER (WHERE state = 'CLOSED' AND COALESCE(total_count, 0) > 0 AND closed_at < $1),
 			COUNT(*) FILTER (WHERE state = 'OPEN' AND batch_date < $2::date),
-			(SELECT COUNT(*) FROM settlement.outbox WHERE created_at < $3)
+			(SELECT COUNT(*) FROM settlement.outbox WHERE created_at < $3),
+			(SELECT COUNT(*) FROM settlement.reversal_reviews WHERE resolved_at IS NULL AND created_at < $4)
 		FROM settlement.settlement_batches
 		WHERE state IN ('DISPUTED', 'CLOSED', 'OPEN')
 	`
 	var c repository.BatchAttentionCounts
-	err := r.pool.QueryRow(ctx, q, closedBefore, today.Format("2006-01-02"), outboxBefore).
-		Scan(&c.Disputed, &c.ClosedUnsent, &c.OpenOverdue, &c.OutboxStuck)
+	err := r.pool.QueryRow(ctx, q, closedBefore, today.Format("2006-01-02"), outboxBefore, reviewBefore).
+		Scan(&c.Disputed, &c.ClosedUnsent, &c.OpenOverdue, &c.OutboxStuck, &c.ReversalsInReview)
 	if err != nil {
 		return repository.BatchAttentionCounts{}, fmt.Errorf("CountBatchesNeedingAttention: %w", err)
 	}

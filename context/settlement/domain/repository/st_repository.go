@@ -88,16 +88,59 @@ type BatchAuditLog interface {
 	InsertAuditTx(ctx context.Context, tx pgx.Tx, entry BatchAuditEntry) error
 }
 
+// Motivos por los que una reversa queda en revisión.
+const (
+	ReversalReviewPurchaseNotFound = "PURCHASE_NOT_FOUND"
+	ReversalReviewMerchantMismatch = "MERCHANT_MISMATCH"
+	ReversalReviewCurrencyMismatch = "CURRENCY_MISMATCH"
+	ReversalReviewAmountMismatch   = "AMOUNT_MISMATCH"
+)
+
+// ReversalPurchase es la compra registrada a la que apunta una reversa.
+type ReversalPurchase struct {
+	MerchantID  string
+	AmountCents int64
+	Currency    string
+}
+
+// ReversalReview es una reversa que no coincide con su compra. La reversa se registra
+// igual: la revisión la deja a la vista. Purchase es nil si la compra no está.
+type ReversalReview struct {
+	TransactionID string
+	BatchID       string
+	Reason        string
+	MerchantID    string
+	AmountCents   int64
+	Currency      string
+	Purchase      *ReversalPurchase
+}
+
+// ReversalReviewLog valida las reversas contra sus compras. Todos los métodos corren en
+// la transacción que registra la reversa o la compra.
+type ReversalReviewLog interface {
+	// FindPurchaseTx devuelve la compra de la transacción, o nil si no está registrada.
+	FindPurchaseTx(ctx context.Context, tx pgx.Tx, transactionID string) (*ReversalPurchase, error)
+
+	// InsertReversalReviewTx abre la revisión. Una transacción tiene una sola revisión.
+	InsertReversalReviewTx(ctx context.Context, tx pgx.Tx, review ReversalReview) error
+
+	// ReconcileReversalReviewTx actualiza la revisión de una reversa que llegó antes que
+	// su compra: la cierra si coinciden o cambia el motivo si no. Devuelve el resultado
+	// (vacío si no había revisión abierta, o el motivo vigente) y si quedó cerrada.
+	ReconcileReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID string, purchase ReversalPurchase) (reason string, resolved bool, err error)
+}
+
 // BatchAttentionCounts son los lotes que requieren atención de un operador.
 type BatchAttentionCounts struct {
-	Disputed     int64 // En DISPUTED
-	ClosedUnsent int64 // En CLOSED, con transacciones, desde antes del corte
-	OpenOverdue  int64 // En OPEN, de un día de negocio anterior
-	OutboxStuck  int64 // Eventos en el outbox desde antes del corte
+	Disputed          int64 // En DISPUTED
+	ClosedUnsent      int64 // En CLOSED, con transacciones, desde antes del corte
+	OpenOverdue       int64 // En OPEN, de un día de negocio anterior
+	OutboxStuck       int64 // Eventos en el outbox desde antes del corte
+	ReversalsInReview int64 // Revisiones de reversas abiertas desde antes del corte
 }
 
 // BatchAttentionCounter cuenta los lotes que requieren atención. Es un puerto aparte
 // porque solo lo usan las métricas.
 type BatchAttentionCounter interface {
-	CountBatchesNeedingAttention(ctx context.Context, today, closedBefore, outboxBefore time.Time) (BatchAttentionCounts, error)
+	CountBatchesNeedingAttention(ctx context.Context, today, closedBefore, outboxBefore, reviewBefore time.Time) (BatchAttentionCounts, error)
 }

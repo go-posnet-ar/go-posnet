@@ -105,10 +105,11 @@ type fakeAttentionCounter struct {
 	today        time.Time
 	closedBefore time.Time
 	outboxBefore time.Time
+	reviewBefore time.Time
 }
 
-func (f *fakeAttentionCounter) CountBatchesNeedingAttention(_ context.Context, today, closedBefore, outboxBefore time.Time) (repository.BatchAttentionCounts, error) {
-	f.today, f.closedBefore, f.outboxBefore = today, closedBefore, outboxBefore
+func (f *fakeAttentionCounter) CountBatchesNeedingAttention(_ context.Context, today, closedBefore, outboxBefore, reviewBefore time.Time) (repository.BatchAttentionCounts, error) {
+	f.today, f.closedBefore, f.outboxBefore, f.reviewBefore = today, closedBefore, outboxBefore, reviewBefore
 	return f.counts, f.err
 }
 
@@ -128,7 +129,7 @@ func attentionByReason(t *testing.T, reader *sdkmetric.ManualReader) map[string]
 
 func TestBatchAttentionGauge_ReportsEveryReason(t *testing.T) {
 	reader := newTestReader(t)
-	counter := &fakeAttentionCounter{counts: repository.BatchAttentionCounts{Disputed: 2, OpenOverdue: 1, OutboxStuck: 4}}
+	counter := &fakeAttentionCounter{counts: repository.BatchAttentionCounts{Disputed: 2, OpenOverdue: 1, OutboxStuck: 4, ReversalsInReview: 5}}
 	loc := time.FixedZone("BA", -3*60*60)
 	if err := command.RegisterBatchAttentionGauge(counter, loc); err != nil {
 		t.Fatalf("RegisterBatchAttentionGauge() error = %v", err)
@@ -141,6 +142,12 @@ func TestBatchAttentionGauge_ReportsEveryReason(t *testing.T) {
 	}
 	if counter.outboxBefore.After(before.Add(-time.Minute + time.Second)) {
 		t.Errorf("outboxBefore = %v, want about one minute ago", counter.outboxBefore)
+	}
+	if dps := metrics["posnet_settlement_reversals_in_review"].Data.(metricdata.Gauge[int64]).DataPoints; len(dps) != 1 || dps[0].Value != 5 {
+		t.Errorf("reversals in review data points = %+v, want a single value of 5", dps)
+	}
+	if counter.reviewBefore.After(before.Add(-15*time.Minute + time.Second)) {
+		t.Errorf("reviewBefore = %v, want about 15 minutes ago", counter.reviewBefore)
 	}
 	got := attentionByReason(t, reader)
 

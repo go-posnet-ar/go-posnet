@@ -157,11 +157,11 @@ Al recibir `auth.approved`:
 
 1. Valida los IDs, la moneda y el monto, y calcula el día de negocio de `authorized_at`.
 2. Marca el evento en `processed_events` dentro de una transacción.
-3. Busca el lote `OPEN` del terminal para ese día y moneda o lo crea, en una transacción `SERIALIZABLE`.
-4. Agrega la transacción y guarda el lote, en otra transacción.
+3. Busca el lote `OPEN` del terminal para ese día y moneda o lo crea, en una transacción `SERIALIZABLE` aparte.
+4. Agrega la transacción, guarda el lote y [compara la reversa](#52-reversa) si había una esperando esta compra,
+   en la transacción del paso 2.
 
-El guardado queda fuera de la transacción de idempotencia. Si el commit final falla, la reentrega
-reprocesa sin duplicar, gracias a `ON CONFLICT (transaction_id, tx_type) DO NOTHING`.
+Si algo falla, nada de los pasos 2 y 4 se confirma, y el evento se reintenta.
 
 ### 5.2 Reversa
 
@@ -173,8 +173,24 @@ monto del evento. La fila va al **lote abierto del momento**, no necesariamente 
 | La compra está en el lote abierto | Ese lote queda con el monto neto |
 | La compra está en un lote ya cerrado | La reversa entra en un lote nuevo, que puede dar un **total negativo** |
 
-No se verifica que la compra exista en Settlement ni que el monto coincida: se confía en el evento de
-Authorization.
+**La reversa se registra siempre, con el monto del evento, y se compara con su compra.** Si no coinciden, queda
+además en `reversal_reviews` y salta la alerta `ReversasEnRevision`. No se rechaza: una reversa `Term` se perdería.
+
+| `reason` | Situación |
+|---|---|
+| `PURCHASE_NOT_FOUND` | La compra no está en Settlement |
+| `MERCHANT_MISMATCH` | La compra es de otro comercio |
+| `CURRENCY_MISMATCH` | La moneda es otra. La reversa entra en un lote de la moneda del evento |
+| `AMOUNT_MISMATCH` | El monto es otro. Authorization siempre revierte el monto completo: no hay reversas parciales |
+
+Si hay más de una diferencia, el motivo es el primero de esa lista, de arriba abajo.
+
+**La reversa puede llegar antes que la compra,** porque van por consumidores distintos y una compra puede
+demorarse en reintentos. Al llegar la compra, si coincide, la revisión se cierra sola (`resolved_by = 'system'`).
+Si no coincide, cambia el motivo y sigue abierta.
+
+**Una revisión abierta no frena nada:** el lote se cierra y se envía con el monto del evento. Para corregirlo,
+ver el [Escenario H](../runbooks/batch-close-failure.md#escenario-h--reversas-en-revisión).
 
 **Las reversas anteriores a esta corrección no se recuperan solas:** se descartaron, y su evento ya figura
 como procesado. Ver el
@@ -481,6 +497,7 @@ hace nada, [`migrations/settlement/`](../../migrations/settlement/) se aplica a 
 | `batch_transactions` | Transacciones del lote | PK `id`; único `(transaction_id, tx_type)`; FK `batch_id` |
 | `processed_events` | Idempotencia | PK `event_id` |
 | `outbox` | Eventos pendientes de publicar | PK `id`; índice `created_at` |
+| `reversal_reviews` | Reversas que no coinciden con su compra | PK `transaction_id`; FK `batch_id`; índice `created_at` de las abiertas |
 | `batch_audit_log` | Cambios de estado hechos por operadores | PK `id`; FK `batch_id`; índice `(batch_id, created_at)` |
 
 | Índice | Para qué sirve |
@@ -494,7 +511,8 @@ Con 2.000 lotes y 400.000 transacciones, cargar un lote pasó de recorrer toda l
 
 ### Aplicar la migración
 
-**Una base existente necesita `000001`, `000003` y `000004` antes de desplegar esta versión del servicio.**
+**Una base existente necesita `000001`, `000003`, `000004` y `000005` antes de desplegar esta versión del
+servicio.**
 `01-init.sql` solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
 
 ```bash
@@ -502,14 +520,16 @@ psql "$POSTGRES_DSN" -f migrations/settlement/000001_batch_integrity.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000002_batch_indexes.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000003_outbox.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000004_batch_audit.up.sql
+psql "$POSTGRES_DSN" -f migrations/settlement/000005_reversal_reviews.up.sql
 ```
 
 Son idempotentes y no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
 coincide con el de una base nueva.
 
 **Sin `000003`, fallan los cierres y las liquidaciones,** y `/metrics` deja de informar los lotes que
-requieren atención. **Sin `000004`, fallan las operaciones de administración.** Las dos se pueden aplicar con
-el servicio anterior en marcha, porque solo agregan una tabla.
+requieren atención. **Sin `000004`, fallan las operaciones de administración.** **Sin `000005`, fallan todas las ventas y reversas,**
+y al agotar los reintentos sus eventos se pierden. Las tres se pueden aplicar con el servicio anterior en marcha,
+porque solo agregan una tabla.
 
 `000002` crea los índices con `CONCURRENTLY`, sin bloquear las escrituras, y por eso no puede correr dentro de
 una transacción: no usar `psql -1`. Si se interrumpe, puede dejar un índice inválido: hay que borrarlo y volver
@@ -519,7 +539,8 @@ a ejecutarla. Se puede aplicar después del despliegue, porque el servicio no de
 terminal y fecha o filas `REVERSAL`, porque el schema anterior no los admite. Resolver esos datos es una
 decisión financiera, y el script no los borra. `000003_outbox.down.sql` también falla sin cambiar nada si
 quedan eventos sin publicar: hay que esperar a que salgan. `000004_batch_audit.down.sql` falla si hay
-registros de auditoría, para no perderlos.
+registros de auditoría, para no perderlos. `000005_reversal_reviews.down.sql` falla si hay revisiones abiertas, y
+exige volver antes a una versión del servicio que no use la tabla.
 
 ### Auditoría de operadores
 
@@ -570,6 +591,7 @@ el pool de Postgres.
 | `posnet_settlement_submissions_total` | Counter | `result` | Envíos tras un cierre: `submitted`, `unavailable` o `error`. No incluye `resubmit` |
 | `posnet_settlement_batches_attention` | Gauge | `reason` | Lotes que requieren atención (ver abajo). Consulta la base en cada scrape |
 | `posnet_settlement_outbox_stuck` | Gauge | — | Eventos en el outbox desde hace más de 1 minuto |
+| `posnet_settlement_reversals_in_review` | Gauge | — | Revisiones de reversas abiertas desde hace más de 15 minutos, para dar tiempo a una compra demorada |
 
 También se exponen métricas del pool de Postgres y de mensajes NATS, incluida
 `posnet_nats_messages_failed_total{kind="exhausted"}` para los eventos que agotaron las entregas.
@@ -588,6 +610,7 @@ Si la consulta falla, estas series no se informan en ese scrape, y las alertas q
 |---|---|---|---|
 | `EventoSettlementPerdido` | Crítica | Un evento agotó las entregas. Sigue activa hasta reiniciar el servicio | [Reprocesar el evento](../runbooks/nats-dlq-reprocess.md) |
 | `OutboxSettlementTrabado` | Warning | Hay eventos en el outbox hace más de 1 minuto, durante 5 min | Revisar NATS y el log `outbox relay`. Se publican solos al resolver la causa |
+| `ReversasEnRevision` | Warning | Hay revisiones abiertas hace más de 15 min, durante 5 min | [Escenario H](../runbooks/batch-close-failure.md#escenario-h--reversas-en-revisión) |
 | `LotesEnDisputa` | Warning | Hay lotes en disputa durante 15 min | [Escenario A](../runbooks/batch-close-failure.md#escenario-a--lote-en-disputed) |
 | `LotesCerradosSinEnviar` | Warning | `closed_unsent` > 0 durante 15 min | [Escenario C](../runbooks/batch-close-failure.md#escenario-c--lote-en-closed-sin-enviar) |
 | `LotesAbiertosVencidos` | Warning | `open_overdue` > 0 durante 30 min | [Escenario F](../runbooks/batch-close-failure.md#escenario-f--lotes-abiertos-de-días-anteriores) |
@@ -610,7 +633,8 @@ ORDER BY batch_date DESC;
 
 En los logs, `modified concurrently` indica conflictos de versión, que son esperables con tráfico simultáneo,
 `no open batch found` indica cierres sin efecto, `deliveries exhausted` un evento perdido y
-`outbox relay: publish cycle failed` que el Relay no puede publicar. `batch closed automatically` identifica los cierres sin
+`outbox relay: publish cycle failed` que el Relay no puede publicar y `reversal registered for review` una
+reversa que no coincide con su compra. `batch closed automatically` identifica los cierres sin
 conciliar, y `no settlement processor configured` los lotes que quedaron sin enviar.
 
 ### Variables de entorno
@@ -709,7 +733,9 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 |---|---|---|
 | Reversas anteriores sin recuperar | Las procesadas antes de la corrección no se guardaron, y sus eventos figuran como procesados | Datos históricos |
 | Un cierre tardío usa solo lo pendiente | Si los contadores del terminal no se reinician tras cada cierre, el segundo cierre del día da `DISPUTED` | `ProcessBatchClose` |
-| La reversa no se valida contra la compra | Se confía en el monto y la moneda del evento | `RegisterReversal` |
+| Una reversa en revisión se descuenta igual | El lote se cierra y se envía con el monto del evento, aunque no coincida con la compra. Corregirlo es manual | `RegisterReversal` |
+| Falso positivo si reversa y compra se procesan a la vez | Ninguna ve aún a la otra, y la revisión queda como `PURCHASE_NOT_FOUND`, aunque la compra exista. El Escenario H lo detecta | `reviewReversal` |
+| Las revisiones se cierran por SQL | No hay endpoint, y `resolved_by` lo escribe quien ejecuta la consulta | `reversal_reviews` |
 | Una sola zona horaria | No sirve para comercios de distintas zonas | `SETTLEMENT_BUSINESS_TIMEZONE` |
 | `batch_date` no valida coherencia | Un terminal puede pedir el cierre de cualquier fecha con un lote `OPEN` | `closeDate` |
 

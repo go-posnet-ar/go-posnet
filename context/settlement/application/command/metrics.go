@@ -24,6 +24,7 @@ import (
 //	posnet_settlement_submissions   → posnet_settlement_submissions_total{result}
 //	posnet_settlement_batches_attention → posnet_settlement_batches_attention{reason}
 //	posnet_settlement_outbox_stuck → posnet_settlement_outbox_stuck
+//	posnet_settlement_reversals_in_review → posnet_settlement_reversals_in_review
 //
 // El label "bc" lo inyecta Prometheus como target label (prometheus.yml).
 type Metrics struct {
@@ -48,6 +49,9 @@ const (
 	// outboxStuckAfter es cuánto puede esperar un evento en el outbox: el Relay lo
 	// publica en segundos, salvo que NATS no esté disponible.
 	outboxStuckAfter = time.Minute
+	// reversalReviewAfter da tiempo a que llegue la compra de una reversa adelantada: un
+	// evento puede tardar unos 12 minutos en reintentos (ver retryDelays en el subscriber).
+	reversalReviewAfter = 15 * time.Minute
 	// attentionQueryTimeout acota la consulta para no demorar el scrape de /metrics.
 	attentionQueryTimeout = 2 * time.Second
 )
@@ -147,6 +151,13 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 	if err != nil {
 		return err
 	}
+	reviewGauge, err := observability.Meter("posnet.settlement").Int64ObservableGauge(
+		"posnet_settlement_reversals_in_review",
+		metric.WithDescription("Reversas que no coinciden con su compra, en revisión hace más de 15 minutos."),
+	)
+	if err != nil {
+		return err
+	}
 	_, err = observability.Meter("posnet.settlement").RegisterCallback(
 		func(ctx context.Context, o metric.Observer) error {
 			ctx, cancel := context.WithTimeout(ctx, attentionQueryTimeout)
@@ -156,7 +167,7 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 			y, m, d := now.In(loc).Date()
 			today := time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
 
-			counts, err := counter.CountBatchesNeedingAttention(ctx, today, now.Add(-closedUnsentAfter), now.Add(-outboxStuckAfter))
+			counts, err := counter.CountBatchesNeedingAttention(ctx, today, now.Add(-closedUnsentAfter), now.Add(-outboxStuckAfter), now.Add(-reversalReviewAfter))
 			if err != nil {
 				slog.ErrorContext(ctx, "failed to count batches needing attention", slog.String("error", err.Error()))
 				return nil
@@ -168,9 +179,10 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 			observe("closed_unsent", counts.ClosedUnsent)
 			observe("open_overdue", counts.OpenOverdue)
 			o.ObserveInt64(outboxGauge, counts.OutboxStuck)
+			o.ObserveInt64(reviewGauge, counts.ReversalsInReview)
 			return nil
 		},
-		gauge, outboxGauge,
+		gauge, outboxGauge, reviewGauge,
 	)
 	return err
 }

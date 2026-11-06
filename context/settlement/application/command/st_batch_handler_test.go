@@ -1101,3 +1101,145 @@ func (f *fakeBatchRepoStaleReload) SaveTx(ctx context.Context, _ pgx.Tx, b *aggr
 func (f *fakeBatchRepoCancelOnSave) SaveTx(ctx context.Context, _ pgx.Tx, b *aggregate.SettlementBatch) error {
 	return f.Save(ctx, b)
 }
+
+// ─── Revisión de reversas ─────────────────────────────────────────────────────
+
+type fakeReviews struct {
+	purchase *repository.ReversalPurchase
+	findErr  error
+
+	inserted  []repository.ReversalReview
+	insertErr error
+
+	reconcileReason   string
+	reconcileResolved bool
+	reconcileErr      error
+	reconciled        []repository.ReversalPurchase
+}
+
+func (f *fakeReviews) FindPurchaseTx(context.Context, pgx.Tx, string) (*repository.ReversalPurchase, error) {
+	return f.purchase, f.findErr
+}
+
+func (f *fakeReviews) InsertReversalReviewTx(_ context.Context, _ pgx.Tx, r repository.ReversalReview) error {
+	f.inserted = append(f.inserted, r)
+	return f.insertErr
+}
+
+func (f *fakeReviews) ReconcileReversalReviewTx(_ context.Context, _ pgx.Tx, _ string, p repository.ReversalPurchase) (string, bool, error) {
+	f.reconciled = append(f.reconciled, p)
+	return f.reconcileReason, f.reconcileResolved, f.reconcileErr
+}
+
+func TestRegisterReversal_Review(t *testing.T) {
+	cmd := validReversalCmd()
+	match := repository.ReversalPurchase{MerchantID: cmd.MerchantID, AmountCents: cmd.AmountCents, Currency: cmd.Currency}
+	with := func(change func(*repository.ReversalPurchase)) *repository.ReversalPurchase {
+		p := match
+		change(&p)
+		return &p
+	}
+	tests := []struct {
+		name       string
+		purchase   *repository.ReversalPurchase
+		wantReason string
+	}{
+		{"coincide", &match, ""},
+		{"sin compra", nil, repository.ReversalReviewPurchaseNotFound},
+		{"otro monto", with(func(p *repository.ReversalPurchase) { p.AmountCents++ }), repository.ReversalReviewAmountMismatch},
+		{"otra moneda", with(func(p *repository.ReversalPurchase) { p.Currency = "USD" }), repository.ReversalReviewCurrencyMismatch},
+		{"otro comercio", with(func(p *repository.ReversalPurchase) { p.MerchantID = domain.NewMerchantID().String() }), repository.ReversalReviewMerchantMismatch},
+		{"el comercio pesa más que el monto", with(func(p *repository.ReversalPurchase) {
+			p.MerchantID = domain.NewMerchantID().String()
+			p.AmountCents++
+		}), repository.ReversalReviewMerchantMismatch},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+			repo := &fakeBatchRepo{findOrCreateResult: batch}
+			pool := newMockPool(t)
+			expectClaimed(pool, 1)
+			reviews := &fakeReviews{purchase: tc.purchase}
+			h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+			h.SetReversalReviews(reviews)
+
+			if err := h.RegisterReversal(context.Background(), cmd); err != nil {
+				t.Fatalf("RegisterReversal() error = %v", err)
+			}
+
+			// La reversa se registra siempre, con el monto del evento.
+			if repo.saveCallCount != 1 {
+				t.Errorf("Save call count = %d, want 1", repo.saveCallCount)
+			}
+			if tc.wantReason == "" {
+				if len(reviews.inserted) != 0 {
+					t.Errorf("reviews = %+v, want none", reviews.inserted)
+				}
+				return
+			}
+			if len(reviews.inserted) != 1 {
+				t.Fatalf("reviews = %d, want 1", len(reviews.inserted))
+			}
+			got := reviews.inserted[0]
+			if got.Reason != tc.wantReason || got.BatchID != batch.ID() || got.TransactionID != cmd.OriginalTransactionID || got.AmountCents != cmd.AmountCents {
+				t.Errorf("review = %+v", got)
+			}
+		})
+	}
+}
+
+// Si no se puede validar, nada se confirma: el evento se reintenta.
+func TestRegisterReversal_ReviewErrorsRollBack(t *testing.T) {
+	tests := []struct {
+		name    string
+		reviews *fakeReviews
+	}{
+		{"lookup", &fakeReviews{findErr: errors.New("db down")}},
+		{"insert", &fakeReviews{insertErr: errors.New("db down")}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &fakeBatchRepo{findOrCreateResult: newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())}
+			pool := newMockPool(t)
+			expectClaimedThenFail(pool, 1)
+			h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+			h.SetReversalReviews(tc.reviews)
+
+			if err := h.RegisterReversal(context.Background(), validReversalCmd()); err == nil {
+				t.Fatal("RegisterReversal() error = nil, want it to fail")
+			}
+		})
+	}
+}
+
+func TestRegisterApproval_ReconcilesPendingReview(t *testing.T) {
+	repo := &fakeBatchRepo{findOrCreateResult: newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())}
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+	reviews := &fakeReviews{reconcileReason: repository.ReversalReviewPurchaseNotFound, reconcileResolved: true}
+	h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+	h.SetReversalReviews(reviews)
+	cmd := validApprovalCmd()
+
+	if err := h.RegisterApproval(context.Background(), cmd); err != nil {
+		t.Fatalf("RegisterApproval() error = %v", err)
+	}
+
+	want := repository.ReversalPurchase{MerchantID: cmd.MerchantID, AmountCents: cmd.AmountCents, Currency: cmd.Currency}
+	if len(reviews.reconciled) != 1 || reviews.reconciled[0] != want {
+		t.Errorf("reconciled = %+v, want [%+v]", reviews.reconciled, want)
+	}
+}
+
+func TestRegisterApproval_ReconcileErrorRollsBack(t *testing.T) {
+	repo := &fakeBatchRepo{findOrCreateResult: newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())}
+	pool := newMockPool(t)
+	expectClaimedThenFail(pool, 1)
+	h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+	h.SetReversalReviews(&fakeReviews{reconcileErr: errors.New("db down")})
+
+	if err := h.RegisterApproval(context.Background(), validApprovalCmd()); err == nil {
+		t.Fatal("RegisterApproval() error = nil, want the reconcile error")
+	}
+}

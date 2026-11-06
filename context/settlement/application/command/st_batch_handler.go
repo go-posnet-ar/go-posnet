@@ -36,6 +36,12 @@ type BatchHandler struct {
 	mdrPercent  float64
 	metrics     *Metrics // opcional; nil = sin instrumentación (tests)
 	location    *time.Location
+	reviews     repository.ReversalReviewLog // opcional; nil = no valida las reversas
+}
+
+// SetReversalReviews habilita la validación de las reversas contra sus compras.
+func (h *BatchHandler) SetReversalReviews(reviews repository.ReversalReviewLog) {
+	h.reviews = reviews
 }
 
 // SetBusinessLocation define la zona horaria del día de negocio. Sin configurar, usa UTC.
@@ -114,9 +120,13 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 		authorizedAt = time.Now().UTC()
 	}
 
-	var batchID string
+	var (
+		batchID        string
+		reviewReason   string
+		reviewResolved bool
+	)
 	err = retryOnStale(ctx, func() error {
-		batchID = ""
+		batchID, reviewReason, reviewResolved = "", "", false
 		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
 			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
 			if err != nil {
@@ -135,7 +145,17 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 				return fmt.Errorf("add transaction: %w", err)
 			}
 			batchID = batch.ID()
-			return h.batchRepo.Save(ctx, batch)
+			if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
+				return err
+			}
+			if h.reviews == nil {
+				return nil
+			}
+			// La reversa pudo llegar antes: si la estaba esperando, se compara ahora.
+			reviewReason, reviewResolved, err = h.reviews.ReconcileReversalReviewTx(ctx, tx, txID.String(), repository.ReversalPurchase{
+				MerchantID: merchantID.String(), AmountCents: cmd.AmountCents, Currency: cmd.Currency,
+			})
+			return err
 		})
 	})
 	if err != nil {
@@ -143,6 +163,11 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 		return fmt.Errorf("RegisterApproval: %w", err)
 	}
 
+	if reviewResolved {
+		log.Info("reversal review resolved — the purchase arrived and matches")
+	} else if reviewReason != "" {
+		log.Warn("reversal does not match the purchase that arrived later", slog.String("reason", reviewReason))
+	}
 	if batchID != "" {
 		h.metrics.RecordAuthApproved(ctx)
 		log.Info("transaction registered in batch",
@@ -181,9 +206,12 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 		completedAt = time.Now().UTC()
 	}
 
-	var registered bool
+	var (
+		registered   bool
+		reviewReason string
+	)
 	err = retryOnStale(ctx, func() error {
-		registered = false
+		registered, reviewReason = false, ""
 		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
 			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
 			if err != nil {
@@ -201,7 +229,11 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 				return fmt.Errorf("remove transaction: %w", err)
 			}
 			registered = true
-			return h.batchRepo.Save(ctx, batch)
+			if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
+				return err
+			}
+			reviewReason, err = h.reviewReversal(ctx, tx, batch.ID(), origTxID.String(), merchantID.String(), cmd)
+			return err
 		})
 	})
 	if err != nil {
@@ -210,7 +242,58 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 	if registered {
 		h.metrics.RecordReversal(ctx)
 	}
+	if reviewReason != "" {
+		observability.FromContext(ctx).Warn("reversal registered for review",
+			slog.String("transaction_id", cmd.OriginalTransactionID),
+			slog.String("event_id", cmd.EventID),
+			slog.String("reason", reviewReason),
+			slog.Int64("amount_cents", cmd.AmountCents),
+			slog.String("currency", cmd.Currency),
+		)
+	}
 	return nil
+}
+
+// reviewReversal compara la reversa con su compra y, si no coinciden, abre una revisión.
+// Devuelve el motivo, o vacío si coinciden.
+func (h *BatchHandler) reviewReversal(ctx context.Context, tx pgx.Tx, batchID, transactionID, merchantID string, cmd port.RegisterReversalCommand) (string, error) {
+	if h.reviews == nil {
+		return "", nil
+	}
+	purchase, err := h.reviews.FindPurchaseTx(ctx, tx, transactionID)
+	if err != nil {
+		return "", err
+	}
+	reason := reversalMismatch(purchase, merchantID, cmd.AmountCents, cmd.Currency)
+	if reason == "" {
+		return "", nil
+	}
+	err = h.reviews.InsertReversalReviewTx(ctx, tx, repository.ReversalReview{
+		TransactionID: transactionID,
+		BatchID:       batchID,
+		Reason:        reason,
+		MerchantID:    merchantID,
+		AmountCents:   cmd.AmountCents,
+		Currency:      cmd.Currency,
+		Purchase:      purchase,
+	})
+	return reason, err
+}
+
+// reversalMismatch devuelve por qué la reversa no coincide con la compra, o vacío si
+// coincide. Authorization siempre revierte el monto completo: no hay reversas parciales.
+func reversalMismatch(purchase *repository.ReversalPurchase, merchantID string, amountCents int64, currency string) string {
+	switch {
+	case purchase == nil:
+		return repository.ReversalReviewPurchaseNotFound
+	case purchase.MerchantID != merchantID:
+		return repository.ReversalReviewMerchantMismatch
+	case purchase.Currency != currency:
+		return repository.ReversalReviewCurrencyMismatch
+	case purchase.AmountCents != amountCents:
+		return repository.ReversalReviewAmountMismatch
+	}
+	return ""
 }
 
 // ProcessBatchClose procesa el cierre de lote solicitado por el terminal.

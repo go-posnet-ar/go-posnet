@@ -79,6 +79,7 @@ verificar NATS por separado.
 | `CacheRulesLow` | Volumen de tráfico: con poco tráfico puede activarse sin que haya un problema |
 | `PoolPostgresAgotado`, `PostgresDeadlock` | [Sección 4](#4-postgres) |
 | `DuplicadosNATSAltos` | Reinicios en bucle o `AckWait` insuficiente |
+| `ReversasEnRevision` | [Escenario H](batch-close-failure.md#escenario-h--reversas-en-revisión). `MERCHANT_MISMATCH` es lo más urgente |
 | `OutboxSettlementTrabado` | NATS y el log `outbox relay`. **No se pierde nada:** los eventos de Settlement salen solos al resolver la causa |
 | `EventoSettlementPerdido` | **Falta una venta, una reversa o un cierre en Settlement.** Buscá `deliveries exhausted` en los logs y seguí [Reprocesamiento](nats-dlq-reprocess.md) |
 | `LotesEnDisputa` | [Escenario A](batch-close-failure.md#escenario-a--lote-en-disputed) |
@@ -206,7 +207,8 @@ consulta puntual.
 **Migraciones manuales:** no se aplican solas. Sin la de la
 [blocklist](../technical/AUTHORIZATION.md#aplicar-la-migración-de-blocklist), todas las transacciones fallan
 por la falta de `card_token`. Sin la de
-[lotes](../technical/SETTLEMENT.md#aplicar-la-migración), Settlement falla por la falta de `version`, `settlement.outbox` o `settlement.batch_audit_log`.
+[lotes](../technical/SETTLEMENT.md#aplicar-la-migración), Settlement falla por la falta de `version`, `settlement.outbox`, `settlement.batch_audit_log` o
+`settlement.reversal_reviews`; sin esta última, fallan todas las ventas.
 
 ---
 

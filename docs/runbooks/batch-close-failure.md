@@ -23,7 +23,8 @@ export AUTH="Authorization: Bearer <token>"
 | `401 UNAUTHORIZED` | Falta el token o es incorrecto. Queda `rejected admin request` en el log |
 | `503 ADMIN_API_DISABLED` | El servicio no tiene `SETTLEMENT_ADMIN_API_KEY`. Hay que configurarla y reiniciarlo |
 
-**Si Settlement falla justo después de un despliegue con errores sobre `version`, `settlement.outbox` o `settlement.batch_audit_log`,**
+**Si Settlement falla justo después de un despliegue con errores sobre `version`, `settlement.outbox`, `settlement.batch_audit_log` o
+`settlement.reversal_reviews`,**
 falta aplicar las [migraciones](../technical/SETTLEMENT.md#aplicar-la-migración).
 
 Revisado contra el código el 2026-11-05. Detalle técnico en
@@ -354,6 +355,46 @@ Los lotes vacíos no impiden que se publique el evento.
 
 El evento se guarda junto con la liquidación. Si no se puede guardar, `settle` responde `500`, el lote sigue
 en `SUBMITTED` y se puede repetir. Con NATS caído, el evento espera en el outbox y sale solo.
+
+---
+
+## Escenario H — Reversas en revisión
+
+**Síntoma:** alerta `ReversasEnRevision`, o `reversal registered for review` en los logs.
+
+**Qué significa:** la reversa ya se descontó, con el monto del evento, pero no coincide con su compra. **El lote
+sigue su ciclo normal:** si el monto está mal, el total enviado también.
+
+```sql
+-- Revisiones abiertas, con la compra tal como está ahora
+SELECT r.transaction_id, r.reason, r.created_at, r.batch_id, b.state AS batch_state,
+       r.merchant_id, r.reversal_amount, r.reversal_currency,
+       t.amount_cents AS purchase_amount, t.currency AS purchase_currency
+FROM settlement.reversal_reviews r
+JOIN settlement.settlement_batches b ON b.id = r.batch_id
+LEFT JOIN settlement.batch_transactions t ON t.transaction_id = r.transaction_id AND t.tx_type = 'PURCHASE'
+WHERE r.resolved_at IS NULL
+ORDER BY r.created_at;
+```
+
+| `reason` | Qué revisar |
+|---|---|
+| `PURCHASE_NOT_FOUND`, con `purchase_amount` completo y coincidente | **Falso positivo:** reversa y compra se procesaron a la vez. Cerrar la revisión |
+| `PURCHASE_NOT_FOUND`, sin compra | Falta la venta en Settlement: [Escenario D](#escenario-d--aprobaciones-fuera-de-todo-lote). Si llega y coincide, la revisión se cierra sola |
+| `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH` | Comparar con la transacción en Authorization: hoy siempre revierte el monto completo, así que apunta a un error |
+| `MERCHANT_MISMATCH` | **Puede descontarle a un comercio una venta de otro.** Escalar antes de enviar el lote |
+
+Si el lote de `batch_id` aún no se envió y el monto es incorrecto, corregirlo es una decisión financiera: ver
+[Modificar un lote a mano](#modificar-un-lote-a-mano). Después, cerrar la revisión:
+
+```sql
+UPDATE settlement.reversal_reviews
+SET resolved_at = now(), resolved_by = '<operador>', resolution = '<qué se hizo, ticket>'
+WHERE transaction_id = '<transaction_id>' AND resolved_at IS NULL
+RETURNING transaction_id, reason, resolved_by;
+```
+
+Cerrar la revisión no cambia ningún monto.
 
 ---
 

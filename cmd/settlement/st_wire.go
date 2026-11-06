@@ -117,6 +117,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		return nil, fmt.Errorf("init settlement metrics: %w", err)
 	}
 	batchHandler.SetMetrics(settlementMetrics)
+	batchHandler.SetReversalReviews(batchRepo)
 	businessLocation, err := time.LoadLocation(cfg.Settlement.BusinessTimezone)
 	if err != nil {
 		return nil, fmt.Errorf("wire: load business timezone: %w", err)

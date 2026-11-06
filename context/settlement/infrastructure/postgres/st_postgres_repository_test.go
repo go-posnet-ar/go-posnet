@@ -821,17 +821,18 @@ func TestCountBatchesNeedingAttention(t *testing.T) {
 	today := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	closedBefore := today.Add(-time.Hour)
 	outboxBefore := today.Add(-time.Minute)
+	reviewBefore := today.Add(-15 * time.Minute)
 
 	pool.ExpectQuery("FROM settlement.settlement_batches").
-		WithArgs(closedBefore, "2026-11-05", outboxBefore).
-		WillReturnRows(pgxmock.NewRows([]string{"disputed", "closed", "open", "outbox"}).AddRow(int64(3), int64(2), int64(1), int64(4)))
+		WithArgs(closedBefore, "2026-11-05", outboxBefore, reviewBefore).
+		WillReturnRows(pgxmock.NewRows([]string{"disputed", "closed", "open", "outbox", "reviews"}).AddRow(int64(3), int64(2), int64(1), int64(4), int64(5)))
 
-	got, err := repo.CountBatchesNeedingAttention(context.Background(), today, closedBefore, outboxBefore)
+	got, err := repo.CountBatchesNeedingAttention(context.Background(), today, closedBefore, outboxBefore, reviewBefore)
 	if err != nil {
 		t.Fatalf("CountBatchesNeedingAttention() error = %v", err)
 	}
-	if got.Disputed != 3 || got.ClosedUnsent != 2 || got.OpenOverdue != 1 || got.OutboxStuck != 4 {
-		t.Errorf("counts = %+v, want {3 2 1 4}", got)
+	if got.Disputed != 3 || got.ClosedUnsent != 2 || got.OpenOverdue != 1 || got.OutboxStuck != 4 || got.ReversalsInReview != 5 {
+		t.Errorf("counts = %+v, want {3 2 1 4 5}", got)
 	}
 }
 
@@ -840,10 +841,10 @@ func TestCountBatchesNeedingAttention_QueryError(t *testing.T) {
 	repo := postgres.NewSettlementBatchRepo(pool)
 
 	pool.ExpectQuery("FROM settlement.settlement_batches").
-		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WithArgs(anyArgs(4)...).
 		WillReturnError(errors.New("db down"))
 
-	if _, err := repo.CountBatchesNeedingAttention(context.Background(), time.Now(), time.Now(), time.Now()); err == nil {
+	if _, err := repo.CountBatchesNeedingAttention(context.Background(), time.Now(), time.Now(), time.Now(), time.Now()); err == nil {
 		t.Fatal("CountBatchesNeedingAttention() error = nil, want error")
 	}
 }
@@ -978,5 +979,93 @@ func TestInsertAuditTx_Error(t *testing.T) {
 
 	if err := repo.InsertAuditTx(context.Background(), tx, repository.BatchAuditEntry{}); err == nil {
 		t.Fatal("InsertAuditTx() error = nil, want error")
+	}
+}
+
+// reviewTx abre una transacción simulada para los métodos de revisión de reversas.
+func reviewTx(t *testing.T, pool pgxmock.PgxPoolIface) pgx.Tx {
+	t.Helper()
+	pool.ExpectBegin()
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	return tx
+}
+
+func TestFindPurchaseTx(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	tx := reviewTx(t, pool)
+
+	pool.ExpectQuery("FROM settlement.batch_transactions").WithArgs("tx-1").
+		WillReturnRows(pgxmock.NewRows([]string{"merchant", "amount", "currency"}).AddRow("m-1", int64(1000), "ARS"))
+
+	got, err := repo.FindPurchaseTx(context.Background(), tx, "tx-1")
+	if err != nil {
+		t.Fatalf("FindPurchaseTx() error = %v", err)
+	}
+	want := repository.ReversalPurchase{MerchantID: "m-1", AmountCents: 1000, Currency: "ARS"}
+	if got == nil || *got != want {
+		t.Errorf("purchase = %+v, want %+v", got, want)
+	}
+}
+
+func TestFindPurchaseTx_NotFound(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	tx := reviewTx(t, pool)
+
+	pool.ExpectQuery("FROM settlement.batch_transactions").WithArgs("tx-1").WillReturnError(pgx.ErrNoRows)
+
+	got, err := repo.FindPurchaseTx(context.Background(), tx, "tx-1")
+	if err != nil || got != nil {
+		t.Errorf("FindPurchaseTx() = %+v, %v, want nil, nil", got, err)
+	}
+}
+
+func TestInsertReversalReviewTx_WithoutPurchase(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	tx := reviewTx(t, pool)
+
+	pool.ExpectExec("INSERT INTO settlement.reversal_reviews").
+		WithArgs("tx-1", "b-1", repository.ReversalReviewPurchaseNotFound, "m-1", int64(1000), "ARS", (*string)(nil), (*int64)(nil), (*string)(nil)).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+
+	err := repo.InsertReversalReviewTx(context.Background(), tx, repository.ReversalReview{
+		TransactionID: "tx-1", BatchID: "b-1", Reason: repository.ReversalReviewPurchaseNotFound,
+		MerchantID: "m-1", AmountCents: 1000, Currency: "ARS",
+	})
+	if err != nil {
+		t.Fatalf("InsertReversalReviewTx() error = %v", err)
+	}
+}
+
+func TestReconcileReversalReviewTx(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	tx := reviewTx(t, pool)
+
+	pool.ExpectQuery("UPDATE settlement.reversal_reviews").WithArgs("tx-1", "m-1", int64(1000), "ARS").
+		WillReturnRows(pgxmock.NewRows([]string{"reason", "resolved"}).AddRow(repository.ReversalReviewPurchaseNotFound, true))
+
+	reason, resolved, err := repo.ReconcileReversalReviewTx(context.Background(), tx, "tx-1",
+		repository.ReversalPurchase{MerchantID: "m-1", AmountCents: 1000, Currency: "ARS"})
+	if err != nil || !resolved || reason != repository.ReversalReviewPurchaseNotFound {
+		t.Errorf("ReconcileReversalReviewTx() = %q, %v, %v", reason, resolved, err)
+	}
+}
+
+func TestReconcileReversalReviewTx_NoOpenReview(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	tx := reviewTx(t, pool)
+
+	pool.ExpectQuery("UPDATE settlement.reversal_reviews").WithArgs(anyArgs(4)...).WillReturnError(pgx.ErrNoRows)
+
+	reason, resolved, err := repo.ReconcileReversalReviewTx(context.Background(), tx, "tx-1", repository.ReversalPurchase{})
+	if err != nil || resolved || reason != "" {
+		t.Errorf("ReconcileReversalReviewTx() = %q, %v, %v, want empty", reason, resolved, err)
 	}
 }

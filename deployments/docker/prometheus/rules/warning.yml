@@ -128,3 +128,15 @@ groups:
           summary: "{{ $value }} eventos trabados en el outbox de Settlement"
           description: "batch-closed y settlement.completed no llegan a NATS. Se publicarán solos cuando se resuelva la causa. Revisar NATS y los logs 'outbox relay'."
 
+      # Reversas que no coinciden con su compra. La métrica ya espera 15 minutos, para dar
+      # tiempo a que llegue una compra demorada.
+      # Investigar: docs/runbooks/batch-close-failure.md, Escenario H.
+      - alert: ReversasEnRevision
+        expr: max(posnet_settlement_reversals_in_review) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} reversas en revisión"
+          description: "Hay reversas sin compra o que no coinciden con ella. Se descontaron con el monto del evento (batch-close-failure.md, Escenario H)."
+
