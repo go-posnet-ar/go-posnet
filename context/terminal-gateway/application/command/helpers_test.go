@@ -9,6 +9,7 @@ import (
 
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/entity"
+	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/repository"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
@@ -26,6 +27,11 @@ type fakeSessionRepo struct {
 
 	findResult *aggregate.PaymentSession
 	findErr    error
+
+	// expirePending son las sesiones vencidas que devuelve ExpireAwaiting, de a limit.
+	expirePending []repository.ExpiredSession
+	expireErr     error
+	expireCalls   int
 }
 
 func (f *fakeSessionRepo) Save(_ context.Context, s *aggregate.PaymentSession) error {
@@ -55,8 +61,15 @@ func (f *fakeSessionRepo) FindActiveByTerminal(context.Context, domain.TerminalI
 	return nil, nil
 }
 
-func (f *fakeSessionRepo) DeleteExpired(context.Context) (int64, error) {
-	return 0, nil
+func (f *fakeSessionRepo) ExpireAwaiting(_ context.Context, limit int) ([]repository.ExpiredSession, error) {
+	f.expireCalls++
+	if f.expireErr != nil {
+		return nil, f.expireErr
+	}
+	n := min(limit, len(f.expirePending))
+	batch := f.expirePending[:n]
+	f.expirePending = f.expirePending[n:]
+	return batch, nil
 }
 
 // ─── fakeTerminalRepo ──────────────────────────────────────────────────────────
@@ -85,6 +98,8 @@ type fakeNotifier struct {
 	notifyResultCalls        int
 	notifySessionCreatedErr  error
 	notifySessionCreatedCall int
+	notifyExpiredErr         error
+	expiredNotified          []domain.TransactionID
 }
 
 func (f *fakeNotifier) NotifyResult(context.Context, *aggregate.PaymentSession) error {
@@ -97,8 +112,9 @@ func (f *fakeNotifier) NotifySessionCreated(context.Context, *aggregate.PaymentS
 	return f.notifySessionCreatedErr
 }
 
-func (f *fakeNotifier) NotifySessionExpired(context.Context, domain.TerminalID, domain.TransactionID) error {
-	return nil
+func (f *fakeNotifier) NotifySessionExpired(_ context.Context, _ domain.TerminalID, txID domain.TransactionID) error {
+	f.expiredNotified = append(f.expiredNotified, txID)
+	return f.notifyExpiredErr
 }
 
 // ─── fakePublisher ─────────────────────────────────────────────────────────────

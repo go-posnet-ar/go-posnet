@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/entity"
+	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/repository"
 	valueobject "github.com/juantevez/go-posnet/context/terminal-gateway/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
@@ -20,6 +21,7 @@ import (
 type pgxPool interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
 // ─── PaymentSessionRepo ───────────────────────────────────────────────────────
@@ -127,17 +129,46 @@ func (r *PaymentSessionRepo) FindActiveByTerminal(ctx context.Context, terminalI
 	return s, nil
 }
 
-func (r *PaymentSessionRepo) DeleteExpired(ctx context.Context) (int64, error) {
+func (r *PaymentSessionRepo) ExpireAwaiting(ctx context.Context, limit int) ([]repository.ExpiredSession, error) {
+	// SKIP LOCKED: con varias instancias, cada sesión la vence y la notifica una sola.
 	const q = `
-		DELETE FROM terminal_gateway.payment_sessions
-		WHERE expires_at < NOW()
-		  AND state IN ('AWAITING_PAYMENT', 'PROCESSING')
+		UPDATE terminal_gateway.payment_sessions
+		SET state = 'EXPIRED', closed_at = NOW()
+		WHERE id IN (
+			SELECT id FROM terminal_gateway.payment_sessions
+			WHERE state = 'AWAITING_PAYMENT' AND expires_at < NOW()
+			ORDER BY expires_at
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		RETURNING id::text, terminal_id::text
 	`
-	tag, err := r.pool.Exec(ctx, q)
+	rows, err := r.pool.Query(ctx, q, limit)
 	if err != nil {
-		return 0, fmt.Errorf("PaymentSessionRepo.DeleteExpired: %w", err)
+		return nil, fmt.Errorf("PaymentSessionRepo.ExpireAwaiting: %w", err)
 	}
-	return tag.RowsAffected(), nil
+	defer rows.Close()
+
+	var expired []repository.ExpiredSession
+	for rows.Next() {
+		var id, terminalID string
+		if err := rows.Scan(&id, &terminalID); err != nil {
+			return nil, fmt.Errorf("PaymentSessionRepo.ExpireAwaiting: scan: %w", err)
+		}
+		txID, err := domain.ParseTransactionID(id)
+		if err != nil {
+			return nil, fmt.Errorf("PaymentSessionRepo.ExpireAwaiting: %w", err)
+		}
+		tID, err := domain.ParseTerminalID(terminalID)
+		if err != nil {
+			return nil, fmt.Errorf("PaymentSessionRepo.ExpireAwaiting: %w", err)
+		}
+		expired = append(expired, repository.ExpiredSession{TransactionID: txID, TerminalID: tID})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("PaymentSessionRepo.ExpireAwaiting: rows: %w", err)
+	}
+	return expired, nil
 }
 
 // CountProcessing retorna la cantidad de sesiones actualmente en PROCESSING.

@@ -7,6 +7,7 @@ import (
 	natsclient "github.com/nats-io/nats.go"
 
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/repository"
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
 
@@ -86,7 +87,9 @@ func (f *fakeSessionRepo) FindActiveByTerminal(context.Context, domain.TerminalI
 	return nil, nil
 }
 
-func (f *fakeSessionRepo) DeleteExpired(context.Context) (int64, error) { return 0, nil }
+func (f *fakeSessionRepo) ExpireAwaiting(context.Context, int) ([]repository.ExpiredSession, error) {
+	return nil, nil
+}
 
 // ─── fakeNotifier ──────────────────────────────────────────────────────────────
 

@@ -37,8 +37,11 @@ type app struct {
 	grpcSrv     *grpcserver.TerminalGatewayServer
 	httpSrv     *http.Server
 	metrics     *command.Metrics
-	tokens      *httpinfra.TerminalTokens // nil = API abierta, solo en desarrollo
-	grpcOpts    []grpc.ServerOption
+
+	sessionHandler *command.SessionHandler
+	cleanupEvery   time.Duration
+	tokens         *httpinfra.TerminalTokens // nil = API abierta, solo en desarrollo
+	grpcOpts       []grpc.ServerOption
 	// wsSrv   *websocket.Server  ← agregar cuando se implemente infrastructure/websocket/
 
 	// wg sincroniza el apagado de los jobs de background (outbox relay,
@@ -205,6 +208,9 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		metrics:     tgMetrics,
 		tokens:      tokens,
 		grpcOpts:    grpcOpts,
+
+		sessionHandler: sessionHandler,
+		cleanupEvery:   cfg.Session.ExpiredCleanupEvery,
 	}, nil
 }
 
@@ -271,29 +277,23 @@ func (a *app) start(ctx context.Context) error {
 	return nil
 }
 
-// runExpiredSessionsCleaner es un job periódico que elimina sesiones vencidas.
-// Corre en background y se detiene cuando el contexto es cancelado.
+// runExpiredSessionsCleaner vence periódicamente las sesiones sin pagar. Se detiene cuando el
+// contexto se cancela.
 func (a *app) runExpiredSessionsCleaner(ctx context.Context) {
-	// La frecuencia viene de config.Session.ExpiredCleanupEvery
-	// Usando 1 minuto como valor por defecto aquí para simplificar.
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(a.cleanupEvery)
 	defer ticker.Stop()
-
-	repo := pginfra.NewPaymentSessionRepo(a.pool)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			deleted, err := repo.DeleteExpired(ctx)
-			if err != nil {
-				slog.Error("expired sessions cleanup failed", slog.String("error", err.Error()))
-				continue
+			expired, err := a.sessionHandler.ExpireSessions(ctx)
+			if err != nil && ctx.Err() == nil {
+				slog.Error("expired sessions job failed", slog.String("error", err.Error()))
 			}
-			if deleted > 0 {
-				a.metrics.RecordExpired(ctx, deleted)
-				slog.Info("expired sessions cleaned", slog.Int64("count", deleted))
+			if expired > 0 {
+				slog.Info("sessions expired", slog.Int("count", expired))
 			}
 		}
 	}

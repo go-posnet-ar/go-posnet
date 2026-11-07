@@ -12,6 +12,7 @@ import (
 
 	"github.com/juantevez/go-posnet/context/terminal-gateway/application/query"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/repository"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	"github.com/juantevez/go-posnet/pkg/observability"
 )
@@ -38,7 +39,9 @@ func (p *panickySessionRepo) FindActiveByTerminal(context.Context, domain.Termin
 	return nil, nil
 }
 
-func (p *panickySessionRepo) DeleteExpired(context.Context) (int64, error) { return 0, nil }
+func (p *panickySessionRepo) ExpireAwaiting(context.Context, int) ([]repository.ExpiredSession, error) {
+	return nil, nil
+}
 
 func TestNewRouter_Routes(t *testing.T) {
 	router := newRouterFor(&fakeSessionService{}, &fakeSessionRepo{}, &fakePool{})

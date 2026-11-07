@@ -25,7 +25,7 @@ todavía no existe**: hoy el flujo funciona por HTTP, con un simulador QR. El re
 | Notificaciones al terminal | **Mock** | `MockNotifier` solo escribe en el log |
 | Parsing de ISO 8583 | **Pendiente** | El flujo QR envía `iso8583_raw` vacío |
 | Entrega de comprobantes (`SendReceipt`) | **Parcial** | Responde `delivered=true` sin entregar nada |
-| Expiración con estado `EXPIRED` | **Pendiente** | El job borra las filas vencidas |
+| Expiración con estado `EXPIRED` | Implementado | Ver [§5.6](#56-expiración). El aviso al terminal pasa por `MockNotifier` |
 
 Las consecuencias de estos pendientes están en [§13](#13-brechas-conocidas).
 
@@ -111,7 +111,8 @@ AWAITING_PAYMENT ───────────────────► PR
 Partes definidas en el dominio que ningún flujo utiliza hoy:
 
 - `IDLE` y `RECONNECTING` nunca se asignan.
-- `Expire()` no se invoca: el job de limpieza borra las filas, por lo que `EXPIRED` no se persiste.
+- `Expire()` no se invoca: el job pasa las sesiones a `EXPIRED` con un solo `UPDATE`, sin cargarlas (ver
+  [§5.6](#56-expiración)).
 - La sesión registra eventos internos (`session.created`, `transaction.initiated`, etc.), pero nadie
   los lee. Lo que se publica a NATS se construye aparte en el publisher.
 
@@ -169,8 +170,10 @@ Si el evento de rechazo trae `capture_card=true`, TG registra un log `WARN` de a
 notificar. Los códigos que exigen retención son `04`, `41`, `43` y `CARD_BLOCKED`
 ([`pkg/domain/card_capture.go`](../../pkg/domain/card_capture.go)).
 
-No se guarda en una columna propia: `RequiresCardCapture()` lo deriva del `rejection_code`. Hoy la
-instrucción no llega a ningún terminal (ver [§13](#13-brechas-conocidas)).
+No se guarda en una columna propia: `RequiresCardCapture()` lo deriva del `rejection_code`. Las respuestas de
+`GET /api/sessions/{id}/status` y `GET /sessions/{id}` lo incluyen en `capture_card` (`CaptureCard`), y el cajero de
+`posnet-front` muestra **RETENER TARJETA**. Al terminal físico todavía no llega, porque no hay WebSocket (ver
+[§13](#13-brechas-conocidas)).
 
 ### 5.3 Cancelación
 
@@ -192,16 +195,21 @@ la conciliación. TG no persiste nada en este flujo. `currency` es obligatorio y
 
 ### 5.6 Expiración
 
-Cada minuto, el job borra las sesiones vencidas en `AWAITING_PAYMENT` o `PROCESSING`:
+Cada `SESSION_CLEANUP_EVERY` (1 minuto), el job pasa a `EXPIRED` las sesiones vencidas en `AWAITING_PAYMENT`, con un solo
+`UPDATE` que también fija `closed_at`, y le avisa a cada terminal con `NotifySessionExpired`. Hoy ese aviso solo queda en el
+log, porque el notifier es `MockNotifier`. Si falla, el estado ya quedó guardado y el terminal lo ve al consultar.
+
+**Una sesión en `PROCESSING` no vence:** el pago ya salió, y su resultado llega de Authorization aunque haya pasado el TTL.
+Antes se borraba, y una aprobación tardía no encontraba la sesión.
 
 | Momento | `GET .../status` | `POST .../pay` |
 |---|---|---|
 | Antes de vencer | Estado real | `202` |
 | Vencida, antes de que corra el job | Estado anterior, `ttl_seconds: 0` | `500` |
-| Después de que corrió el job | `404` | `404` |
+| Después de que corrió el job | `EXPIRED` | `500` |
 
-Los clientes deben interpretar el `404` o `ttl_seconds: 0` como una sesión vencida, porque nunca
-verán el estado `EXPIRED`.
+Las filas ya no se borran: quedan con su estado final, como las aprobadas y las rechazadas. Con varias instancias, el `UPDATE`
+usa `FOR UPDATE SKIP LOCKED`, así que cada sesión la vence y la notifica una sola.
 
 ## 6. API HTTP
 
@@ -379,6 +387,7 @@ en NATS sin vencimiento: un PAN enviado por error en estos campos no debe llegar
   "auth_code": "A1B2C3",
   "rejection_code": "",
   "rejection_reason": "",
+  "capture_card": false,
   "ttl_seconds": 281,
   "expires_at": "2026-11-05T15:05:00Z"
 }
@@ -561,7 +570,7 @@ Ante `SIGINT` o `SIGTERM`, el orden es:
 |---|---|---|
 | `posnet_sessions_created_total` | Counter | Sesiones creadas |
 | `posnet_sessions_approved_total` | Counter | Sesiones aprobadas |
-| `posnet_sessions_expired_total` | Counter | Filas borradas por el job, incluidas las que estaban en `PROCESSING` |
+| `posnet_sessions_expired_total` | Counter | Sesiones que el job pasó a `EXPIRED` |
 | `posnet_qr_e2e_duration_seconds` | Histogram | Tiempo de creación a aprobación; incluye la espera del pago |
 | `posnet_sessions_processing_current` | Gauge | Sesiones en `PROCESSING`; hace un `COUNT` en cada scrape |
 
@@ -613,7 +622,7 @@ Cada comando y consulta abre un span (`command.ProcessPayment`, `query.GetSessio
 | `WS_PORT` | `8082` | **No**: no hay servidor WebSocket |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_CA_PATH` | Vacías | **No**: nada usa esta configuración |
 | `SESSION_TTL_SECONDS` | `300` | **No**: el TTL está fijo en 5 minutos |
-| `SESSION_CLEANUP_EVERY` | `1m` | **No**: la frecuencia está fija en 1 minuto |
+| `SESSION_CLEANUP_EVERY` | `1m` | Sí; cada cuánto vencen las sesiones sin pagar. Si no es positivo, el servicio no arranca |
 | `MIGRATIONS_DIR` | `migrations/terminal-gateway` | **No**: `Migrate` no hace nada |
 
 ### Levantar el servicio
@@ -678,7 +687,6 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| El job borra sesiones vencidas en `PROCESSING` | Una aprobación tardía no encuentra la sesión y se reintenta hasta agotar entregas: el pago puede estar aprobado sin que el cajero lo vea | `DeleteExpired` |
 | La reversa no verifica el estado | Se puede pedir la reversa de una sesión no aprobada, con `original_auth_code` vacío | `RequestReversal` |
 | Un terminal puede tener varias sesiones activas | Nada impide la creación, aunque el diseño pide una sola; `GetActiveSession` devuelve una cualquiera | `CreateSession`, `FindActiveByTerminal` |
 | El guardado de la sesión queda fuera de la transacción de idempotencia | `Save` usa el pool en lugar de `tx`: si falla el commit, la sesión queda guardada sin el evento marcado | `ApplyApproval`, `ApplyRejection` |
@@ -689,11 +697,9 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
 | `MockNotifier` en lugar de WebSocket | Ningún terminal recibe el resultado | `tg_wire.go` |
-| La orden de retener la tarjeta no llega al terminal | Solo queda en los logs; tampoco aparece en las respuestas HTTP | `mock_notifier.go`, `tg_qr_handler.go` |
 | `SendReceipt` responde `delivered=true` sin entregar | Notification puede registrar como entregado un comprobante que no se envió | `tg_grpc_server.go` |
 | `GetTerminalStatus` no mide la conexión | Un terminal conectado sin sesión figura como `DISCONNECTED` | `tg_grpc_server.go` |
 | Sin parsing de ISO 8583 | `iso8583_raw` y `emv_data_b64` viajan vacíos | `tg_qr_handler.go` |
-| Sin notificación ni estado al expirar | `NotifySessionExpired` no se invoca y `EXPIRED` no se persiste | `tg_wire.go` |
 
 ### Operación
 

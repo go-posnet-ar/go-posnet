@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/repository"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
@@ -35,7 +36,9 @@ func (f *fakeSessionRepo) FindActiveByTerminal(context.Context, domain.TerminalI
 	return f.findActiveResult, f.findActiveErr
 }
 
-func (f *fakeSessionRepo) DeleteExpired(context.Context) (int64, error) { return 0, nil }
+func (f *fakeSessionRepo) ExpireAwaiting(context.Context, int) ([]repository.ExpiredSession, error) {
+	return nil, nil
+}
 
 // ─── builders de dominio ──────────────────────────────────────────────────────
 

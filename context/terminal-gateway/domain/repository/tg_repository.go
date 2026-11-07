@@ -26,9 +26,15 @@ type PaymentSessionRepository interface {
 	// Retorna nil si el terminal no tiene sesión activa (estado AWAITING o PROCESSING).
 	FindActiveByTerminal(ctx context.Context, terminalID domain.TerminalID) (*aggregate.PaymentSession, error)
 
-	// DeleteExpired elimina sesiones expiradas para mantener la tabla limpia.
-	// Llamado por un job periódico, no en el flujo crítico.
-	DeleteExpired(ctx context.Context) (int64, error)
+	// ExpireAwaiting pasa a EXPIRED hasta limit sesiones vencidas en AWAITING_PAYMENT, y devuelve
+	// cuáles. Una sesión en PROCESSING no vence: espera el resultado de Authorization.
+	ExpireAwaiting(ctx context.Context, limit int) ([]ExpiredSession, error)
+}
+
+// ExpiredSession identifica una sesión que acaba de vencer, para avisarle a su terminal.
+type ExpiredSession struct {
+	TransactionID domain.TransactionID
+	TerminalID    domain.TerminalID
 }
 
 // TerminalRepository persiste y recupera terminales registrados.

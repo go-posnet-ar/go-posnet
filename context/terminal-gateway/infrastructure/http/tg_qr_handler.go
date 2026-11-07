@@ -246,6 +246,7 @@ func (h *QRHandler) handleSessionStatus(w http.ResponseWriter, r *http.Request) 
 		"auth_code":        session.AuthCode,
 		"rejection_code":   session.RejectionCode,
 		"rejection_reason": session.RejectionReason,
+		"capture_card":     session.CaptureCard,
 		"ttl_seconds":      session.TTLSeconds,
 		"expires_at":       session.ExpiresAt,
 	})

@@ -246,32 +246,32 @@ func TestPaymentSessionRepo_FindActiveByTerminal_OtherError(t *testing.T) {
 	}
 }
 
-// ─── PaymentSessionRepo.DeleteExpired ────────────────────────────────────────────
+// ─── PaymentSessionRepo.ExpireAwaiting ───────────────────────────────────────────
 
-func TestPaymentSessionRepo_DeleteExpired_Success(t *testing.T) {
+func TestPaymentSessionRepo_ExpireAwaiting(t *testing.T) {
 	pool := newMockPool(t)
-	pool.ExpectExec("DELETE FROM terminal_gateway.payment_sessions").
-		WillReturnResult(pgxmock.NewResult("DELETE", 3))
+	txID, terminalID := domain.NewTransactionID(), domain.NewTerminalID()
+	pool.ExpectQuery(`UPDATE terminal_gateway.payment_sessions[\s\S]*SET state = 'EXPIRED'[\s\S]*state = 'AWAITING_PAYMENT' AND expires_at < NOW\(\)[\s\S]*FOR UPDATE SKIP LOCKED`).
+		WithArgs(100).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "terminal_id"}).AddRow(txID.String(), terminalID.String()))
 
-	repo := postgres.NewPaymentSessionRepo(pool)
-	n, err := repo.DeleteExpired(context.Background())
+	got, err := postgres.NewPaymentSessionRepo(pool).ExpireAwaiting(context.Background(), 100)
 	if err != nil {
-		t.Fatalf("DeleteExpired() error = %v", err)
+		t.Fatalf("ExpireAwaiting() error = %v", err)
 	}
-	if n != 3 {
-		t.Errorf("n = %d, want 3", n)
+	if len(got) != 1 || got[0].TransactionID != txID || got[0].TerminalID != terminalID {
+		t.Errorf("ExpireAwaiting() = %+v", got)
 	}
 }
 
-func TestPaymentSessionRepo_DeleteExpired_Error(t *testing.T) {
+func TestPaymentSessionRepo_ExpireAwaiting_Error(t *testing.T) {
 	pool := newMockPool(t)
-	pool.ExpectExec("DELETE FROM terminal_gateway.payment_sessions").
+	pool.ExpectQuery("UPDATE terminal_gateway.payment_sessions").WithArgs(100).
 		WillReturnError(errors.New("connection reset"))
 
-	repo := postgres.NewPaymentSessionRepo(pool)
-	_, err := repo.DeleteExpired(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "PaymentSessionRepo.DeleteExpired") {
-		t.Fatalf("error = %v, want it to contain %q", err, "PaymentSessionRepo.DeleteExpired")
+	_, err := postgres.NewPaymentSessionRepo(pool).ExpireAwaiting(context.Background(), 100)
+	if err == nil || !strings.Contains(err.Error(), "PaymentSessionRepo.ExpireAwaiting") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

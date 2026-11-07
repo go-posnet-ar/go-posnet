@@ -2,10 +2,12 @@ package http
 
 import (
 	"errors"
+	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/aggregate"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/juantevez/go-posnet/context/terminal-gateway/application/port"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/application/query"
@@ -312,6 +314,29 @@ func TestHandleSessionStatus_Success(t *testing.T) {
 	}
 	if body["state"] != valueobject.StateAwaitingPayment.String() {
 		t.Errorf("state = %v, want %q", body["state"], valueobject.StateAwaitingPayment.String())
+	}
+}
+
+func TestHandleSessionStatus_CaptureCard(t *testing.T) {
+	session := aggregate.Reconstitute(aggregate.ReconstituteParams{
+		ID:            domain.NewTransactionID(),
+		TerminalID:    domain.NewTerminalID(),
+		MerchantID:    domain.NewMerchantID(),
+		Amount:        mustMoney(t),
+		STAN:          mustSTAN(t),
+		Channel:       valueobject.ChannelQR,
+		State:         valueobject.StateRejected,
+		RejectionCode: "41",
+		ExpiresAt:     time.Now().UTC().Add(time.Minute),
+		CreatedAt:     time.Now().UTC(),
+	})
+	mux := newQRTestMux(newTestQRHandler(&fakeSessionService{}, &fakeSessionRepo{findResult: session}))
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/sessions/"+session.ID().String()+"/status", nil))
+
+	body := decodeJSON(t, rec.Body.Bytes())
+	if body["capture_card"] != true || body["rejection_code"] != "41" {
+		t.Errorf("body = %v, want capture_card=true", body)
 	}
 }
 

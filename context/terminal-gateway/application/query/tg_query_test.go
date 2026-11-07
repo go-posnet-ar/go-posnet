@@ -181,3 +181,40 @@ func TestGetActiveSession_RepoError(t *testing.T) {
 		t.Fatalf("error = %v, want it to contain %q", err, "GetActiveSession")
 	}
 }
+
+// La orden de retener la tarjeta se deriva del código de rechazo guardado: el del emisor (04,
+// 41, 43) o el de la blocklist.
+func TestGetSessionStatus_CaptureCard(t *testing.T) {
+	cases := []struct {
+		state valueobject.SessionState
+		code  string
+		want  bool
+	}{
+		{valueobject.StateRejected, "41", true},
+		{valueobject.StateRejected, "CARD_BLOCKED", true},
+		{valueobject.StateRejected, "51", false},
+		{valueobject.StateRejected, "FRAUD_REJECTED", false},
+		{valueobject.StateApproved, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.state)+" "+tc.code, func(t *testing.T) {
+			session := aggregate.Reconstitute(aggregate.ReconstituteParams{
+				ID:            domain.NewTransactionID(),
+				TerminalID:    domain.NewTerminalID(),
+				MerchantID:    domain.NewMerchantID(),
+				Amount:        mustMoney(t),
+				STAN:          mustSTAN(t),
+				Channel:       valueobject.ChannelQR,
+				State:         tc.state,
+				RejectionCode: tc.code,
+			})
+			result, err := query.NewSessionQueryHandler(&fakeSessionRepo{findByIDResult: session}).GetSessionStatus(context.Background(), session.ID())
+			if err != nil {
+				t.Fatalf("GetSessionStatus() error = %v", err)
+			}
+			if result.CaptureCard != tc.want {
+				t.Errorf("CaptureCard = %v, want %v", result.CaptureCard, tc.want)
+			}
+		})
+	}
+}

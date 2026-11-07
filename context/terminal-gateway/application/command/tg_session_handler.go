@@ -150,6 +150,39 @@ func (h *SessionHandler) CreateSession(ctx context.Context, cmd port.CreateSessi
 	}, nil
 }
 
+// expireBatch limita cuántas sesiones vence cada consulta.
+const expireBatch = 100
+
+// ExpireSessions pasa a EXPIRED las sesiones vencidas sin pagar, y le avisa a cada terminal. Una
+// sesión en PROCESSING no se toca: el pago ya salió, y su resultado llega de Authorization aunque
+// la sesión haya vencido. Devuelve cuántas venció.
+func (h *SessionHandler) ExpireSessions(ctx context.Context) (int, error) {
+	ctx, span := observability.StartSpan(ctx, "command.ExpireSessions")
+	defer span.End()
+
+	total := 0
+	for {
+		expired, err := h.sessionRepo.ExpireAwaiting(ctx, expireBatch)
+		if err != nil {
+			return total, fmt.Errorf("ExpireSessions: %w", err)
+		}
+		for _, s := range expired {
+			// El estado ya quedó guardado: si el aviso falla, el terminal lo ve al consultar.
+			if err := h.notifier.NotifySessionExpired(ctx, s.TerminalID, s.TransactionID); err != nil {
+				observability.FromContext(ctx).Warn("failed to notify terminal of session expiry",
+					slog.String("transaction_id", s.TransactionID.String()),
+					slog.String("terminal_id", s.TerminalID.String()),
+					slog.String("error", err.Error()))
+			}
+		}
+		total += len(expired)
+		h.metrics.RecordExpired(ctx, int64(len(expired)))
+		if len(expired) < expireBatch {
+			return total, nil
+		}
+	}
+}
+
 // ProcessPayment procesa el mensaje ISO 8583 e inicia la Saga de autorización.
 // Usa el patrón Transactional Outbox: el Save de la sesión y la entrada en el outbox
 // se realizan en la misma transacción Postgres, eliminando el dual-write.

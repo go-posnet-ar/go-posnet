@@ -173,6 +173,9 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	if c.Session.ExpiredCleanupEvery <= 0 {
+		return fmt.Errorf("config: SESSION_CLEANUP_EVERY %s must be positive", c.Session.ExpiredCleanupEvery)
+	}
 	if (c.HTTPTLSCert == "") != (c.HTTPTLSKey == "") {
 		return fmt.Errorf("config: HTTP_TLS_CERT and HTTP_TLS_KEY must be set together")
 	}

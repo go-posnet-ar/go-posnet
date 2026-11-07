@@ -11,6 +11,7 @@ import (
 
 	"github.com/juantevez/go-posnet/context/terminal-gateway/application/command"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/application/port"
+	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/repository"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
@@ -813,4 +814,55 @@ func TestMerchantMustBelongToTheTerminal(t *testing.T) {
 			t.Fatalf("error = %v, publish calls = %d, want a ValidationError and no publish", err, publisher.publishBatchCloseCall)
 		}
 	})
+}
+
+// ─── ExpireSessions ─────────────────────────────────────────────────────────────
+
+func expiredSessions(n int) []repository.ExpiredSession {
+	out := make([]repository.ExpiredSession, n)
+	for i := range out {
+		out[i] = repository.ExpiredSession{TransactionID: domain.NewTransactionID(), TerminalID: domain.NewTerminalID()}
+	}
+	return out
+}
+
+func TestExpireSessions_NotifiesEachTerminal(t *testing.T) {
+	// 250 vencidas: tres consultas de a 100 (100, 100 y 50).
+	pending := expiredSessions(250)
+	repo := &fakeSessionRepo{expirePending: pending}
+	notifier := &fakeNotifier{}
+	h := newHandler(nil, repo, &fakeTerminalRepo{}, notifier, &fakePublisher{})
+
+	n, err := h.ExpireSessions(context.Background())
+	if err != nil || n != 250 {
+		t.Fatalf("ExpireSessions() = %d, %v, want 250, nil", n, err)
+	}
+	if repo.expireCalls != 3 {
+		t.Errorf("consultas = %d, want 3", repo.expireCalls)
+	}
+	if len(notifier.expiredNotified) != 250 || notifier.expiredNotified[0] != pending[0].TransactionID {
+		t.Errorf("avisos = %d, want 250", len(notifier.expiredNotified))
+	}
+}
+
+func TestExpireSessions_NotifyFailureDoesNotStop(t *testing.T) {
+	repo := &fakeSessionRepo{expirePending: expiredSessions(3)}
+	notifier := &fakeNotifier{notifyExpiredErr: errors.New("terminal not connected")}
+	h := newHandler(nil, repo, &fakeTerminalRepo{}, notifier, &fakePublisher{})
+
+	if n, err := h.ExpireSessions(context.Background()); err != nil || n != 3 {
+		t.Fatalf("ExpireSessions() = %d, %v, want 3, nil", n, err)
+	}
+	if len(notifier.expiredNotified) != 3 {
+		t.Errorf("avisos = %d, want 3", len(notifier.expiredNotified))
+	}
+}
+
+func TestExpireSessions_RepositoryError(t *testing.T) {
+	repo := &fakeSessionRepo{expireErr: errors.New("db down")}
+	h := newHandler(nil, repo, &fakeTerminalRepo{}, &fakeNotifier{}, &fakePublisher{})
+
+	if _, err := h.ExpireSessions(context.Background()); err == nil || !strings.Contains(err.Error(), "ExpireSessions") {
+		t.Fatalf("error = %v", err)
+	}
 }

@@ -36,6 +36,9 @@ type SessionStatusResult struct {
 	AuthCode        string // Solo si APPROVED
 	RejectionCode   string // Solo si REJECTED
 	RejectionReason string // Solo si REJECTED
+	// CaptureCard es la orden de retener la tarjeta: el emisor la dio con el rechazo (04, 41,
+	// 43) o la tarjeta está en la blocklist. Solo si REJECTED.
+	CaptureCard bool
 }
 
 // GetSessionStatus retorna el estado actual de una sesión por TransactionID.
@@ -73,6 +76,7 @@ func (h *SessionQueryHandler) GetSessionStatus(
 	if session.State() == valueobject.StateRejected {
 		result.RejectionCode = session.RejectionCode()
 		result.RejectionReason = session.RejectionReason()
+		result.CaptureCard = session.RequiresCardCapture()
 	}
 
 	return result, nil
