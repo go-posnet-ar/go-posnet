@@ -52,6 +52,9 @@ const (
 // codeTimeout es el código de una transacción sin respuesta del adquirente, ya revertida.
 const codeTimeout = "TIMEOUT"
 
+// CodeInvalidData es el código de una transacción descartada por datos inválidos.
+const CodeInvalidData = "INVALID_DATA"
+
 // retryableCodes son códigos donde tiene sentido reintentar la transacción.
 var retryableCodes = map[string]bool{
 	ISO_ISSUER_UNAVAILABLE: true,
@@ -83,6 +86,7 @@ var isoDescriptions = map[string]string{
 
 	domain.CodeCardBlocked: "Card Blocked - Pick Up",
 	codeTimeout:            "No Response From Acquirer - Reversed",
+	CodeInvalidData:        "Invalid Transaction Data",
 }
 
 // NewRejectionFromISO crea un RejectionCode a partir de un código ISO 8583.
@@ -115,6 +119,17 @@ func NewRejectionFromBlocklist() RejectionCode {
 // NewRejectionFromValidation crea un RejectionCode para errores de validación local.
 func NewRejectionFromValidation(reason string) RejectionCode {
 	return RejectionCode{code: reason, source: SourceValidation}
+}
+
+// RestoreRejectionCode reconstruye un RejectionCode guardado, con su código y su fuente. Una
+// fuente ausente o desconocida se lee como ACQUIRER.
+func RestoreRejectionCode(code, source string) RejectionCode {
+	switch s := RejectionSource(source); s {
+	case SourceFraud, SourceTimeout, SourceValidation, SourceBlocklist:
+		return RejectionCode{code: code, source: s}
+	default:
+		return RejectionCode{code: code, source: SourceAcquirer}
+	}
 }
 
 func (r RejectionCode) Code() string            { return r.code }

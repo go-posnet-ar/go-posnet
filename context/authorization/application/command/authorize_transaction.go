@@ -44,6 +44,10 @@ type AuthorizationHandler struct {
 	acquirerCalls   sync.WaitGroup
 }
 
+// duplicateTransactionMsg se registra cuando llega un alta de un transaction_id que ya existe,
+// con otro event_id. Se ignora: el resultado sigue siendo el de la transacción original.
+const duplicateTransactionMsg = "transaction already exists — ignoring the duplicate"
+
 // defaultAcquirerTimeout limita las llamadas si no se configura otro valor.
 const defaultAcquirerTimeout = 30 * time.Second
 
@@ -135,12 +139,12 @@ func NewAuthorizationHandler(
 // Implementa port.AuthorizationService.
 //
 // Pasos:
-//  1. Verificar idempotencia (event_id ya procesado → drop)
-//  2. Parsear y validar el comando
-//  3. Crear el aggregate Transaction
-//  4. Persistir en Postgres (estado RECEIVED)
-//  5. Solicitar fraud check → publicar FraudCheckRequested
-//  6. El score llega vía ApplyFraudScore (evento NATS separado)
+//  1. Parsear y validar el comando. Si es inválido, avisar del rechazo y descartarlo
+//  2. Crear el aggregate Transaction y consultar la blocklist
+//  3. Marcar el evento y dar de alta la transacción, en una sola transacción de base. Un
+//     event_id ya procesado o un transaction_id que ya existe no continúan
+//  4. Solicitar fraud check → publicar FraudCheckRequested
+//  5. El score llega vía ApplyFraudScore (evento NATS separado)
 func (h *AuthorizationHandler) AuthorizeTransaction(ctx context.Context, cmd port.AuthorizeTransactionCommand) error {
 	ctx, span := observability.StartSpan(ctx, "command.AuthorizeTransaction")
 	defer span.End()
@@ -151,56 +155,9 @@ func (h *AuthorizationHandler) AuthorizeTransaction(ctx context.Context, cmd por
 		slog.String("event_id", cmd.EventID),
 	)
 
-	// ── Paso 1: Parsear y validar los Value Objects ──────────────────────────
-	txID, err := domain.ParseTransactionID(cmd.TransactionID)
+	tx, err := newTransactionFromCommand(cmd)
 	if err != nil {
-		return pkgerrors.NewValidationError("invalid transaction_id: " + err.Error())
-	}
-	terminalID, err := domain.ParseTerminalID(cmd.TerminalID)
-	if err != nil {
-		return pkgerrors.NewValidationError("invalid terminal_id: " + err.Error())
-	}
-	merchantID, err := domain.ParseMerchantID(cmd.MerchantID)
-	if err != nil {
-		return pkgerrors.NewValidationError("invalid merchant_id: " + err.Error())
-	}
-	currency, err := domain.ParseCurrency(cmd.Currency)
-	if err != nil {
-		return pkgerrors.NewValidationError("invalid currency: " + err.Error())
-	}
-	amount, err := domain.NewMoney(cmd.AmountCents, currency)
-	if err != nil {
-		return pkgerrors.NewValidationError("invalid amount: " + err.Error())
-	}
-	stan, err := domain.NewSTAN(cmd.STAN)
-	if err != nil {
-		return pkgerrors.NewValidationError("invalid stan: " + err.Error())
-	}
-	network, err := domain.ParseCardNetwork(cmd.CardNetwork)
-	if err != nil {
-		return pkgerrors.NewValidationError("invalid card_network: " + err.Error())
-	}
-	pan, err := domain.NewPAN(cmd.CardLast4, network)
-	if err != nil {
-		return pkgerrors.NewValidationError("invalid pan: " + err.Error())
-	}
-	entryMode, err := valueobject.ParseEntryMode(cmd.EntryMode)
-	if err != nil {
-		return pkgerrors.NewValidationError("invalid entry_mode: " + err.Error())
-	}
-	cardToken, err := domain.ParseOptionalCardToken(cmd.CardToken)
-	if err != nil {
-		return pkgerrors.NewValidationError("invalid card_token: " + err.Error())
-	}
-
-	// ── Paso 3: Crear el aggregate ───────────────────────────────────────────
-	tx, err := aggregate.NewTransaction(
-		txID, terminalID, merchantID,
-		amount, stan, pan, entryMode,
-		cardToken, cmd.EMVDataBase64, cmd.ISO8583Raw,
-	)
-	if err != nil {
-		return pkgerrors.NewValidationError(err.Error())
+		return h.rejectInvalid(ctx, cmd, err, log)
 	}
 
 	// ── Blocklist: la tarjeta fue reportada como robada/perdida ──────────────
@@ -208,7 +165,7 @@ func (h *AuthorizationHandler) AuthorizeTransaction(ctx context.Context, cmd por
 	// bloqueada, no hay nada que consultar. Si la consulta a la blocklist
 	// falla se deja seguir la Saga en vez de rechazar: un error de la base no
 	// debe convertirse en un rechazo con orden de retener el plástico.
-	blocked, err := h.isCardBlocked(ctx, cardToken)
+	blocked, err := h.isCardBlocked(ctx, tx.CardToken())
 	if err != nil {
 		log.Error("blocklist lookup failed — continuing without the check",
 			slog.String("error", err.Error()))
@@ -222,7 +179,7 @@ func (h *AuthorizationHandler) AuthorizeTransaction(ctx context.Context, cmd por
 	}
 
 	// ── Paso 4: Persistir + marcar idempotencia en una sola transacción ──────
-	var published bool
+	var created bool
 	err = pgutil.WithReadCommitted(ctx, h.pool, func(dbTx pgx.Tx) error {
 		inserted, err := h.idempotency.TryMarkAsProcessed(ctx, dbTx, cmd.EventID)
 		if err != nil {
@@ -232,17 +189,20 @@ func (h *AuthorizationHandler) AuthorizeTransaction(ctx context.Context, cmd por
 			log.Info("event already processed — skipping")
 			return nil
 		}
-		if err := h.repo.Save(ctx, tx); err != nil {
+		created, err = h.repo.InsertTx(ctx, dbTx, tx)
+		if err != nil {
 			return fmt.Errorf("save transaction: %w", err)
 		}
-		published = true
+		if !created {
+			log.Warn(duplicateTransactionMsg)
+		}
 		return nil
 	})
 	if err != nil {
 		observability.RecordError(ctx, err)
 		return fmt.Errorf("AuthorizeTransaction: persist: %w", err)
 	}
-	if !published {
+	if !created {
 		return nil
 	}
 	h.metrics.RecordReceived(ctx)
@@ -260,6 +220,126 @@ func (h *AuthorizationHandler) AuthorizeTransaction(ctx context.Context, cmd por
 		slog.Int64("amount_cents", cmd.AmountCents),
 	)
 	return nil
+}
+
+// newTransactionFromCommand valida el comando y crea el aggregate. Todos sus errores son de
+// validación. No incluye card_last4 en el mensaje, porque podría traer un PAN completo.
+func newTransactionFromCommand(cmd port.AuthorizeTransactionCommand) (*aggregate.Transaction, error) {
+	txID, err := domain.ParseTransactionID(cmd.TransactionID)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError("invalid transaction_id: " + err.Error())
+	}
+	terminalID, err := domain.ParseTerminalID(cmd.TerminalID)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError("invalid terminal_id: " + err.Error())
+	}
+	merchantID, err := domain.ParseMerchantID(cmd.MerchantID)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError("invalid merchant_id: " + err.Error())
+	}
+	currency, err := domain.ParseCurrency(cmd.Currency)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError("invalid currency: " + err.Error())
+	}
+	amount, err := domain.NewMoney(cmd.AmountCents, currency)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError("invalid amount: " + err.Error())
+	}
+	stan, err := domain.NewSTAN(cmd.STAN)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError("invalid stan: " + err.Error())
+	}
+	network, err := domain.ParseCardNetwork(cmd.CardNetwork)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError("invalid card_network: " + err.Error())
+	}
+	pan, err := domain.NewPAN(cmd.CardLast4, network)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError("invalid pan: card_last4 must be exactly 4 digits")
+	}
+	entryMode, err := valueobject.ParseEntryMode(cmd.EntryMode)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError("invalid entry_mode: " + err.Error())
+	}
+	cardToken, err := domain.ParseOptionalCardToken(cmd.CardToken)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError("invalid card_token: " + err.Error())
+	}
+
+	tx, err := aggregate.NewTransaction(
+		txID, terminalID, merchantID,
+		amount, stan, pan, entryMode,
+		cardToken, cmd.EMVDataBase64, cmd.ISO8583Raw,
+	)
+	if err != nil {
+		return nil, pkgerrors.NewValidationError(err.Error())
+	}
+	return tx, nil
+}
+
+// rejectInvalid avisa del rechazo de una transacción con datos inválidos, para que su sesión
+// no quede en PROCESSING. No la guarda: sus datos no cumplen las invariantes del aggregate.
+//
+// Devuelve cause para que el mensaje se descarte, salvo un error transitorio, que se reintenta
+// antes de descartarlo. Sin un transaction_id válido no hay a quién avisar, y si esa
+// transacción ya existe, su resultado sigue siendo el de la original.
+func (h *AuthorizationHandler) rejectInvalid(
+	ctx context.Context,
+	cmd port.AuthorizeTransactionCommand,
+	cause error,
+	log *slog.Logger,
+) error {
+	txID, err := domain.ParseTransactionID(cmd.TransactionID)
+	if err != nil {
+		return cause
+	}
+	exists, err := h.repo.ExistsByID(ctx, txID)
+	if err != nil {
+		return fmt.Errorf("rejectInvalid: check existing transaction: %w", err)
+	}
+	if exists {
+		log.Warn(duplicateTransactionMsg, slog.String("reason", "invalid data"))
+		return cause
+	}
+
+	rejection := newInvalidRejection(cmd, txID)
+	if err := h.publisher.PublishInvalidRejected(ctx, rejection); err != nil {
+		return fmt.Errorf("rejectInvalid: publish: %w", err)
+	}
+	h.metrics.RecordReceived(ctx)
+	h.metrics.RecordRejected(ctx, rejection.Rejection.Code(), string(rejection.Rejection.Source()))
+	log.Warn("transaction rejected — invalid data", slog.String("error", cause.Error()))
+	return cause
+}
+
+// newInvalidRejection arma el rechazo solo con los campos del comando que son válidos.
+func newInvalidRejection(cmd port.AuthorizeTransactionCommand, txID domain.TransactionID) service.InvalidTransactionRejection {
+	r := service.InvalidTransactionRejection{
+		TransactionID: txID,
+		Rejection:     valueobject.NewRejectionFromValidation(valueobject.CodeInvalidData),
+	}
+	if id, err := domain.ParseTerminalID(cmd.TerminalID); err == nil {
+		r.TerminalID = id.String()
+	}
+	if id, err := domain.ParseMerchantID(cmd.MerchantID); err == nil {
+		r.MerchantID = id.String()
+	}
+	if currency, err := domain.ParseCurrency(cmd.Currency); err == nil {
+		r.Currency = currency.String()
+		if amount, err := domain.NewMoney(cmd.AmountCents, currency); err == nil {
+			r.AmountCents = amount.Cents()
+		}
+	}
+	if network, err := domain.ParseCardNetwork(cmd.CardNetwork); err == nil {
+		r.CardNetwork = string(network)
+	}
+	if pan, err := domain.NewPAN(cmd.CardLast4, domain.NetworkUnknown); err == nil {
+		r.CardLast4 = pan.Last4()
+	}
+	if mode, err := valueobject.ParseEntryMode(cmd.EntryMode); err == nil {
+		r.EntryMode = mode.String()
+	}
+	return r
 }
 
 // ApplyFraudScore procesa el resultado del motor antifraude y continúa la Saga.
@@ -514,23 +594,29 @@ func (h *AuthorizationHandler) rejectBlockedCard(
 		return fmt.Errorf("rejectBlockedCard: reject: %w", err)
 	}
 
-	var claimed bool
+	var created bool
 	if err := pgutil.WithReadCommitted(ctx, h.pool, func(dbTx pgx.Tx) error {
 		inserted, err := h.idempotency.TryMarkAsProcessed(ctx, dbTx, eventID)
 		if err != nil {
 			return err
 		}
 		if !inserted {
+			log.Info("event already processed — skipping")
 			return nil
 		}
-		claimed = true
-		return h.repo.Save(ctx, tx)
+		created, err = h.repo.InsertTx(ctx, dbTx, tx)
+		if err != nil {
+			return err
+		}
+		if !created {
+			log.Warn(duplicateTransactionMsg)
+		}
+		return nil
 	}); err != nil {
 		observability.RecordError(ctx, err)
 		return fmt.Errorf("rejectBlockedCard: persist: %w", err)
 	}
-	if !claimed {
-		log.Info("event already processed — skipping")
+	if !created {
 		return nil
 	}
 

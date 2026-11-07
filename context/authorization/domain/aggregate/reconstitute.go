@@ -65,14 +65,11 @@ func Reconstitute(p ReconstituteParams) *Transaction {
 	}
 
 	if p.RejectionCode != nil {
-		var rc valueobject.RejectionCode
-		if p.RejectionSource != nil && *p.RejectionSource == string(valueobject.SourceFraud) {
-			rc = valueobject.NewRejectionFromFraud()
-		} else if p.RejectionSource != nil && *p.RejectionSource == string(valueobject.SourceTimeout) {
-			rc = valueobject.NewRejectionFromTimeout()
-		} else {
-			rc, _ = valueobject.NewRejectionFromISO(*p.RejectionCode)
+		var source string
+		if p.RejectionSource != nil {
+			source = *p.RejectionSource
 		}
+		rc := valueobject.RestoreRejectionCode(*p.RejectionCode, source)
 		tx.rejectionCode = &rc
 	}
 

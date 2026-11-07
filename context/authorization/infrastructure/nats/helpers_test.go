@@ -90,6 +90,10 @@ func (f *fakeRepo) ExistsByID(_ context.Context, _ domain.TransactionID) (bool, 
 	return false, nil
 }
 
+func (f *fakeRepo) InsertTx(ctx context.Context, _ pgx.Tx, tx *aggregate.Transaction) (bool, error) {
+	return true, f.Save(ctx, tx)
+}
+
 func (f *fakeRepo) SaveIfState(ctx context.Context, tx *aggregate.Transaction, _ valueobject.TransactionState) (bool, error) {
 	return true, f.Save(ctx, tx)
 }
@@ -138,6 +142,9 @@ func (f *fakeAcquirer) Reverse(_ context.Context, _ *aggregate.Transaction) erro
 // *EventPublisher productivo de este mismo paquete (publisher.go), que es lo
 // que se está testeando en publisher_test.go.
 type fakeDomainPublisher struct {
+	invalidRejectedCalls int
+	invalidRejectedErr   error
+
 	approvedCalls   int
 	rejectedCalls   int
 	fraudCheckCalls int
@@ -154,6 +161,11 @@ func (f *fakeDomainPublisher) PublishApproved(_ context.Context, _ *aggregate.Tr
 func (f *fakeDomainPublisher) PublishRejected(_ context.Context, _ *aggregate.Transaction) error {
 	f.rejectedCalls++
 	return nil
+}
+
+func (f *fakeDomainPublisher) PublishInvalidRejected(_ context.Context, _ service.InvalidTransactionRejection) error {
+	f.invalidRejectedCalls++
+	return f.invalidRejectedErr
 }
 
 func (f *fakeDomainPublisher) PublishFraudCheckRequested(_ context.Context, _ *aggregate.Transaction) error {

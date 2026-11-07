@@ -19,9 +19,9 @@ import (
 // REGLA: esta interface está en el dominio. El adaptador Postgres
 // en infrastructure/postgres/repository.go la implementa.
 type TransactionRepository interface {
-	// Save persiste una Transaction nueva o actualiza una existente.
-	// Usa UPSERT internamente para garantizar idempotencia.
-	Save(ctx context.Context, tx *aggregate.Transaction) error
+	// InsertTx da de alta una Transaction dentro de dbTx. Si ya existe ese ID, no cambia nada y
+	// devuelve false.
+	InsertTx(ctx context.Context, dbTx pgx.Tx, tx *aggregate.Transaction) (bool, error)
 
 	// FindByID recupera una Transaction por su ID.
 	// Retorna ErrNotFound si no existe.

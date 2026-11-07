@@ -45,16 +45,17 @@ func NewTransactionRepo(pool pgxPool) *TransactionRepo {
 	return &TransactionRepo{pool: pool}
 }
 
-// Save persiste una Transaction en Postgres usando UPSERT.
-// Si la transacción ya existe (mismo ID), actualiza todos los campos mutables.
-func (r *TransactionRepo) Save(ctx context.Context, tx *aggregate.Transaction) error {
+// InsertTx da de alta una Transaction dentro de dbTx, junto con la marca de idempotencia. Si ya
+// existe ese ID, no cambia nada y devuelve false: las transiciones siguientes pasan por
+// SaveIfState, así que un alta no puede devolver una transacción a un estado anterior.
+func (r *TransactionRepo) InsertTx(ctx context.Context, dbTx pgx.Tx, tx *aggregate.Transaction) (bool, error) {
 	const query = `
 		INSERT INTO pn_authorization.transactions (
 			id, terminal_id, merchant_id,
 			state, amount_cents, currency,
 			pan_last4, card_network, entry_mode,
 			stan, auth_code, rejection_code, rejection_source,
-			fraud_score, fraud_decision,
+			fraud_score, fraud_decision, fraud_rules_hit,
 			emv_data_b64, iso8583_raw,
 			created_at, authorized_at, rejected_at,
 			card_token
@@ -63,20 +64,12 @@ func (r *TransactionRepo) Save(ctx context.Context, tx *aggregate.Transaction) e
 			$4, $5, $6,
 			$7, $8, $9,
 			$10, $11, $12, $13,
-			$14, $15,
-			$16, $17,
-			$18, $19, $20,
-			$21
+			$14, $15, $16,
+			$17, $18,
+			$19, $20, $21,
+			$22
 		)
-		ON CONFLICT (id) DO UPDATE SET
-			state           = EXCLUDED.state,
-			auth_code       = EXCLUDED.auth_code,
-			rejection_code  = EXCLUDED.rejection_code,
-			rejection_source= EXCLUDED.rejection_source,
-			fraud_score     = EXCLUDED.fraud_score,
-			fraud_decision  = EXCLUDED.fraud_decision,
-			authorized_at   = EXCLUDED.authorized_at,
-			rejected_at     = EXCLUDED.rejected_at
+		ON CONFLICT (id) DO NOTHING
 	`
 
 	var authCode *string
@@ -101,6 +94,10 @@ func (r *TransactionRepo) Save(ctx context.Context, tx *aggregate.Transaction) e
 		fraudScore = &fs
 		fraudDecision = &fd
 	}
+	rulesHit, err := fraudRulesJSON(tx)
+	if err != nil {
+		return false, fmt.Errorf("TransactionRepo.InsertTx: %w", err)
+	}
 
 	// El token va como NULL cuando el terminal no lo emite: así la columna
 	// distingue "sin token" de "token vacío" y el índice único no agrupa
@@ -111,7 +108,7 @@ func (r *TransactionRepo) Save(ctx context.Context, tx *aggregate.Transaction) e
 		cardToken = &ct
 	}
 
-	_, err := r.pool.Exec(ctx, query,
+	tag, err := dbTx.Exec(ctx, query,
 		tx.ID().String(),
 		tx.TerminalID().String(),
 		tx.MerchantID().String(),
@@ -127,6 +124,7 @@ func (r *TransactionRepo) Save(ctx context.Context, tx *aggregate.Transaction) e
 		rejSource,
 		fraudScore,
 		fraudDecision,
+		rulesHit,
 		tx.EMVDataBase64(),
 		tx.ISO8583Raw(),
 		tx.ReceivedAt(),
@@ -135,9 +133,23 @@ func (r *TransactionRepo) Save(ctx context.Context, tx *aggregate.Transaction) e
 		cardToken,
 	)
 	if err != nil {
-		return fmt.Errorf("TransactionRepo.Save: exec upsert: %w", err)
+		return false, fmt.Errorf("TransactionRepo.InsertTx: exec insert: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() == 1, nil
+}
+
+// fraudRulesJSON serializa las reglas activadas para la columna JSONB. Sin decisión de fraude
+// devuelve nil, que se guarda como NULL.
+func fraudRulesJSON(tx *aggregate.Transaction) ([]byte, error) {
+	rules := tx.FraudDecision().RulesHit
+	if rules == nil {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(rules)
+	if err != nil {
+		return nil, fmt.Errorf("encode fraud rules: %w", err)
+	}
+	return encoded, nil
 }
 
 // SaveIfState guarda el estado y el resultado solo si en la base sigue en expected.
@@ -163,6 +175,7 @@ func saveIfState(ctx context.Context, db execer, tx *aggregate.Transaction, expe
 			fraud_decision   = $8,
 			authorized_at    = $9,
 			rejected_at      = $10,
+			fraud_rules_hit  = $11,
 			processing_started_at = CASE WHEN $3::text = 'PROCESSING' THEN now() ELSE processing_started_at END
 		WHERE id = $1 AND state = $2
 	`
@@ -186,11 +199,15 @@ func saveIfState(ctx context.Context, db execer, tx *aggregate.Transaction, expe
 		fraudScore = &fs
 		fraudDecision = &fd
 	}
+	rulesHit, err := fraudRulesJSON(tx)
+	if err != nil {
+		return false, fmt.Errorf("TransactionRepo.SaveIfState: %w", err)
+	}
 
 	tag, err := db.Exec(ctx, query,
 		tx.ID().String(), expected.String(), tx.State().String(),
 		authCode, rejCode, rejSource, fraudScore, fraudDecision,
-		tx.AuthorizedAt(), tx.RejectedAt(),
+		tx.AuthorizedAt(), tx.RejectedAt(), rulesHit,
 	)
 	if err != nil {
 		return false, fmt.Errorf("TransactionRepo.SaveIfState: %w", err)

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/authorization/domain/service"
 	"github.com/juantevez/go-posnet/context/authorization/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	"github.com/juantevez/go-posnet/pkg/events"
@@ -180,6 +181,45 @@ func TestPublishRejected_PublishError(t *testing.T) {
 	err := p.PublishRejected(context.Background(), tx)
 	if err == nil || !strings.Contains(err.Error(), "publish rejected") {
 		t.Fatalf("error = %v, want it to contain %q", err, "publish rejected")
+	}
+}
+
+func TestPublishInvalidRejected(t *testing.T) {
+	js := &fakeJetStream{}
+	id := domain.NewTransactionID()
+
+	err := newTestPublisher(js).PublishInvalidRejected(context.Background(), service.InvalidTransactionRejection{
+		TransactionID: id,
+		AmountCents:   5000,
+		Currency:      "ARS",
+		Rejection:     valueobject.NewRejectionFromValidation(valueobject.CodeInvalidData),
+	})
+	if err != nil {
+		t.Fatalf("PublishInvalidRejected() error = %v", err)
+	}
+	if len(js.published) != 1 || js.published[0].Subject != events.SubjectAuthRejected {
+		t.Fatalf("published = %+v, want one message on %q", js.published, events.SubjectAuthRejected)
+	}
+	envelope, err := events.UnmarshalEnvelope(js.published[0].Data)
+	if err != nil {
+		t.Fatalf("UnmarshalEnvelope() error = %v", err)
+	}
+	if envelope.CorrelationID != id.String() {
+		t.Errorf("CorrelationID = %q, want %q", envelope.CorrelationID, id)
+	}
+	payload, err := events.Unwrap[events.AuthorizationRejectedPayload](envelope)
+	if err != nil {
+		t.Fatalf("Unwrap() error = %v", err)
+	}
+	if payload.TransactionID != id.String() || payload.RejectionCode != valueobject.CodeInvalidData ||
+		payload.Source != string(valueobject.SourceValidation) || payload.RejectionReason == "" {
+		t.Errorf("payload = %+v", payload)
+	}
+	if payload.IsRetryable || payload.CaptureCard {
+		t.Errorf("payload = %+v: no debe ser reintentable ni ordenar la retención", payload)
+	}
+	if payload.CardLast4 != "" || payload.AmountCents != 5000 || payload.RejectedAt == "" {
+		t.Errorf("payload = %+v", payload)
 	}
 }
 

@@ -199,6 +199,22 @@ func TestHandleTransactionReceived_HandlerValidationError(t *testing.T) {
 	}
 }
 
+func TestHandleTransactionReceived_InvalidDataPublishesRejection(t *testing.T) {
+	pub := &fakeDomainPublisher{}
+	h := command.NewAuthorizationHandler(&fakeRepo{}, &fakeAcquirer{}, pub, natsutil.NewIdempotencyStore(nil, idempotencySchema), nil)
+	s := NewSubscriber(&fakeJetStream{}, h)
+
+	id := domain.NewTransactionID().String()
+	s.handleTransactionReceived(newEnvelopeMsg(t, events.SubjectTransactionReceived, id, events.TransactionReceivedPayload{
+		TransactionID: id,
+		CardNetwork:   "BOGUS",
+	}))
+
+	if pub.invalidRejectedCalls != 1 {
+		t.Errorf("PublishInvalidRejected calls = %d, want 1", pub.invalidRejectedCalls)
+	}
+}
+
 // ─── handleFraudScoreCalculated ────────────────────────────────────────────────
 
 func TestHandleFraudScoreCalculated_MalformedEnvelope(t *testing.T) {

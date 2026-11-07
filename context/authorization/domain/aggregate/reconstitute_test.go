@@ -156,6 +156,52 @@ func TestReconstitute_RejectionCode(t *testing.T) {
 		}
 	})
 
+	t.Run("every source survives the round trip", func(t *testing.T) {
+		cases := []struct {
+			code    string
+			source  valueobject.RejectionSource
+			capture bool
+		}{
+			{"51", valueobject.SourceAcquirer, false},
+			{"41", valueobject.SourceAcquirer, true},
+			{"CARD_BLOCKED", valueobject.SourceBlocklist, true},
+			{"UNKNOWN_RESPONSE", valueobject.SourceValidation, false},
+			{"FRAUD_REJECTED", valueobject.SourceFraud, false},
+			{"TIMEOUT", valueobject.SourceTimeout, false},
+		}
+		for _, tc := range cases {
+			code, source := tc.code, string(tc.source)
+			params := baseReconstituteParams(t)
+			params.RejectionCode = &code
+			params.RejectionSource = &source
+
+			rc := aggregate.Reconstitute(params).RejectionCode()
+			if rc == nil {
+				t.Fatalf("%s: RejectionCode() = nil", tc.source)
+			}
+			if rc.Code() != tc.code || rc.Source() != tc.source {
+				t.Errorf("RejectionCode() = %v, want %s(%s)", rc, tc.source, tc.code)
+			}
+			if rc.RequiresCardCapture() != tc.capture {
+				t.Errorf("%v RequiresCardCapture() = %v, want %v", rc, rc.RequiresCardCapture(), tc.capture)
+			}
+		}
+	})
+
+	t.Run("missing or unknown source reads as acquirer", func(t *testing.T) {
+		code, unknown := "05", "SOMETHING_ELSE"
+		for _, source := range []*string{nil, &unknown} {
+			params := baseReconstituteParams(t)
+			params.RejectionCode = &code
+			params.RejectionSource = source
+
+			rc := aggregate.Reconstitute(params).RejectionCode()
+			if rc == nil || rc.Source() != valueobject.SourceAcquirer {
+				t.Errorf("RejectionCode() = %v, want source %v", rc, valueobject.SourceAcquirer)
+			}
+		}
+	})
+
 	t.Run("timeout source", func(t *testing.T) {
 		code := "TIMEOUT"
 		source := string(valueobject.SourceTimeout)

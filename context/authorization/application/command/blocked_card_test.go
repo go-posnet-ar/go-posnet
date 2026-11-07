@@ -68,6 +68,26 @@ func TestAuthorizeTransaction_BlockedCardIsRejectedBeforeFraudCheck(t *testing.T
 	}
 }
 
+// Si la tarjeta se bloqueó después de la venta original, un alta repetida no puede publicar un
+// rechazo de una transacción que quizás ya se aprobó.
+func TestAuthorizeTransaction_BlockedCardDoesNotRejectExistingTransaction(t *testing.T) {
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+
+	publisher := &fakePublisher{}
+	h := newHandlerWithBlocklist(t, pool, &fakeRepo{alreadyExists: true}, &fakeAcquirer{}, publisher, &fakeBlockedCards{blocked: true})
+
+	cmd := validAuthorizeCmd(t)
+	cmd.CardToken = testCardToken
+
+	if err := h.AuthorizeTransaction(context.Background(), cmd); err != nil {
+		t.Fatalf("AuthorizeTransaction() error = %v", err)
+	}
+	if publisher.rejectedCalls != 0 {
+		t.Errorf("PublishRejected calls = %d, want 0", publisher.rejectedCalls)
+	}
+}
+
 func TestAuthorizeTransaction_TokenlessCardIsNeverBlocked(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)

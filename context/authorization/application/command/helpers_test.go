@@ -29,6 +29,11 @@ type fakeRepo struct {
 	findResult *aggregate.Transaction
 	findErr    error
 
+	// alreadyExists simula un transaction_id que ya existe: InsertTx devuelve false y
+	// ExistsByID, true.
+	alreadyExists bool
+	existsErr     error
+
 	// claimErr, claimLost y claimed corresponden al guardado junto con el evento (SaveIfStateTx).
 	claimErr  error
 	claimLost bool
@@ -105,9 +110,15 @@ func (f *fakeRepo) CountUnresolved(context.Context, time.Time, time.Time) (repos
 
 var _ repository.TransactionRepository = (*fakeRepo)(nil)
 
-func (f *fakeRepo) Save(_ context.Context, tx *aggregate.Transaction) error {
+func (f *fakeRepo) InsertTx(_ context.Context, _ pgx.Tx, tx *aggregate.Transaction) (bool, error) {
+	if f.saveErr != nil {
+		return false, f.saveErr
+	}
+	if f.alreadyExists {
+		return false, nil
+	}
 	f.savedTxs = append(f.savedTxs, tx)
-	return f.saveErr
+	return true, nil
 }
 
 func (f *fakeRepo) FindByID(_ context.Context, _ domain.TransactionID) (*aggregate.Transaction, error) {
@@ -123,7 +134,7 @@ func (f *fakeRepo) UpdateState(_ context.Context, _ domain.TransactionID, _ valu
 }
 
 func (f *fakeRepo) ExistsByID(_ context.Context, _ domain.TransactionID) (bool, error) {
-	return false, nil
+	return f.alreadyExists, f.existsErr
 }
 
 // ─── fakeBlockedCards ────────────────────────────────────────────────────────
@@ -191,6 +202,9 @@ type fakePublisher struct {
 	rejectedCalls int
 	rejectedErr   error
 
+	invalidRejections []service.InvalidTransactionRejection
+	invalidErr        error
+
 	fraudCheckCalls int
 	fraudCheckErr   error
 
@@ -208,6 +222,14 @@ func (f *fakePublisher) PublishApproved(_ context.Context, _ *aggregate.Transact
 func (f *fakePublisher) PublishRejected(_ context.Context, _ *aggregate.Transaction) error {
 	f.rejectedCalls++
 	return f.rejectedErr
+}
+
+func (f *fakePublisher) PublishInvalidRejected(_ context.Context, r service.InvalidTransactionRejection) error {
+	if f.invalidErr != nil {
+		return f.invalidErr
+	}
+	f.invalidRejections = append(f.invalidRejections, r)
+	return nil
 }
 
 func (f *fakePublisher) PublishFraudCheckRequested(_ context.Context, _ *aggregate.Transaction) error {

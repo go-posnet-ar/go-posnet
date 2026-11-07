@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/authorization/domain/service"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	"github.com/juantevez/go-posnet/pkg/events"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
@@ -99,6 +100,41 @@ func (p *EventPublisher) PublishRejected(ctx context.Context, tx *aggregate.Tran
 	)
 	if err != nil {
 		return fmt.Errorf("publisher: publish rejected: %w", err)
+	}
+	return nil
+}
+
+// PublishInvalidRejected publica AuthorizationRejectedPayload para una transacción con datos
+// inválidos. Consumidores: Terminal Gateway, Notification.
+func (p *EventPublisher) PublishInvalidRejected(ctx context.Context, r service.InvalidTransactionRejection) error {
+	payload := events.AuthorizationRejectedPayload{
+		TransactionID:   r.TransactionID.String(),
+		TerminalID:      r.TerminalID,
+		MerchantID:      r.MerchantID,
+		RejectionCode:   r.Rejection.Code(),
+		RejectionReason: r.Rejection.Description(),
+		IsRetryable:     r.Rejection.IsRetryable(),
+		CaptureCard:     r.Rejection.RequiresCardCapture(),
+		Source:          string(r.Rejection.Source()),
+		AmountCents:     r.AmountCents,
+		Currency:        r.Currency,
+		CardLast4:       r.CardLast4,
+		CardNetwork:     r.CardNetwork,
+		EntryMode:       r.EntryMode,
+		RejectedAt:      time.Now().UTC().Format(time.RFC3339),
+	}
+
+	_, err := p.pub.Publish(ctx,
+		events.SubjectAuthRejected,
+		events.SubjectAuthRejected,
+		r.TransactionID.String(),
+		"Transaction",
+		r.TransactionID.String(),
+		"",
+		payload,
+	)
+	if err != nil {
+		return fmt.Errorf("publisher: publish invalid rejected: %w", err)
 	}
 	return nil
 }

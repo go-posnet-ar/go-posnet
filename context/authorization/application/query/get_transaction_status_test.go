@@ -43,6 +43,10 @@ func (f *fakeRepo) ExistsByID(_ context.Context, _ domain.TransactionID) (bool, 
 	return false, nil
 }
 
+func (f *fakeRepo) InsertTx(ctx context.Context, _ pgx.Tx, tx *aggregate.Transaction) (bool, error) {
+	return true, f.Save(ctx, tx)
+}
+
 func (f *fakeRepo) SaveIfState(ctx context.Context, tx *aggregate.Transaction, _ valueobject.TransactionState) (bool, error) {
 	return true, f.Save(ctx, tx)
 }

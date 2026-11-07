@@ -59,6 +59,132 @@ func TestAuthorizeTransaction_ValidationErrors(t *testing.T) {
 	}
 }
 
+func newInvalidDataHandler(repo *fakeRepo, publisher *fakePublisher) *command.AuthorizationHandler {
+	// El pool queda en nil: una transacción inválida no abre una transacción de base.
+	return command.NewAuthorizationHandler(
+		repo, &fakeAcquirer{}, publisher,
+		natsutil.NewIdempotencyStore(nil, idempotencySchema), nil,
+	)
+}
+
+func TestAuthorizeTransaction_InvalidDataPublishesRejection(t *testing.T) {
+	cmd := validAuthorizeCmd(t)
+	cmd.CardNetwork = "BOGUS"
+	repo := &fakeRepo{}
+	publisher := &fakePublisher{}
+
+	err := newInvalidDataHandler(repo, publisher).AuthorizeTransaction(context.Background(), cmd)
+
+	var ve *pkgerrors.ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("error = %v, want a ValidationError, para que el mensaje se descarte", err)
+	}
+	if len(publisher.invalidRejections) != 1 {
+		t.Fatalf("rechazos publicados = %d, want 1", len(publisher.invalidRejections))
+	}
+	got := publisher.invalidRejections[0]
+	if got.TransactionID.String() != cmd.TransactionID {
+		t.Errorf("TransactionID = %q, want %q", got.TransactionID, cmd.TransactionID)
+	}
+	if got.Rejection.Code() != valueobject.CodeInvalidData || got.Rejection.Source() != valueobject.SourceValidation {
+		t.Errorf("Rejection = %v, want VALIDATION(%s)", got.Rejection, valueobject.CodeInvalidData)
+	}
+	if got.Rejection.IsRetryable() || got.Rejection.RequiresCardCapture() {
+		t.Errorf("Rejection = %v: no debe ser reintentable ni ordenar la retención", got.Rejection)
+	}
+	if got.CardNetwork != "" {
+		t.Errorf("CardNetwork = %q, want vacío: no pasó la validación", got.CardNetwork)
+	}
+	if got.CardLast4 != cmd.CardLast4 || got.AmountCents != cmd.AmountCents || got.Currency != cmd.Currency ||
+		got.TerminalID != cmd.TerminalID || got.MerchantID != cmd.MerchantID || got.EntryMode != cmd.EntryMode {
+		t.Errorf("rechazo = %+v: debe conservar los campos válidos de %+v", got, cmd)
+	}
+	if len(repo.savedTxs) != 0 {
+		t.Errorf("saved txs = %d, want 0", len(repo.savedTxs))
+	}
+	if publisher.fraudCheckCalls != 0 {
+		t.Errorf("PublishFraudCheckRequested calls = %d, want 0", publisher.fraudCheckCalls)
+	}
+}
+
+// card_last4 lo envía el cliente sin validar: un PAN completo no puede salir por el evento
+// ni quedar en el error que se loguea.
+func TestAuthorizeTransaction_InvalidCardLast4IsNotForwarded(t *testing.T) {
+	const pan = "4111111111111111"
+	cmd := validAuthorizeCmd(t)
+	cmd.CardLast4 = pan
+	publisher := &fakePublisher{}
+
+	err := newInvalidDataHandler(&fakeRepo{}, publisher).AuthorizeTransaction(context.Background(), cmd)
+	if err == nil {
+		t.Fatal("AuthorizeTransaction() error = nil, want a validation error")
+	}
+	if strings.Contains(err.Error(), pan) {
+		t.Errorf("error = %q: no debe incluir card_last4", err.Error())
+	}
+	if len(publisher.invalidRejections) != 1 {
+		t.Fatalf("rechazos publicados = %d, want 1", len(publisher.invalidRejections))
+	}
+	if got := publisher.invalidRejections[0].CardLast4; got != "" {
+		t.Errorf("CardLast4 = %q, want vacío", got)
+	}
+}
+
+func TestAuthorizeTransaction_InvalidDataNotPublished(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*port.AuthorizeTransactionCommand)
+		repo   *fakeRepo
+	}{
+		{"sin un transaction_id válido no hay a quién avisar", func(c *port.AuthorizeTransactionCommand) { c.TransactionID = "not-a-uuid" }, &fakeRepo{}},
+		{"una transacción existente no se rechaza", func(c *port.AuthorizeTransactionCommand) { c.CardNetwork = "BOGUS" }, &fakeRepo{alreadyExists: true}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := validAuthorizeCmd(t)
+			tc.mutate(&cmd)
+			publisher := &fakePublisher{}
+
+			err := newInvalidDataHandler(tc.repo, publisher).AuthorizeTransaction(context.Background(), cmd)
+
+			var ve *pkgerrors.ValidationError
+			if !errors.As(err, &ve) {
+				t.Errorf("error = %v, want a ValidationError", err)
+			}
+			if len(publisher.invalidRejections) != 0 {
+				t.Errorf("rechazos publicados = %d, want 0", len(publisher.invalidRejections))
+			}
+		})
+	}
+}
+
+// Un error transitorio no es de validación: el mensaje se reintenta, en lugar de descartarse
+// sin haber avisado del rechazo.
+func TestAuthorizeTransaction_InvalidDataTransientErrorsAreRetried(t *testing.T) {
+	boom := errors.New("boom")
+	tests := []struct {
+		name      string
+		repo      *fakeRepo
+		publisher *fakePublisher
+	}{
+		{"falla la consulta", &fakeRepo{existsErr: boom}, &fakePublisher{}},
+		{"falla la publicación", &fakeRepo{}, &fakePublisher{invalidErr: boom}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := validAuthorizeCmd(t)
+			cmd.CardNetwork = "BOGUS"
+
+			err := newInvalidDataHandler(tc.repo, tc.publisher).AuthorizeTransaction(context.Background(), cmd)
+
+			var ve *pkgerrors.ValidationError
+			if !errors.Is(err, boom) || errors.As(err, &ve) {
+				t.Errorf("error = %v, want %v y que no sea de validación", err, boom)
+			}
+		})
+	}
+}
+
 func TestAuthorizeTransaction_Success(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
@@ -101,6 +227,27 @@ func TestAuthorizeTransaction_DuplicateEventIsSkipped(t *testing.T) {
 	}
 	if len(repo.savedTxs) != 0 {
 		t.Errorf("saved txs = %d, want 0 (duplicate must not be persisted)", len(repo.savedTxs))
+	}
+	if publisher.fraudCheckCalls != 0 {
+		t.Errorf("PublishFraudCheckRequested calls = %d, want 0", publisher.fraudCheckCalls)
+	}
+}
+
+// Un alta repetida con otro event_id no reinicia la transacción ni pide otro fraud check: si
+// no, el score nuevo volvería a llamar al adquirente. El evento queda marcado.
+func TestAuthorizeTransaction_ExistingTransactionIsNotRestarted(t *testing.T) {
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+
+	repo := &fakeRepo{alreadyExists: true}
+	publisher := &fakePublisher{}
+	h := command.NewAuthorizationHandler(
+		repo, &fakeAcquirer{}, publisher,
+		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
+	)
+
+	if err := h.AuthorizeTransaction(context.Background(), validAuthorizeCmd(t)); err != nil {
+		t.Fatalf("AuthorizeTransaction() error = %v", err)
 	}
 	if publisher.fraudCheckCalls != 0 {
 		t.Errorf("PublishFraudCheckRequested calls = %d, want 0", publisher.fraudCheckCalls)

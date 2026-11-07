@@ -137,6 +137,7 @@ respuesta tardía del adquirente no pisa lo que ya resolvió el conciliador.
 | `BLOCKLIST` | `CARD_BLOCKED` | La tarjeta está en la blocklist | Sí |
 | `ACQUIRER` | ISO 8583 (`05`, `51`, etc.) | El emisor rechazó | Solo `04`, `41` y `43` |
 | `VALIDATION` | `UNKNOWN_RESPONSE` | El adquirente respondió sin código | No |
+| `VALIDATION` | `INVALID_DATA` | `transaction.received` trae datos inválidos. No se guarda: ver [§5.5](#55-qué-pasa-cuando-falla-cada-paso) | No |
 | `TIMEOUT` | `TIMEOUT` | Definido, pero ningún flujo lo genera | No |
 
 Solo los códigos `91` y `96` se publican con `is_retryable=true`. La retención se decide por la
@@ -216,8 +217,12 @@ descuenta. **Terminal Gateway no se entera:** ya respondió `202` e ignora este 
 
 | Fallo | Resultado | ¿Se recupera solo? |
 |---|---|---|
-| `transaction.received` con datos inválidos | `Term`; no se guarda ni se publica nada | No |
+| `transaction.received` con datos inválidos | Publica `auth.rejected` con `INVALID_DATA` y `Term`; no se guarda | **Sí**: la sesión pasa a rechazada |
+| Ídem, sin un `transaction_id` válido o con uno que ya existe | `Term`; no se publica nada | No hace falta: no hay sesión a la que avisar, o vale la transacción original |
+| Ídem, y falla la consulta o la publicación del rechazo | `Nak` y reintento. Al agotar las entregas, se pierde | **Sí**, si se recupera antes |
 | Error de base de datos antes de marcar el evento | `Nak` y reintento | **Sí** |
+| Falla el alta o el commit de la transacción | Nada queda guardado, ni el evento marcado: `Nak` y reintento | **Sí** |
+| Otro `transaction.received` con un `transaction_id` que ya existe | Se ignora con un `WARN` y se marca el evento: la transacción original no cambia | No hace falta |
 | Falla la publicación de `fraud.check-requested` | Se registra y se confirma; queda en `FRAUD_CHECKING` | No |
 | Fraud Detection nunca responde | Queda en `FRAUD_CHECKING`; no hay timeout | No |
 | Error de base de datos antes de guardar `PROCESSING` | Nada queda guardado: `Nak` y reintento, sin haber llamado al adquirente | **Sí** |
@@ -227,6 +232,11 @@ descuenta. **Terminal Gateway no se entera:** ya respondió `202` e ignora este 
 | Falla el guardado tras responder el adquirente | Queda en `PROCESSING`; la toma el conciliador | **Sí**: la revierte, aunque el emisor la haya aprobado |
 | La reversa del conciliador falla | Sigue en `INDETERMINATE`; alerta `TransaccionesSinResolver` | **Sí**, cuando el adquirente responda |
 | Falla la publicación del resultado | Se registra y se confirma; la base queda correcta, pero nadie se entera | No |
+
+El rechazo por `INVALID_DATA` solo lleva los campos que pasaron la validación; los demás van vacíos o en cero. Un
+`card_last4` inválido tampoco se loguea, porque podría traer un PAN completo. Como no hay una fila,
+`GET /transactions/{id}` responde `404`. Notification descarta el evento si el comercio no es válido o el monto no es
+positivo, pero Terminal Gateway solo necesita el `transaction_id`.
 
 En los casos sin resultado publicado, Terminal Gateway mantiene la sesión en `PROCESSING` hasta
 que su job de limpieza la borra.
@@ -421,7 +431,7 @@ hay transacciones en `PROCESSING` o `INDETERMINATE`, y exige volver antes a la v
 ### Aplicar la migración de blocklist
 
 **Una base creada antes de este cambio necesita la migración manualmente.** Sin la columna
-`card_token`, fallan tanto `Save` como `FindByID`, y con ellos todas las transacciones:
+`card_token`, fallan tanto `InsertTx` como `FindByID`, y con ellos todas las transacciones:
 
 ```bash
 psql "$POSTGRES_DSN" -f migrations/pn_authorization/000001_card_blocklist.up.sql
@@ -435,8 +445,9 @@ entorno con datos reales, exportarlos antes de ejecutarlo.
 
 - **Publicación:** *at-most-once* en la práctica. No hay outbox: si NATS falla después de guardar, el
   evento se pierde. La reentrega no ayuda, porque el mensaje se confirma igual.
-- **Idempotencia:** el `event_id` se registra en `processed_events`. En `ApplyFraudScore` y `ProcessReversal`, ese
-  registro se confirma junto con el nuevo estado o el pedido, y **antes** de llamar al adquirente: un fallo previo se
+- **Idempotencia:** el `event_id` se registra en `processed_events`. En `AuthorizeTransaction`, ese registro se confirma
+  junto con el alta, que no modifica una transacción existente. En `ApplyFraudScore` y `ProcessReversal`, se confirma
+  junto con el nuevo estado o el pedido, y **antes** de llamar al adquirente: un fallo previo se
   reintenta, y una reentrega no vuelve a llamarlo. Lo que falle después lo resuelve el
   [conciliador](#56-conciliación).
 
@@ -462,7 +473,8 @@ conciliador. El servidor gRPC no se detiene de forma ordenada.
 | `posnet_acquirer_connected` | Gauge | Con `iso8583`: 1 conectado, 0 caído |
 | `posnet_reversals_ignored_total` | Counter | `state`: pedidos de reversa sin nada que revertir |
 
-`posnet_saga_duration_seconds` solo registra sagas que terminan en aprobación o rechazo: las trabadas no aparecen.
+`posnet_saga_duration_seconds` solo registra sagas que terminan en aprobación o rechazo: las trabadas no aparecen, ni
+las rechazadas por `INVALID_DATA`, que no llegan a empezar.
 Una reversa del conciliador cuenta como rechazo, con `source="TIMEOUT"`.
 
 También se exponen métricas del pool de Postgres, de mensajes NATS y de duplicados descartados
@@ -611,9 +623,6 @@ Con el simulador, estas fallas solo ocurren con [los montos de prueba](#probar-l
 |---|---|---|
 | No existe el bypass ni el timeout de fraude | El log dice `fraud bypass will apply` y la documentación del evento menciona 500 ms, pero `BypassFraudCheck` no se invoca. Si Fraud Detection no responde, la transacción queda trabada para siempre | `AuthorizeTransaction` |
 | Resultados publicados sin outbox | Si falla la publicación de una aprobación, Settlement no la liquida y el cajero no la ve, aunque figure `APPROVED` | `callAcquirer`, `publishRejection`, `reconcile` |
-| Una transacción inválida no recibe respuesta | Terminal Gateway no valida `card_network` ni `card_last4`: `/pay` responde `202`, Authorization descarta el mensaje y la sesión queda en `PROCESSING` hasta su limpieza | `AuthorizeTransaction` |
-| Un segundo evento con el mismo `transaction_id` reinicia la transacción | `Save` es un UPSERT: un `event_id` distinto la devuelve a `FRAUD_CHECKING` y puede cobrarse otra vez. Hoy Terminal Gateway no genera este caso, pero Authorization no se defiende | `AuthorizeTransaction`, `TransactionRepo.Save` |
-| `Save` queda fuera de la transacción de idempotencia | Usa el pool en lugar de `dbTx`, aunque el comentario diga lo contrario. Si falla el commit, queda guardado sin el evento marcado y la reentrega reprocesa | `AuthorizeTransaction`, `rejectBlockedCard` |
 | Notification no consume `reversal-completed` | El contrato del evento prevé un comprobante de anulación, pero el subscriber de Notification no se suscribe, así que no se genera | `nt_nats_subscriber.go` |
 
 ### Blocklist y datos de tarjeta
@@ -625,18 +634,16 @@ Con el simulador, estas fallas solo ocurren con [los montos de prueba](#probar-l
 | Dialecto propio | Los campos siguen ISO 8583:1987, pero un host real va a pedir los suyos, además de certificación | `messages.go` |
 | El stub no usa `card_token` para nada real | Devuelve una tarjeta de prueba: no valida que el token exista ni que coincidan los últimos 4 dígitos | `carddata.Stub` |
 | Sin caso de uso para desbloquear | Un bloqueo es permanente, salvo que se borre la fila a mano | `BlockedCardRepository` |
-| `iso8583_raw` se guarda tal como llega | El mensaje al host no se guarda ahí, pero si un terminal lo enviara con el PAN, quedaría en la base. Definir qué se guarda antes de recibir mensajes de terminales | `TransactionRepo.Save` |
+| `iso8583_raw` se guarda tal como llega | El mensaje al host no se guarda ahí, pero si un terminal lo enviara con el PAN, quedaría en la base. Definir qué se guarda antes de recibir mensajes de terminales | `TransactionRepo.InsertTx` |
 
 ### Operación y datos
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
 | Sin migraciones automáticas | Cambios como `card_token` requieren aplicarse a mano; si no, fallan todas las transacciones (ver [§9](#9-persistencia)) | `pkg/pgutil/migrate.go` |
-| `fraud_rules_hit` nunca se guarda | `Save` no incluye la columna: las reglas que motivaron una decisión se pierden para auditoría | `TransactionRepo.Save` |
 | Faltan índices en `01-init.sql` | Solo está el de `card_token`. Las consultas de historial de Fraud Detection, por terminal y fecha, recorren la tabla | `01-init.sql` |
 | Acoplamiento con Fraud Detection | Lee las tablas de este contexto directamente, en contra de lo que indica la documentación de arquitectura | `fd_postgres_repository.go` |
 | gRPC sin TLS, sin autenticación y sin apagado ordenado | Si falla el listen, solo se registra el error y el proceso sigue. El puerto ignora `GRPC_PORT` | `server.go`, `wire.go` |
 | API HTTP sin autenticación | Cualquiera con acceso de red y un ID puede leer el estado y el monto de una transacción | `router.go` |
 | `/readyz` no verifica NATS | Una instancia sin NATS sigue figurando como lista | `handler.go` |
-| La fuente del rechazo no se reconstruye bien | `BLOCKLIST` y `VALIDATION` se leen como `ACQUIRER`. Hoy no tiene efecto, porque un rechazo no se vuelve a guardar | `reconstitute.go` |
-| Código sin uso | `FindBySTAN`, `UpdateState`, `ExistsByID`, `parseRFC3339` y los eventos de dominio internos no se usan | `repository.go`, `server.go`, `transaction.go` |
+| Código sin uso | `FindBySTAN`, `UpdateState`, `parseRFC3339` y los eventos de dominio internos no se usan | `repository.go`, `server.go`, `transaction.go` |

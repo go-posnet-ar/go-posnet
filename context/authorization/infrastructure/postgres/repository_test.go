@@ -22,35 +22,65 @@ import (
 func strPtr(s string) *string { return &s }
 func intPtr(i int) *int       { return &i }
 
-// ─── Save ───────────────────────────────────────────────────────────────────
+// ─── InsertTx ───────────────────────────────────────────────────────────────
 
-func TestSave_Success(t *testing.T) {
+// beginMockTx abre la transacción de base que InsertTx recibe del handler. Las expectations
+// se verifican sobre el mismo mock: InsertTx no debe pedir otra conexión al pool.
+func beginMockTx(t *testing.T, pool pgxmock.PgxPoolIface) pgx.Tx {
+	t.Helper()
+	pool.ExpectBegin()
+	dbTx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	return dbTx
+}
+
+func TestInsertTx_NewTransaction(t *testing.T) {
 	pool := newMockPool(t)
+	dbTx := beginMockTx(t, pool)
 	pool.ExpectExec("INSERT INTO pn_authorization.transactions").
-		WithArgs(anyArgs(21)...).
+		WithArgs(anyArgs(22)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 	repo := postgres.NewTransactionRepo(pool)
-	if err := repo.Save(context.Background(), newValidTransaction(t)); err != nil {
-		t.Fatalf("Save() error = %v", err)
+	created, err := repo.InsertTx(context.Background(), dbTx, newValidTransaction(t))
+	if err != nil || !created {
+		t.Fatalf("InsertTx() = %v, %v, want true, nil", created, err)
 	}
 }
 
-func TestSave_ExecError(t *testing.T) {
+func TestInsertTx_ExistingTransactionIsNotOverwritten(t *testing.T) {
 	pool := newMockPool(t)
+	dbTx := beginMockTx(t, pool)
+	pool.ExpectExec(`INSERT INTO pn_authorization.transactions[\s\S]*ON CONFLICT \(id\) DO NOTHING`).
+		WithArgs(anyArgs(22)...).
+		WillReturnResult(pgxmock.NewResult("INSERT", 0))
+
+	repo := postgres.NewTransactionRepo(pool)
+	created, err := repo.InsertTx(context.Background(), dbTx, newValidTransaction(t))
+	if err != nil || created {
+		t.Fatalf("InsertTx() = %v, %v, want false, nil", created, err)
+	}
+}
+
+func TestInsertTx_ExecError(t *testing.T) {
+	pool := newMockPool(t)
+	dbTx := beginMockTx(t, pool)
 	pool.ExpectExec("INSERT INTO pn_authorization.transactions").
-		WithArgs(anyArgs(21)...).
+		WithArgs(anyArgs(22)...).
 		WillReturnError(errors.New("connection reset"))
 
 	repo := postgres.NewTransactionRepo(pool)
-	err := repo.Save(context.Background(), newValidTransaction(t))
-	if err == nil || !strings.Contains(err.Error(), "exec upsert") {
-		t.Fatalf("error = %v, want it to contain %q", err, "exec upsert")
+	_, err := repo.InsertTx(context.Background(), dbTx, newValidTransaction(t))
+	if err == nil || !strings.Contains(err.Error(), "exec insert") {
+		t.Fatalf("error = %v, want it to contain %q", err, "exec insert")
 	}
 }
 
-func TestSave_ApprovedTransactionArgs(t *testing.T) {
+func TestInsertTx_ApprovedTransactionArgs(t *testing.T) {
 	pool := newMockPool(t)
+	dbTx := beginMockTx(t, pool)
 	tx := newApprovedTransaction(t)
 
 	pool.ExpectExec("INSERT INTO pn_authorization.transactions").
@@ -60,7 +90,7 @@ func TestSave_ApprovedTransactionArgs(t *testing.T) {
 			tx.PAN().Last4(), string(tx.PAN().Network()), tx.EntryMode().String(),
 			tx.STAN().Value(),
 			strPtr(tx.AuthCode().String()), (*string)(nil), (*string)(nil),
-			intPtr(tx.FraudDecision().Score), strPtr(tx.FraudDecision().Decision),
+			intPtr(tx.FraudDecision().Score), strPtr(tx.FraudDecision().Decision), pgxmock.AnyArg(),
 			tx.EMVDataBase64(), tx.ISO8583Raw(),
 			tx.ReceivedAt(), tx.AuthorizedAt(), (*time.Time)(nil),
 			(*string)(nil), // card_token — la transacción de prueba no trae token
@@ -68,13 +98,14 @@ func TestSave_ApprovedTransactionArgs(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 	repo := postgres.NewTransactionRepo(pool)
-	if err := repo.Save(context.Background(), tx); err != nil {
-		t.Fatalf("Save() error = %v", err)
+	if _, err := repo.InsertTx(context.Background(), dbTx, tx); err != nil {
+		t.Fatalf("InsertTx() error = %v", err)
 	}
 }
 
-func TestSave_RejectedTransactionArgs(t *testing.T) {
+func TestInsertTx_RejectedTransactionArgs(t *testing.T) {
 	pool := newMockPool(t)
+	dbTx := beginMockTx(t, pool)
 	tx := newRejectedTransaction(t)
 	rc := tx.RejectionCode()
 
@@ -85,7 +116,7 @@ func TestSave_RejectedTransactionArgs(t *testing.T) {
 			tx.PAN().Last4(), string(tx.PAN().Network()), tx.EntryMode().String(),
 			tx.STAN().Value(),
 			(*string)(nil), strPtr(rc.Code()), strPtr(string(rc.Source())),
-			(*int)(nil), (*string)(nil), // sin fraud decision — Reject() directo desde RECEIVED
+			(*int)(nil), (*string)(nil), []byte(nil), // sin fraud decision — Reject() directo desde RECEIVED
 			tx.EMVDataBase64(), tx.ISO8583Raw(),
 			tx.ReceivedAt(), (*time.Time)(nil), tx.RejectedAt(),
 			(*string)(nil), // card_token — la transacción de prueba no trae token
@@ -93,8 +124,8 @@ func TestSave_RejectedTransactionArgs(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
 	repo := postgres.NewTransactionRepo(pool)
-	if err := repo.Save(context.Background(), tx); err != nil {
-		t.Fatalf("Save() error = %v", err)
+	if _, err := repo.InsertTx(context.Background(), dbTx, tx); err != nil {
+		t.Fatalf("InsertTx() error = %v", err)
 	}
 }
 
@@ -371,7 +402,7 @@ func TestSaveIfState(t *testing.T) {
 			pool := newMockPool(t)
 			tx := newApprovedTransaction(t)
 			pool.ExpectExec("WHERE id = .* AND state = ").
-				WithArgs(append([]any{tx.ID().String(), "PROCESSING", "APPROVED"}, anyArgs(7)...)...).
+				WithArgs(append([]any{tx.ID().String(), "PROCESSING", "APPROVED"}, anyArgs(8)...)...).
 				WillReturnResult(pgxmock.NewResult("UPDATE", tc.rows))
 
 			got, err := postgres.NewTransactionRepo(pool).SaveIfState(context.Background(), tx, valueobject.StateProcessing)
@@ -382,9 +413,31 @@ func TestSaveIfState(t *testing.T) {
 	}
 }
 
+func TestSaveIfState_SavesFraudRules(t *testing.T) {
+	pool := newMockPool(t)
+	tx := newValidTransaction(t)
+	if err := tx.StartFraudCheck(); err != nil {
+		t.Fatalf("StartFraudCheck() error = %v", err)
+	}
+	decision, err := valueobject.NewFraudDecision(55, valueobject.FraudDecisionReview, []string{"R1", "R2"})
+	if err != nil {
+		t.Fatalf("NewFraudDecision() error = %v", err)
+	}
+	if err := tx.ApplyFraudDecision(decision); err != nil {
+		t.Fatalf("ApplyFraudDecision() error = %v", err)
+	}
+	pool.ExpectExec("fraud_rules_hit  = \\$11").
+		WithArgs(append(anyArgs(10), []byte(`["R1","R2"]`))...).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+	if _, err := postgres.NewTransactionRepo(pool).SaveIfState(context.Background(), tx, valueobject.StateFraudChecking); err != nil {
+		t.Fatalf("SaveIfState() error = %v", err)
+	}
+}
+
 func TestSaveIfState_ExecError(t *testing.T) {
 	pool := newMockPool(t)
-	pool.ExpectExec("WHERE id = ").WithArgs(anyArgs(10)...).WillReturnError(errors.New("db down"))
+	pool.ExpectExec("WHERE id = ").WithArgs(anyArgs(11)...).WillReturnError(errors.New("db down"))
 
 	if _, err := postgres.NewTransactionRepo(pool).SaveIfState(context.Background(), newApprovedTransaction(t), valueobject.StateProcessing); err == nil {
 		t.Fatal("SaveIfState() error = nil, want error")
@@ -398,7 +451,7 @@ func TestSaveIfStateTx_UsesCallerTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Begin() error = %v", err)
 	}
-	pool.ExpectExec("WHERE id = ").WithArgs(anyArgs(10)...).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	pool.ExpectExec("WHERE id = ").WithArgs(anyArgs(11)...).WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 
 	got, err := postgres.NewTransactionRepo(pool).SaveIfStateTx(context.Background(), dbTx, newApprovedTransaction(t), valueobject.StateFraudChecking)
 	if err != nil || !got {
