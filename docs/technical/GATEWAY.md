@@ -75,6 +75,10 @@ El gateway reemplaza `X-Forwarded-For` por la IP de la conexión: un cliente no 
 detrás de un balanceador, hay que declararlo en `GATEWAY_TRUSTED_PROXIES`, y entonces se conserva la cadena que este
 escribió.
 
+En Docker Compose, `GATEWAY_TRUSTED_PROXIES` declara `172.30.0.20`, la IP fija del nginx de `posnet-front` en la red `edge`.
+La página de pago llama a la API a través de ese nginx: sin esto, el límite de `/pay` y `/status` vería a todos los
+teléfonos con la IP de nginx.
+
 Para que los límites de intentos de Terminal Gateway y Settlement vean la IP del cliente y no la del gateway, los dos
 declaran al gateway como proxy de confianza: `TRUSTED_PROXIES` y `SETTLEMENT_TRUSTED_PROXIES`. Si no, agruparían a todos los
 clientes bajo la IP del gateway, y 10 tokens inválidos de cualquiera bloquearían a todos durante 5 minutos.
