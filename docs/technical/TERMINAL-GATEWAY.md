@@ -377,8 +377,33 @@ Un `500` responde `{"error": "INTERNAL", "message": "internal error"}`, y el det
 ## 7. API gRPC
 
 Contrato: [`terminal_gateway.proto`](../../pkg/proto/terminalgateway/v1/terminal_gateway.proto). El
-puerto es 9091, sin TLS. Su único consumidor en producción es Notification, a través de su propio
+puerto es 9091. Su único consumidor en producción es Notification, a través de su propio
 cliente; el de `infrastructure/grpc/client` no se importa fuera de sus tests.
+
+### mTLS
+
+Con `GRPC_TLS_CERT` y `GRPC_TLS_KEY`, el puerto sirve solo TLS, desde 1.2. Con `GRPC_TLS_CLIENT_CA`, además exige que el
+cliente presente un certificado firmado por esa CA: sin él, el handshake falla y la llamada termina en `Unavailable`. **Fuera
+de `ENVIRONMENT=development`, el servicio no arranca sin los tres.** Docker Compose no usa TLS.
+
+El certificado del servidor tiene que incluir el nombre con el que lo llama Notification (por ejemplo, `terminal-gateway`), o
+Notification tiene que declararlo con `GRPC_CLIENT_TLS_SERVER_NAME`. Del lado de Notification se configuran
+`GRPC_CLIENT_TLS_CA`, `GRPC_CLIENT_TLS_CERT` y `GRPC_CLIENT_TLS_KEY` (ver
+[Notification](NOTIFICATION.md#7-grpc)). Un certificado nuevo requiere reiniciar los dos servicios.
+
+```bash
+# Ejemplo con openssl: una CA, el certificado de Terminal Gateway y el de Notification
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 \
+  -subj /CN=posnet-ca -keyout ca.key -out ca.pem
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=terminal-gateway \
+  -keyout tg.key -out tg.csr
+openssl x509 -req -in tg.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 365 -out tg.pem \
+  -extfile <(printf 'subjectAltName=DNS:terminal-gateway\nextendedKeyUsage=serverAuth')
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=notification \
+  -keyout nt.key -out nt.csr
+openssl x509 -req -in nt.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 365 -out nt.pem \
+  -extfile <(printf 'extendedKeyUsage=clientAuth')
+```
 
 | RPC | Comportamiento actual |
 |---|---|
@@ -544,6 +569,8 @@ Cada comando y consulta abre un span (`command.ProcessPayment`, `query.GetSessio
 | `HTTP_TLS_CERT`, `HTTP_TLS_KEY` | Vacías | Sí; habilitan [HTTPS](#tls). Van juntas. Si no se pueden cargar, el servicio no arranca |
 | `HTTP_TLS_EXTERNAL` | `false` | Sí; declara que un proxy termina TLS. Fuera de desarrollo, hace falta esto o `HTTP_TLS_CERT` |
 | `TRUSTED_PROXIES` | Vacía | Sí; CIDR separados por comas cuyo `X-Forwarded-For` se acepta para el límite de intentos. Uno inválido impide arrancar |
+| `GRPC_TLS_CERT`, `GRPC_TLS_KEY` | Vacías | Sí; habilitan [TLS en gRPC](#mtls). Van juntas. Si no se pueden cargar, el servicio no arranca |
+| `GRPC_TLS_CLIENT_CA` | Vacía | Sí; CA de los clientes: exige mTLS. Fuera de desarrollo, hace falta junto con las dos anteriores |
 | `CORS_ALLOWED_ORIGINS` | Frontend de pago | Sí; orígenes separados por comas, como `https://pagos.example.com`. `*` permite cualquiera |
 | `GRPC_PORT` | `9091` | **No**: el puerto está fijo en 9091 |
 | `WS_PORT` | `8082` | **No**: no hay servidor WebSocket |
@@ -611,7 +638,7 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | `/pay` y `/status` son públicos | Cualquiera con un ID de sesión puede pagarla o ver su estado. Requiere un token por sesión en `qr_content`, que cambia `posnet-frontend` | `tg_qr_handler.go` |
 | En desarrollo, los tokens pueden viajar sin TLS | Con `ENVIRONMENT=development` y un archivo de tokens, el servicio arranca sin TLS y lo advierte en el log | `tg_wire.go` |
 | El límite de intentos es por instancia | Con varias instancias detrás de un balanceador, un atacante tiene 10 intentos por minuto en cada una | `tg_http_auth.go` |
-| gRPC sin TLS | Tráfico interno sin cifrar ni autenticar | `tg_grpc_server.go` |
+| gRPC acepta cualquier certificado de la CA | No se verifica que el cliente sea Notification: otro servicio con un certificado de la misma CA también entra. Conviene una CA solo para este canal | `tg_grpc_tls.go` |
 
 ### Pagos y consistencia
 

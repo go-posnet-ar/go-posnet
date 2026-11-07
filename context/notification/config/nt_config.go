@@ -70,9 +70,13 @@ type RetryConfig struct {
 // Notification es el único BC que actúa como cliente gRPC.
 type GRPCClientConfig struct {
 	TerminalGatewayAddr string // ej: "terminal-gateway:9091"
-	TLSCertPath         string
-	TLSKeyPath          string
-	TLSCAPath           string
+	// TLSCAPath verifica a Terminal Gateway, y TLSCertPath y TLSKeyPath son el certificado de
+	// Notification para mTLS. Fuera de desarrollo hacen falta los tres.
+	TLSCertPath string
+	TLSKeyPath  string
+	TLSCAPath   string
+	// TLSServerName reemplaza al host de TerminalGatewayAddr al verificar el certificado.
+	TLSServerName string
 }
 
 // Load carga la configuración desde variables de entorno.
@@ -122,6 +126,7 @@ func Load() (*Config, error) {
 			TLSCertPath:         envStr("GRPC_CLIENT_TLS_CERT", ""),
 			TLSKeyPath:          envStr("GRPC_CLIENT_TLS_KEY", ""),
 			TLSCAPath:           envStr("GRPC_CLIENT_TLS_CA", ""),
+			TLSServerName:       envStr("GRPC_CLIENT_TLS_SERVER_NAME", ""),
 		},
 	}
 
@@ -140,6 +145,16 @@ func (c *Config) validate() error {
 	if c.Retry.BatchSize < 1 || c.Retry.BatchSize > 500 {
 		return fmt.Errorf("config: RETRY_BATCH_SIZE %d out of range [1, 500]",
 			c.Retry.BatchSize)
+	}
+	g := c.GRPCClient
+	if (g.TLSCertPath == "") != (g.TLSKeyPath == "") {
+		return fmt.Errorf("config: GRPC_CLIENT_TLS_CERT and GRPC_CLIENT_TLS_KEY must be set together")
+	}
+	if g.TLSCertPath != "" && g.TLSCAPath == "" {
+		return fmt.Errorf("config: GRPC_CLIENT_TLS_CERT requires GRPC_CLIENT_TLS_CA to verify Terminal Gateway")
+	}
+	if c.OTEL.Environment != "development" && (g.TLSCAPath == "" || g.TLSCertPath == "") {
+		return fmt.Errorf("config: ENVIRONMENT=%s requires GRPC_CLIENT_TLS_CA, GRPC_CLIENT_TLS_CERT and GRPC_CLIENT_TLS_KEY: receipts would travel unencrypted", c.OTEL.Environment)
 	}
 	return nil
 }

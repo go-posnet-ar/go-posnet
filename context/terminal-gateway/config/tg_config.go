@@ -31,6 +31,13 @@ type Config struct {
 	// HTTPTLSExternal declara que un proxy termina TLS. Fuera de desarrollo hace falta esto o
 	// HTTPTLSCert: si no, el servicio no arranca, porque los tokens viajarían sin cifrar.
 	HTTPTLSExternal bool
+	// GRPCTLSCert y GRPCTLSKey habilitan TLS en el puerto gRPC, y GRPCTLSClientCA exige que el
+	// cliente (Notification) presente un certificado firmado por esa CA. Fuera de desarrollo
+	// hacen falta los tres.
+	GRPCTLSCert     string
+	GRPCTLSKey      string
+	GRPCTLSClientCA string
+
 	// TrustedProxies son los CIDR, separados por comas, cuyo X-Forwarded-For se acepta.
 	TrustedProxies string
 
@@ -134,6 +141,9 @@ func Load() (*Config, error) {
 		HTTPTLSKey:         envStr("HTTP_TLS_KEY", ""),
 		HTTPTLSExternal:    envStr("HTTP_TLS_EXTERNAL", "") == "true",
 		TrustedProxies:     envStr("TRUSTED_PROXIES", ""),
+		GRPCTLSCert:        envStr("GRPC_TLS_CERT", ""),
+		GRPCTLSKey:         envStr("GRPC_TLS_KEY", ""),
+		GRPCTLSClientCA:    envStr("GRPC_TLS_CLIENT_CA", ""),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -148,6 +158,15 @@ func (c *Config) validate() error {
 	}
 	if c.OTEL.Environment != "development" && c.HTTPTLSCert == "" && !c.HTTPTLSExternal {
 		return fmt.Errorf("config: ENVIRONMENT=%s requires HTTP_TLS_CERT or HTTP_TLS_EXTERNAL=true: terminal tokens would travel unencrypted", c.OTEL.Environment)
+	}
+	if (c.GRPCTLSCert == "") != (c.GRPCTLSKey == "") {
+		return fmt.Errorf("config: GRPC_TLS_CERT and GRPC_TLS_KEY must be set together")
+	}
+	if c.GRPCTLSClientCA != "" && c.GRPCTLSCert == "" {
+		return fmt.Errorf("config: GRPC_TLS_CLIENT_CA requires GRPC_TLS_CERT and GRPC_TLS_KEY")
+	}
+	if c.OTEL.Environment != "development" && (c.GRPCTLSCert == "" || c.GRPCTLSClientCA == "") {
+		return fmt.Errorf("config: ENVIRONMENT=%s requires GRPC_TLS_CERT, GRPC_TLS_KEY and GRPC_TLS_CLIENT_CA: gRPC would be unencrypted and accept any client", c.OTEL.Environment)
 	}
 	if _, err := c.TrustedProxyPrefixes(); err != nil {
 		return err

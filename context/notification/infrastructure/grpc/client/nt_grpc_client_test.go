@@ -166,7 +166,7 @@ func TestToProtoResult(t *testing.T) {
 func TestNewTerminalGatewayClient_SuccessAndClose(t *testing.T) {
 	// grpc.NewClient no marca (no dial real) — solo valida y parsea el target,
 	// así que esto debe funcionar sin un servidor gRPC real escuchando.
-	c, err := NewTerminalGatewayClient("localhost:50051")
+	c, err := NewTerminalGatewayClient("localhost:50051", nil)
 	if err != nil {
 		t.Fatalf("NewTerminalGatewayClient() error = %v", err)
 	}

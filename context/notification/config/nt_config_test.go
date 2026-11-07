@@ -147,6 +147,7 @@ func TestValidate(t *testing.T) {
 			c := &Config{
 				Webhook: WebhookConfig{Timeout: tc.webhookTO},
 				Retry:   RetryConfig{BatchSize: tc.batchSize},
+				OTEL:    OTELConfig{Environment: "development"},
 			}
 			err := c.validate()
 			if tc.wantErrSubstr == "" {
@@ -382,5 +383,42 @@ func TestLoad_ReturnsErrorWhenValidateFails(t *testing.T) {
 	_, err := Load()
 	if err == nil || !strings.Contains(err.Error(), "WEBHOOK_TIMEOUT") {
 		t.Fatalf("Load() error = %v, want it to mention WEBHOOK_TIMEOUT", err)
+	}
+}
+
+func TestValidate_GRPCClientTLS(t *testing.T) {
+	full := GRPCClientConfig{TLSCAPath: "ca.pem", TLSCertPath: "c.pem", TLSKeyPath: "k.pem"}
+	tests := []struct {
+		name          string
+		environment   string
+		grpc          GRPCClientConfig
+		wantErrSubstr string
+	}{
+		{"desarrollo sin TLS", "development", GRPCClientConfig{}, ""},
+		{"producción sin TLS", "production", GRPCClientConfig{}, "requires GRPC_CLIENT_TLS_CA"},
+		{"staging sin certificado de cliente", "staging", GRPCClientConfig{TLSCAPath: "ca.pem"}, "requires GRPC_CLIENT_TLS_CA"},
+		{"producción con mTLS", "production", full, ""},
+		{"certificado sin clave", "development", GRPCClientConfig{TLSCAPath: "ca.pem", TLSCertPath: "c.pem"}, "must be set together"},
+		{"certificado sin CA", "development", GRPCClientConfig{TLSCertPath: "c.pem", TLSKeyPath: "k.pem"}, "requires GRPC_CLIENT_TLS_CA"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{
+				Webhook:    WebhookConfig{Timeout: 10 * time.Second},
+				Retry:      RetryConfig{BatchSize: 50},
+				OTEL:       OTELConfig{Environment: tc.environment},
+				GRPCClient: tc.grpc,
+			}
+			err := c.validate()
+			if tc.wantErrSubstr == "" {
+				if err != nil {
+					t.Errorf("validate() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErrSubstr) {
+				t.Errorf("validate() error = %v, want it to contain %q", err, tc.wantErrSubstr)
+			}
+		})
 	}
 }

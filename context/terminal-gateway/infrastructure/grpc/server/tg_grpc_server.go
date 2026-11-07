@@ -49,15 +49,16 @@ func NewTerminalGatewayServer(
 	}
 }
 
-func Start(srv *TerminalGatewayServer, grpcPort int) error {
+// Start sirve en grpcPort. opts agrega, por ejemplo, las credenciales de TLSOption.
+func Start(srv *TerminalGatewayServer, grpcPort int, opts ...grpc.ServerOption) error {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", grpcPort))
 	if err != nil {
 		return fmt.Errorf("grpc server: listen on port %d: %w", grpcPort, err)
 	}
 
-	grpcServer := grpc.NewServer(
+	grpcServer := grpc.NewServer(append([]grpc.ServerOption{
 		grpc.UnaryInterceptor(observability.GRPCUnaryServerInterceptor()),
-	)
+	}, opts...)...)
 	tgv1.RegisterTerminalGatewayServiceServer(grpcServer, srv)
 
 	srv.grpcServer = grpcServer

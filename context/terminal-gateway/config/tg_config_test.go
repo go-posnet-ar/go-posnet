@@ -381,6 +381,10 @@ func TestLoad_HTTPTLS(t *testing.T) {
 			t.Setenv("HTTP_TLS_KEY", tc.key)
 			t.Setenv("HTTP_TLS_EXTERNAL", tc.external)
 			t.Setenv("TRUSTED_PROXIES", tc.cidr)
+			// gRPC con mTLS, para que solo influya lo que se prueba acá.
+			t.Setenv("GRPC_TLS_CERT", "g.pem")
+			t.Setenv("GRPC_TLS_KEY", "g.key")
+			t.Setenv("GRPC_TLS_CLIENT_CA", "ca.pem")
 			cfg, err := Load()
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Load() error = %v, wantErr %v", err, tc.wantErr)
@@ -389,6 +393,37 @@ func TestLoad_HTTPTLS(t *testing.T) {
 				if prefixes, _ := cfg.TrustedProxyPrefixes(); len(prefixes) != 2 {
 					t.Errorf("TrustedProxyPrefixes() = %v, want 2", prefixes)
 				}
+			}
+		})
+	}
+}
+
+func TestLoad_GRPCTLS(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "postgres://x")
+	t.Setenv("NATS_URL", "nats://x")
+	t.Setenv("HTTP_TLS_EXTERNAL", "true")
+
+	cases := []struct {
+		name               string
+		env, cert, key, ca string
+		wantErr            bool
+	}{
+		{name: "desarrollo sin TLS", env: "development"},
+		{name: "producción sin TLS", env: "production", wantErr: true},
+		{name: "producción con TLS pero sin verificar clientes", env: "production", cert: "c", key: "k", wantErr: true},
+		{name: "producción con mTLS", env: "production", cert: "c", key: "k", ca: "ca"},
+		{name: "desarrollo con TLS sin mTLS", env: "development", cert: "c", key: "k"},
+		{name: "certificado sin clave", env: "development", cert: "c", wantErr: true},
+		{name: "CA sin certificado", env: "development", ca: "ca", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ENVIRONMENT", tc.env)
+			t.Setenv("GRPC_TLS_CERT", tc.cert)
+			t.Setenv("GRPC_TLS_KEY", tc.key)
+			t.Setenv("GRPC_TLS_CLIENT_CA", tc.ca)
+			if _, err := Load(); (err != nil) != tc.wantErr {
+				t.Errorf("Load() error = %v, wantErr %v", err, tc.wantErr)
 			}
 		})
 	}

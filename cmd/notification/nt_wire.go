@@ -89,12 +89,21 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	// ── gRPC Client → Terminal Gateway ────────────────────────────────────────
 	// Único cliente gRPC del sistema — Notification llama a Terminal Gateway
 	// para entregar el comprobante al WebSocket del terminal.
-	grpcClient, err := grpcclient.NewTerminalGatewayClient(cfg.GRPCClient.TerminalGatewayAddr)
+	g := cfg.GRPCClient
+	grpcTLS, err := grpcclient.TLSConfig(g.TLSCAPath, g.TLSCertPath, g.TLSKeyPath, g.TLSServerName)
+	if err != nil {
+		return nil, fmt.Errorf("wire: terminal gateway gRPC TLS: %w", err)
+	}
+	if grpcTLS == nil {
+		slog.Warn("the terminal gateway gRPC client has no TLS — receipts travel unencrypted")
+	}
+	grpcClient, err := grpcclient.NewTerminalGatewayClient(g.TerminalGatewayAddr, grpcTLS)
 	if err != nil {
 		return nil, fmt.Errorf("wire: init terminal gateway gRPC client: %w", err)
 	}
 	slog.Info("gRPC client connected",
-		slog.String("target", cfg.GRPCClient.TerminalGatewayAddr),
+		slog.String("target", g.TerminalGatewayAddr),
+		slog.Bool("tls", grpcTLS != nil),
 	)
 
 	// ── Infraestructura ────────────────────────────────────────────────────────

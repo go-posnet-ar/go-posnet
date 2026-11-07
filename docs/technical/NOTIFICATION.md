@@ -190,7 +190,7 @@ más que el intervalo del job, la misma notificación puede enviarse dos veces.
 
 ### 5.3 Comprobante al terminal
 
-1. Llama a `SendReceipt` en Terminal Gateway por gRPC, sin TLS y **sin timeout**.
+1. Llama a `SendReceipt` en Terminal Gateway por gRPC, con [mTLS](#7-grpc) si está configurado y **sin timeout**.
 2. Terminal Gateway verifica que la sesión exista y responde `delivered=true`, sin enviar nada.
 3. La notificación pasa a `SENT`.
 
@@ -324,6 +324,13 @@ Usa `SendReceipt` de Terminal Gateway, definido en
 [`terminal_gateway.proto`](../../pkg/proto/terminalgateway/v1/terminal_gateway.proto). La dirección se
 toma de `TERMINAL_GATEWAY_GRPC_ADDR`. La conexión es perezosa, por lo que el log de arranque
 `gRPC client connected` no confirma que Terminal Gateway esté disponible.
+
+**mTLS:** con `GRPC_CLIENT_TLS_CA`, la conexión usa TLS y verifica el certificado de Terminal Gateway con esa CA. Con
+`GRPC_CLIENT_TLS_CERT` y `GRPC_CLIENT_TLS_KEY`, presenta el certificado de Notification, que Terminal Gateway exige con
+`GRPC_TLS_CLIENT_CA` (ver [Terminal Gateway](TERMINAL-GATEWAY.md#mtls)). Si el certificado del servidor no incluye el host de
+`TERMINAL_GATEWAY_GRPC_ADDR`, se declara el nombre con `GRPC_CLIENT_TLS_SERVER_NAME`. **Fuera de
+`ENVIRONMENT=development`, el servicio no arranca sin los tres primeros.** Si fallan el handshake o la verificación, el envío
+falla y la notificación sigue el camino de reintentos. Docker Compose no usa TLS.
 
 ### Como servidor
 
@@ -470,7 +477,9 @@ reenviaría.
 | `OTEL_SERVICE_VERSION` | `1.0.0` | Sí |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel-collector:4317` | Sí |
 | `ENVIRONMENT` | `development` | Sí |
-| `GRPC_CLIENT_TLS_CERT`, `GRPC_CLIENT_TLS_KEY`, `GRPC_CLIENT_TLS_CA` | Vacías | **No**: el cliente siempre usa conexión insegura |
+| `GRPC_CLIENT_TLS_CA` | Vacía | Sí; CA de Terminal Gateway: habilita [TLS](#7-grpc). Fuera de desarrollo, hace falta junto con las dos siguientes |
+| `GRPC_CLIENT_TLS_CERT`, `GRPC_CLIENT_TLS_KEY` | Vacías | Sí; certificado de Notification para mTLS. Van juntas y requieren `GRPC_CLIENT_TLS_CA`. Si no se pueden cargar, el servicio no arranca |
+| `GRPC_CLIENT_TLS_SERVER_NAME` | Host de `TERMINAL_GATEWAY_GRPC_ADDR` | Sí; nombre con el que se verifica el certificado de Terminal Gateway |
 | `GRPC_PORT` | `9094` | **No**: el puerto está fijo en 9094 |
 | `MIGRATIONS_DIR` | `migrations/notification` | **No**: `Migrate` no hace nada |
 
@@ -545,7 +554,6 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Una sola URL para todos los comercios | **Los datos de cada comercio llegan al mismo destino.** Es un riesgo de exposición si se usa con más de un comercio | `resolveEndpoint` |
 | Webhooks sin firma | El receptor no puede validar el origen ni la integridad | `Dispatch` |
 | API sin autenticación ni auditoría | Con acceso de red, cualquiera puede leer notificaciones y disparar reenvíos, sin dejar registro | `nt_http_handler.go` |
-| gRPC sin TLS | Los comprobantes viajan sin cifrar, y `GRPC_CLIENT_TLS_*` no tienen efecto | `nt_grpc_client.go` |
 
 ### Contenido de las notificaciones
 

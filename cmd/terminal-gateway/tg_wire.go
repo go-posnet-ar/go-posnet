@@ -24,6 +24,7 @@ import (
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 	nats "github.com/nats-io/nats.go"
 	"go.opentelemetry.io/otel/metric"
+	"google.golang.org/grpc"
 )
 
 // app agrupa todos los componentes del servicio y sus recursos abiertos.
@@ -36,6 +37,7 @@ type app struct {
 	httpSrv     *http.Server
 	metrics     *command.Metrics
 	tokens      *httpinfra.TerminalTokens // nil = API abierta, solo en desarrollo
+	grpcOpts    []grpc.ServerOption
 	// wsSrv   *websocket.Server  ← agregar cuando se implemente infrastructure/websocket/
 
 	// wg sincroniza el apagado de los jobs de background (outbox relay,
@@ -179,6 +181,10 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	if err := configureHTTPTLS(httpSrv, cfg, tokens.Configured()); err != nil {
 		return nil, err
 	}
+	grpcOpts, err := grpcTLSOptions(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	// WebSocket Server — conexiones mTLS de los terminales POSNET
 	// TODO: wsSrv := websocket.NewServer(cfg.TLS, sessionHandler, terminalRepo)
@@ -193,6 +199,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		httpSrv:     httpSrv,
 		metrics:     tgMetrics,
 		tokens:      tokens,
+		grpcOpts:    grpcOpts,
 	}, nil
 }
 
@@ -209,7 +216,7 @@ func (a *app) start(ctx context.Context) error {
 
 	// gRPC server
 	go func() {
-		if err := grpcserver.Start(a.grpcSrv, 9091); err != nil {
+		if err := grpcserver.Start(a.grpcSrv, 9091, a.grpcOpts...); err != nil {
 			slog.Error("gRPC server stopped", slog.String("error", err.Error()))
 		}
 	}()
@@ -373,4 +380,23 @@ func configureHTTPTLS(srv *http.Server, cfg *config.Config, withTokens bool) err
 	srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	slog.Info("HTTP API serves HTTPS only")
 	return nil
+}
+
+// grpcTLSOptions habilita mTLS en gRPC: cifra el tráfico y solo acepta a Notification, con un
+// certificado firmado por GRPC_TLS_CLIENT_CA. La configuración ya lo exige fuera de desarrollo.
+func grpcTLSOptions(cfg *config.Config) ([]grpc.ServerOption, error) {
+	opt, err := grpcserver.TLSOption(cfg.GRPCTLSCert, cfg.GRPCTLSKey, cfg.GRPCTLSClientCA)
+	if err != nil {
+		return nil, fmt.Errorf("wire: %w", err)
+	}
+	switch {
+	case opt == nil:
+		slog.Warn("the gRPC server has no TLS — receipts travel unencrypted and any client is accepted")
+		return nil, nil
+	case cfg.GRPCTLSClientCA == "":
+		slog.Warn("the gRPC server has TLS but does not verify clients — any client is accepted")
+	default:
+		slog.Info("the gRPC server requires mTLS")
+	}
+	return []grpc.ServerOption{opt}, nil
 }

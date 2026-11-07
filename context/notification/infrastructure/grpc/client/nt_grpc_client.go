@@ -5,12 +5,14 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 
 	"github.com/juantevez/go-posnet/context/notification/domain/aggregate"
 	"github.com/juantevez/go-posnet/pkg/observability"
 	tgv1 "github.com/juantevez/go-posnet/pkg/proto/terminalgateway/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -22,12 +24,16 @@ type TerminalGatewayClient struct {
 	conn   *grpc.ClientConn
 }
 
-// NewTerminalGatewayClient construye el cliente con el interceptor de trace.
-func NewTerminalGatewayClient(target string) (*TerminalGatewayClient, error) {
+// NewTerminalGatewayClient construye el cliente con el interceptor de trace. Sin tlsCfg, la
+// conexión no usa TLS: la configuración solo lo permite en desarrollo.
+func NewTerminalGatewayClient(target string, tlsCfg *tls.Config) (*TerminalGatewayClient, error) {
+	creds := insecure.NewCredentials()
+	if tlsCfg != nil {
+		creds = credentials.NewTLS(tlsCfg)
+	}
 	conn, err := grpc.NewClient(
 		target,
-		// En producción: grpc.WithTransportCredentials(credentials.NewTLS(tlsCfg))
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(creds),
 		grpc.WithUnaryInterceptor(observability.GRPCUnaryClientInterceptor()),
 	)
 	if err != nil {
