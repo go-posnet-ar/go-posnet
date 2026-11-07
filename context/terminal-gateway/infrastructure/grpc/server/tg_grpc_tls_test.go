@@ -31,6 +31,8 @@ import (
 // por ella, y un cliente de otra CA.
 type testPKI struct {
 	caPath, serverCert, serverKey, clientCert, clientKey, otherClientCert, otherClientKey string
+	// otro servicio, con un certificado válido de la misma CA
+	sameCACert, sameCAKey string
 }
 
 func newTestPKI(t *testing.T) testPKI {
@@ -98,13 +100,14 @@ func newTestPKI(t *testing.T) testPKI {
 	p.serverCert, p.serverKey = issue("terminal-gateway", ca, caKey, x509.ExtKeyUsageServerAuth, true)
 	p.clientCert, p.clientKey = issue("notification", ca, caKey, x509.ExtKeyUsageClientAuth, false)
 	p.otherClientCert, p.otherClientKey = issue("intruder", other, otherKey, x509.ExtKeyUsageClientAuth, false)
+	p.sameCACert, p.sameCAKey = issue("fraud-detection", ca, caKey, x509.ExtKeyUsageClientAuth, false)
 	return p
 }
 
 // startTLSServer arranca el servidor con mTLS y devuelve su dirección.
 func startTLSServer(t *testing.T, p testPKI) string {
 	t.Helper()
-	opt, err := server.TLSOption(p.serverCert, p.serverKey, p.caPath)
+	opt, err := server.TLSOption(p.serverCert, p.serverKey, p.caPath, []string{"notification"})
 	if err != nil {
 		t.Fatalf("TLSOption() error = %v", err)
 	}
@@ -173,9 +176,10 @@ func TestTLSOption_RequiresClientCertificate(t *testing.T) {
 		t.Fatalf("cliente con certificado de la CA: code = %v, want InvalidArgument (handshake aceptado)", code)
 	}
 	rejected := map[string]credentials.TransportCredentials{
-		"sin TLS":                insecure.NewCredentials(),
-		"sin certificado":        clientTLS(t, p, "", ""),
-		"certificado de otra CA": clientTLS(t, p, p.otherClientCert, p.otherClientKey),
+		"sin TLS":                      insecure.NewCredentials(),
+		"sin certificado":              clientTLS(t, p, "", ""),
+		"certificado de otra CA":       clientTLS(t, p, p.otherClientCert, p.otherClientKey),
+		"otro servicio de la misma CA": clientTLS(t, p, p.sameCACert, p.sameCAKey),
 	}
 	for name, creds := range rejected {
 		t.Run(name, func(t *testing.T) {
@@ -188,13 +192,13 @@ func TestTLSOption_RequiresClientCertificate(t *testing.T) {
 
 func TestTLSOption_Errors(t *testing.T) {
 	p := newTestPKI(t)
-	if opt, err := server.TLSOption("", "", ""); opt != nil || err != nil {
+	if opt, err := server.TLSOption("", "", "", nil); opt != nil || err != nil {
 		t.Errorf("TLSOption(sin certificado) = %v, %v, want nil, nil", opt, err)
 	}
-	if _, err := server.TLSOption(p.serverCert, p.caPath, ""); err == nil {
+	if _, err := server.TLSOption(p.serverCert, p.caPath, "", nil); err == nil {
 		t.Error("TLSOption(clave inválida) error = nil")
 	}
-	if _, err := server.TLSOption(p.serverCert, p.serverKey, p.serverKey); err == nil {
+	if _, err := server.TLSOption(p.serverCert, p.serverKey, p.serverKey, nil); err == nil {
 		t.Error("TLSOption(CA sin certificados) error = nil")
 	}
 }

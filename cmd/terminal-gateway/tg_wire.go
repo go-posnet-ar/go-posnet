@@ -383,9 +383,9 @@ func configureHTTPTLS(srv *http.Server, cfg *config.Config, withTokens bool) err
 }
 
 // grpcTLSOptions habilita mTLS en gRPC: cifra el tráfico y solo acepta a Notification, con un
-// certificado firmado por GRPC_TLS_CLIENT_CA. La configuración ya lo exige fuera de desarrollo.
+// certificado firmado por GRPC_TLS_CLIENT_CA y a nombre de GRPC_TLS_CLIENT_NAMES. La configuración ya lo exige fuera de desarrollo.
 func grpcTLSOptions(cfg *config.Config) ([]grpc.ServerOption, error) {
-	opt, err := grpcserver.TLSOption(cfg.GRPCTLSCert, cfg.GRPCTLSKey, cfg.GRPCTLSClientCA)
+	opt, err := grpcserver.TLSOption(cfg.GRPCTLSCert, cfg.GRPCTLSKey, cfg.GRPCTLSClientCA, cfg.GRPCTLSClientNames)
 	if err != nil {
 		return nil, fmt.Errorf("wire: %w", err)
 	}
@@ -396,7 +396,7 @@ func grpcTLSOptions(cfg *config.Config) ([]grpc.ServerOption, error) {
 	case cfg.GRPCTLSClientCA == "":
 		slog.Warn("the gRPC server has TLS but does not verify clients — any client is accepted")
 	default:
-		slog.Info("the gRPC server requires mTLS")
+		slog.Info("the gRPC server requires mTLS", slog.Any("allowed_clients", cfg.GRPCTLSClientNames))
 	}
 	return []grpc.ServerOption{opt}, nil
 }

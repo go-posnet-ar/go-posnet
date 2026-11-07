@@ -75,9 +75,13 @@ El gateway reemplaza `X-Forwarded-For` por la IP de la conexión: un cliente no 
 detrás de un balanceador, hay que declararlo en `GATEWAY_TRUSTED_PROXIES`, y entonces se conserva la cadena que este
 escribió.
 
-Para que el límite de intentos de Terminal Gateway vea la IP del cliente y no la del gateway, Terminal Gateway tiene que
-declarar al gateway en `TRUSTED_PROXIES`. En Docker Compose no está configurado: todos los pedidos le llegan con la IP del
-gateway.
+Para que los límites de intentos de Terminal Gateway y Settlement vean la IP del cliente y no la del gateway, los dos
+declaran al gateway como proxy de confianza: `TRUSTED_PROXIES` y `SETTLEMENT_TRUSTED_PROXIES`. Si no, agruparían a todos los
+clientes bajo la IP del gateway, y 10 tokens inválidos de cualquiera bloquearían a todos durante 5 minutos.
+
+En Docker Compose, el gateway llega a los dos por la red `edge` (`172.30.0.0/24`), con la IP fija `172.30.0.10`, y los dos
+confían solo en esa dirección. Usa los alias `terminal-gateway-edge` y `settlement-edge`, que solo existen en esa red: así la
+conexión siempre sale desde la IP fija. En otro despliegue, hay que declarar la IP o la subred del gateway en esas variables.
 
 ### Límite de pedidos
 
@@ -165,6 +169,5 @@ puerto `8081` por `8000`.
 |---|---|
 | `/pay` y `/status` siguen sin credenciales | El límite por IP frena el abuso, pero cualquiera con un ID de sesión puede pagarla o ver su estado. Requiere un token por sesión en `qr_content`, que cambia Terminal Gateway y `posnet-frontend` |
 | Los servicios siguen publicados en Docker Compose | `8081`, `8084` y los demás puertos siguen abiertos en el host, así que se puede saltear el gateway. En producción, solo el gateway debería ser accesible desde afuera |
-| Terminal Gateway no confía en el gateway | Sin `TRUSTED_PROXIES` en Terminal Gateway, su límite de intentos agrupa a todos los clientes bajo la IP del gateway |
 | Límites por instancia | Con varias instancias, cada una tiene su propio límite. Compartirlos requiere un almacenamiento común, como Redis |
 | Sin WebSocket | Cuando Terminal Gateway tenga su servidor WebSocket, el gateway va a necesitar una ruta que haga el upgrade |

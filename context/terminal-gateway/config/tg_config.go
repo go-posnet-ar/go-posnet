@@ -37,6 +37,8 @@ type Config struct {
 	GRPCTLSCert     string
 	GRPCTLSKey      string
 	GRPCTLSClientCA string
+	// GRPCTLSClientNames son los clientes aceptados, por CN o SAN DNS de su certificado.
+	GRPCTLSClientNames []string
 
 	// TrustedProxies son los CIDR, separados por comas, cuyo X-Forwarded-For se acepta.
 	TrustedProxies string
@@ -144,6 +146,7 @@ func Load() (*Config, error) {
 		GRPCTLSCert:        envStr("GRPC_TLS_CERT", ""),
 		GRPCTLSKey:         envStr("GRPC_TLS_KEY", ""),
 		GRPCTLSClientCA:    envStr("GRPC_TLS_CLIENT_CA", ""),
+		GRPCTLSClientNames: envList("GRPC_TLS_CLIENT_NAMES"),
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -161,6 +164,10 @@ func (c *Config) validate() error {
 	}
 	if (c.GRPCTLSCert == "") != (c.GRPCTLSKey == "") {
 		return fmt.Errorf("config: GRPC_TLS_CERT and GRPC_TLS_KEY must be set together")
+	}
+	if len(c.GRPCTLSClientNames) == 0 {
+		// El único cliente gRPC del sistema.
+		c.GRPCTLSClientNames = []string{"notification"}
 	}
 	if c.GRPCTLSClientCA != "" && c.GRPCTLSCert == "" {
 		return fmt.Errorf("config: GRPC_TLS_CLIENT_CA requires GRPC_TLS_CERT and GRPC_TLS_KEY")

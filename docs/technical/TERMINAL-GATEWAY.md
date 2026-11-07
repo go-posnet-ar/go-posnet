@@ -257,7 +257,8 @@ variable, `X-Forwarded-For` se ignora, porque cualquiera podría declarar otra I
 Con `HTTP_TLS_CERT` y `HTTP_TLS_KEY`, el puerto `HTTP_PORT` sirve solo HTTPS, desde TLS 1.2. Un certificado nuevo requiere
 reiniciar. Si TLS lo termina un proxy, hay que declararlo con `HTTP_TLS_EXTERNAL=true` y limitar el acceso directo al
 puerto. **Fuera de `ENVIRONMENT=development`, el servicio no arranca sin una de las dos opciones**, porque los tokens
-viajarían sin cifrar. Docker Compose no usa TLS.
+viajarían sin cifrar. En desarrollo arranca sin TLS, también con tokens, y lo advierte en el log: es intencional, para
+probar localmente. Docker Compose no usa TLS.
 
 Con HTTPS hay que cambiar también lo que consulta ese puerto:
 
@@ -385,8 +386,10 @@ cliente; el de `infrastructure/grpc/client` no se importa fuera de sus tests.
 ### mTLS
 
 Con `GRPC_TLS_CERT` y `GRPC_TLS_KEY`, el puerto sirve solo TLS, desde 1.2. Con `GRPC_TLS_CLIENT_CA`, además exige que el
-cliente presente un certificado firmado por esa CA: sin él, el handshake falla y la llamada termina en `Unavailable`. **Fuera
-de `ENVIRONMENT=development`, el servicio no arranca sin los tres.** Docker Compose no usa TLS.
+cliente presente un certificado firmado por esa CA y a nombre de `GRPC_TLS_CLIENT_NAMES` (`notification` por defecto), en su
+CN o en un SAN DNS: un certificado válido de la misma CA pero de otro servicio también se rechaza. Sin él, el handshake falla
+y la llamada termina en `Unavailable`. **Fuera de `ENVIRONMENT=development`, el servicio no arranca sin los tres primeros.**
+Docker Compose no usa TLS.
 
 El certificado del servidor tiene que incluir el nombre con el que lo llama Notification (por ejemplo, `terminal-gateway`), o
 Notification tiene que declararlo con `GRPC_CLIENT_TLS_SERVER_NAME`. Del lado de Notification se configuran
@@ -573,6 +576,7 @@ Cada comando y consulta abre un span (`command.ProcessPayment`, `query.GetSessio
 | `TRUSTED_PROXIES` | Vacía | Sí; CIDR separados por comas cuyo `X-Forwarded-For` se acepta para el límite de intentos. Uno inválido impide arrancar |
 | `GRPC_TLS_CERT`, `GRPC_TLS_KEY` | Vacías | Sí; habilitan [TLS en gRPC](#mtls). Van juntas. Si no se pueden cargar, el servicio no arranca |
 | `GRPC_TLS_CLIENT_CA` | Vacía | Sí; CA de los clientes: exige mTLS. Fuera de desarrollo, hace falta junto con las dos anteriores |
+| `GRPC_TLS_CLIENT_NAMES` | `notification` | Sí; clientes aceptados en gRPC, separados por comas, por CN o SAN DNS de su certificado |
 | `CORS_ALLOWED_ORIGINS` | Frontend de pago | Sí; orígenes separados por comas, como `https://pagos.example.com`. `*` permite cualquiera |
 | `GRPC_PORT` | `9091` | **No**: el puerto está fijo en 9091 |
 | `WS_PORT` | `8082` | **No**: no hay servidor WebSocket |
@@ -637,10 +641,8 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| `/pay` y `/status` son públicos | Cualquiera con un ID de sesión puede pagarla o ver su estado. Requiere un token por sesión en `qr_content`, que cambia `posnet-frontend` | `tg_qr_handler.go` |
-| En desarrollo, los tokens pueden viajar sin TLS | Con `ENVIRONMENT=development` y un archivo de tokens, el servicio arranca sin TLS y lo advierte en el log | `tg_wire.go` |
-| El límite de intentos es por instancia | Con varias instancias detrás de un balanceador, un atacante tiene 10 intentos por minuto en cada una | `tg_http_auth.go` |
-| gRPC acepta cualquier certificado de la CA | No se verifica que el cliente sea Notification: otro servicio con un certificado de la misma CA también entra. Conviene una CA solo para este canal | `tg_grpc_tls.go` |
+| `/pay` y `/status` son públicos | Cualquiera con un ID de sesión puede pagarla o ver su estado. El [API Gateway](GATEWAY.md#límite-de-pedidos) limita los pedidos por IP, pero no lo impide: hace falta un token por sesión en `qr_content`, que cambia `posnet-frontend` | `tg_qr_handler.go` |
+| El límite de intentos es por instancia | Con varias instancias detrás de un balanceador, un atacante tiene 10 intentos por minuto en cada una. Compartirlo requiere un almacenamiento común, como Redis | `tg_http_auth.go` |
 
 ### Pagos y consistencia
 

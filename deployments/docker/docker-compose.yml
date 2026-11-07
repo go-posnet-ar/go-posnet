@@ -5,6 +5,15 @@ name: posnet
 networks:
   posnet:
     driver: bridge
+  # Entre el gateway y los servicios que publica. La subred es fija para que el gateway tenga una
+  # IP conocida: Terminal Gateway y Settlement solo aceptan su X-Forwarded-For. Si no, sus límites
+  # de intentos verían a todos los clientes con la IP del gateway, y 10 tokens inválidos de
+  # cualquiera bloquearían a todos.
+  edge:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
 
 volumes:
   postgres_data:
@@ -172,14 +181,18 @@ services:
       network: host
     container_name: posnet-gateway
     restart: unless-stopped
-    networks: [posnet]
+    networks:
+      posnet: {}
+      edge:
+        ipv4_address: 172.30.0.10
     ports:
       - "8000:8000"
     environment:
       GATEWAY_PORT: "8000"
       GATEWAY_ADMIN_PORT: "8001"
-      TERMINAL_GATEWAY_URL: http://terminal-gateway:8081
-      SETTLEMENT_URL: http://settlement:8084
+      # Por la red edge, para que los servicios vean la IP fija del gateway.
+      TERMINAL_GATEWAY_URL: http://terminal-gateway-edge:8081
+      SETTLEMENT_URL: http://settlement-edge:8084
       GATEWAY_CORS_ALLOWED_ORIGINS: "http://localhost:5173,http://192.168.0.2:5173"
       ENVIRONMENT: development
       OTEL_SERVICE_NAME: posnet-gateway
@@ -203,7 +216,11 @@ services:
       network: host
     container_name: posnet-terminal-gateway
     restart: unless-stopped
-    networks: [posnet]
+    networks:
+      posnet: {}
+      edge:
+        ipv4_address: 172.30.0.11
+        aliases: [terminal-gateway-edge]
     ports:
       - "8081:8081"
       - "8082:8082"
@@ -215,6 +232,7 @@ services:
       GRPC_PORT: "9091"
       OTEL_SERVICE_NAME: posnet-terminal-gateway
       POSNET_HOST: "192.168.0.2"
+      TRUSTED_PROXIES: "172.30.0.10/32" # el gateway, en la red edge
     depends_on:
       postgres:
         condition: service_healthy
@@ -262,7 +280,11 @@ services:
       network: host
     container_name: posnet-settlement
     restart: unless-stopped
-    networks: [posnet]
+    networks:
+      posnet: {}
+      edge:
+        ipv4_address: 172.30.0.12
+        aliases: [settlement-edge]
     ports:
       - "8084:8084"
       - "9093:9093"
@@ -271,6 +293,7 @@ services:
       HTTP_PORT: "8084"
       GRPC_PORT: "9093"
       OTEL_SERVICE_NAME: posnet-settlement
+      SETTLEMENT_TRUSTED_PROXIES: "172.30.0.10/32" # el gateway, en la red edge
       SETTLEMENT_PROCESSOR: mock # Sin envío real, como acquirer-mock. El default del código es "none".
       SETTLEMENT_BATCH_CLOSE_HOUR: "3" # 03:00 UTC = 00:00 en Argentina.
     depends_on:

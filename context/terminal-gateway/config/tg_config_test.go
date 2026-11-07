@@ -428,3 +428,25 @@ func TestLoad_GRPCTLS(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_GRPCTLSClientNames(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "postgres://x")
+	t.Setenv("NATS_URL", "nats://x")
+
+	t.Setenv("GRPC_TLS_CLIENT_NAMES", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.GRPCTLSClientNames; len(got) != 1 || got[0] != "notification" {
+		t.Errorf("GRPCTLSClientNames = %v, want [notification] por defecto", got)
+	}
+
+	t.Setenv("GRPC_TLS_CLIENT_NAMES", "notification, notification-2")
+	if cfg, err = Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.GRPCTLSClientNames; len(got) != 2 || got[1] != "notification-2" {
+		t.Errorf("GRPCTLSClientNames = %v", got)
+	}
+}
