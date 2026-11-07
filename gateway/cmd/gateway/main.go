@@ -155,6 +155,11 @@ func newHandler(cfg *config.Config) (http.Handler, error) {
 	} else {
 		slog.Warn("SETTLEMENT_URL is empty — settlement routes are not published")
 	}
+	if cfg.TerminalGatewayWSURL != "" {
+		if routes.TerminalGatewayWS, err = proxy.NewUpstream("terminal-gateway-ws", cfg.TerminalGatewayWSURL, transport, clientIP); err != nil {
+			return nil, err
+		}
+	}
 
 	var h http.Handler = proxy.NewRouter(routes)
 	h = middleware.MaxBody(cfg.MaxBodyBytes, h)

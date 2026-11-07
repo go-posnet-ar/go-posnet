@@ -13,6 +13,8 @@ type Routes struct {
 	TerminalGateway http.Handler
 	// Settlement es opcional: nil, sus rutas no se publican.
 	Settlement http.Handler
+	// TerminalGatewayWS es el WebSocket de los terminales. Opcional: nil, /ws no se publica.
+	TerminalGatewayWS http.Handler
 
 	// Límites de las rutas públicas, que usa el teléfono del cliente sin credenciales.
 	PayLimit    *middleware.RateLimiter
@@ -40,6 +42,10 @@ func NewRouter(r Routes) http.Handler {
 	handle("POST /sessions/{id}/cancel", validUUID("id", tg))
 	handle("POST /sessions/{id}/reversal", validUUID("id", tg))
 	handle("POST /batch-close", tg)
+	// WebSocket de los terminales: se autentican con su primer mensaje.
+	if ws := r.TerminalGatewayWS; ws != nil {
+		handle("GET /ws", ws)
+	}
 
 	// De operación: Settlement exige su token de administración.
 	if st := r.Settlement; st != nil {

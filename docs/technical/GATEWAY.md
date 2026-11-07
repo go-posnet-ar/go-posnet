@@ -55,6 +55,7 @@ El path no cambia: para pasar por el gateway, un cliente solo cambia el host y e
 | `GET /sessions/{id}` | Terminal Gateway | Token de terminal |
 | `POST /sessions/{id}/cancel`, `POST /sessions/{id}/reversal` | Terminal Gateway | Token de terminal |
 | `POST /batch-close` | Terminal Gateway | Token de terminal |
+| `GET /ws` | Terminal Gateway (WebSocket, `TERMINAL_GATEWAY_WS_URL`) | Token de terminal, en el primer mensaje |
 | `GET /batches/{id}`, `POST /batches/{id}/{force-close,reopen,resolve-dispute,resubmit,settle}` | Settlement | Token de administración |
 | `GET /merchants/{merchant_id}/batches`, `GET` y `PUT /merchants/{merchant_id}/timezone` | Settlement | Token de administración |
 | `GET /reversal-reviews`, `POST /reversal-reviews/{transaction_id}/resolve` | Settlement | Token de administración |
@@ -62,7 +63,9 @@ El path no cambia: para pasar por el gateway, un cliente solo cambia el host y e
 
 - **Un ID que no es UUID** responde `400 INVALID_ID` sin llegar al servicio.
 - **Cualquier otra ruta o método** responde `404 NOT_FOUND`.
-- **Sin `SETTLEMENT_URL`**, sus rutas no se publican.
+- **Sin `SETTLEMENT_URL`**, sus rutas no se publican. **Sin `TERMINAL_GATEWAY_WS_URL`**, tampoco `/ws`.
+- **`/ws`** pasa la conexión a WebSocket sin intervenir: el terminal se autentica con Terminal Gateway. Los timeouts del
+  servidor no la cortan, porque `net/http` limpia sus plazos cuando el proxy la toma.
 
 Una ruta nueva de un servicio no queda expuesta hasta agregarla en
 [`router.go`](../../gateway/internal/proxy/router.go).
@@ -141,6 +144,7 @@ Cada pedido abre un span y propaga el trace context a los servicios.
 | `GATEWAY_ADMIN_PORT` | `8001` | `/healthz`, `/readyz` y `/metrics`. Tiene que ser distinto del público |
 | `TERMINAL_GATEWAY_URL` | `http://localhost:8081` | Obligatoria. Sin path |
 | `SETTLEMENT_URL` | `http://localhost:8084` | Definida y vacía, no se publican sus rutas |
+| `TERMINAL_GATEWAY_WS_URL` | `http://localhost:8082` | WebSocket de los terminales. Definida y vacía, no se publica `/ws` |
 | `GATEWAY_UPSTREAM_CA` | Vacía | CA para servicios con HTTPS y certificado propio |
 | `GATEWAY_CORS_ALLOWED_ORIGINS` | `http://localhost:5173` | Separados por comas. `*` solo en desarrollo |
 | `GATEWAY_TLS_CERT`, `GATEWAY_TLS_KEY` | Vacías | HTTPS en el puerto público. Van juntas |
@@ -173,4 +177,3 @@ puerto `8081` por `8000`.
 |---|---|
 | Los servicios siguen publicados en Docker Compose | `8081`, `8084` y los demás puertos siguen abiertos en el host, así que se puede saltear el gateway. En producción, solo el gateway debería ser accesible desde afuera |
 | Límites por instancia | Con varias instancias, cada una tiene su propio límite. Compartirlos requiere un almacenamiento común, como Redis |
-| Sin WebSocket | Cuando Terminal Gateway tenga su servidor WebSocket, el gateway va a necesitar una ruta que haga el upgrade |

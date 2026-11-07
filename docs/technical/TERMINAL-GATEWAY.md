@@ -9,9 +9,9 @@
 Terminal Gateway (TG) es el borde del sistema: administra la sesión de pago, inicia la Saga de
 autorización y recibe su resultado.
 
-El diseño prevé conexiones WebSocket/mTLS con terminales físicos y mensajes ISO 8583. **Esa parte
-todavía no existe**: hoy el flujo funciona por HTTP, con un simulador QR. El resto de la cadena
-(persistencia, outbox, NATS, consumo de resultados) sí está implementado.
+Los terminales reciben el resultado de sus ventas por un [WebSocket](#7b-websocket-de-terminales), con mensajes JSON. El
+diseño original prevé además terminales físicos con mTLS y mensajes ISO 8583: **esa parte todavía no existe**. Hoy el
+único terminal es el cajero de `posnet-front`, que usa HTTP para operar y el WebSocket para enterarse del resultado.
 
 | Capacidad | Estado | Detalle |
 |---|---|---|
@@ -21,19 +21,20 @@ todavía no existe**: hoy el flujo funciona por HTTP, con un simulador QR. El re
 | Consumo de resultados de autorización | Implementado | `posnet.auth.>` |
 | Reversa y cierre de lote | Implementado | Publicación directa a NATS, sin outbox |
 | Métricas, trazas y health checks | Implementado | Ver [§11](#11-observabilidad) |
-| Servidor WebSocket/mTLS | **Pendiente** | Se configura `WS_PORT`, pero nada escucha |
-| Notificaciones al terminal | **Mock** | `MockNotifier` solo escribe en el log |
+| WebSocket de terminales | Implementado | `WS_PORT` (8082), mensajes JSON y token en el primer mensaje. Ver [§7b](#7b-websocket-de-terminales) |
+| Notificaciones al terminal | Implementado | Sesión creada, resultado, vencimiento y comprobante, por el WebSocket |
+| Terminales físicos con mTLS | **Pendiente** | El WebSocket autentica con el token del terminal |
 | Parsing de ISO 8583 | **Pendiente** | El flujo QR envía `iso8583_raw` vacío |
-| Entrega de comprobantes (`SendReceipt`) | **Parcial** | Responde `delivered=true` sin entregar nada |
-| Expiración con estado `EXPIRED` | Implementado | Ver [§5.6](#56-expiración). El aviso al terminal pasa por `MockNotifier` |
+| Entrega de comprobantes (`SendReceipt`) | Implementado | Por el WebSocket. Sin conexión, responde `delivered=false` |
+| Expiración con estado `EXPIRED` | Implementado | Ver [§5.6](#56-expiración) |
 
 Las consecuencias de estos pendientes están en [§13](#13-brechas-conocidas).
 
 ## 2. Contexto y límites
 
 ```
- Frontend QR (cajero / celular)            Terminal físico (futuro: WebSocket/mTLS)
-              │ HTTP :8081                            ┆ no implementado
+ Frontend QR (cajero / celular)            Terminal físico (futuro: mTLS e ISO 8583)
+              │ HTTP :8081, WebSocket :8082            ┆ no implementado
               ▼                                       ┆
  ┌────────────────────────────────────────────────────┴──┐
  │                   Terminal Gateway                    │◄── gRPC :9091 ── Notification
@@ -69,7 +70,7 @@ El contexto sigue arquitectura hexagonal con CQRS liviano:
 | [`infrastructure/grpc/server/`](../../context/terminal-gateway/infrastructure/grpc/server/) | Servidor gRPC |
 | [`infrastructure/nats/`](../../context/terminal-gateway/infrastructure/nats/) | Publisher y subscriber |
 | [`infrastructure/postgres/`](../../context/terminal-gateway/infrastructure/postgres/) | Repositorios de sesiones y terminales |
-| [`infrastructure/websocket/`](../../context/terminal-gateway/infrastructure/websocket/) | Solo `MockNotifier` |
+| [`infrastructure/websocket/`](../../context/terminal-gateway/infrastructure/websocket/) | Servidor WebSocket y registro de conexiones (`Hub`). `MockNotifier` queda para pruebas |
 
 Las rutas de `domain/`, `application/` e `infrastructure/` son relativas a `context/terminal-gateway/`.
 
@@ -172,8 +173,8 @@ notificar. Los códigos que exigen retención son `04`, `41`, `43` y `CARD_BLOCK
 
 No se guarda en una columna propia: `RequiresCardCapture()` lo deriva del `rejection_code`. Las respuestas de
 `GET /api/sessions/{id}/status` y `GET /sessions/{id}` lo incluyen en `capture_card` (`CaptureCard`), y el cajero de
-`posnet-front` muestra **RETENER TARJETA**. Al terminal físico todavía no llega, porque no hay WebSocket (ver
-[§13](#13-brechas-conocidas)).
+`posnet-front` muestra **RETENER TARJETA**. También viaja en el mensaje `session.result` del
+[WebSocket](#7b-websocket-de-terminales).
 
 ### 5.3 Cancelación
 
@@ -196,8 +197,8 @@ la conciliación. TG no persiste nada en este flujo. `currency` es obligatorio y
 ### 5.6 Expiración
 
 Cada `SESSION_CLEANUP_EVERY` (1 minuto), el job pasa a `EXPIRED` las sesiones vencidas en `AWAITING_PAYMENT`, con un solo
-`UPDATE` que también fija `closed_at`, y le avisa a cada terminal con `NotifySessionExpired`. Hoy ese aviso solo queda en el
-log, porque el notifier es `MockNotifier`. Si falla, el estado ya quedó guardado y el terminal lo ve al consultar.
+`UPDATE` que también fija `closed_at`, y le avisa a cada terminal con el mensaje `session.expired` del WebSocket. Si el
+terminal no está conectado, el estado ya quedó guardado y lo ve al consultar.
 
 **Una sesión en `PROCESSING` no vence:** el pago ya salió, y su resultado llega de Authorization aunque haya pasado el TTL.
 Antes se borraba, y una aprobación tardía no encontraba la sesión.
@@ -449,8 +450,48 @@ openssl x509 -req -in nt.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 365 
 
 | RPC | Comportamiento actual |
 |---|---|
-| `SendReceipt` | Valida el request y que la sesión exista. Responde `delivered=true` sin enviar nada, o `delivered=false` con `SESSION_NOT_FOUND` |
-| `GetTerminalStatus` | Responde `CONNECTED` si el terminal tiene una sesión activa y `DISCONNECTED` si no. No refleja una conexión real; `connected_since` es la creación de la sesión |
+| `SendReceipt` | Valida el request, busca la sesión y envía el comprobante por el WebSocket al **terminal de la sesión**, no al que declara el pedido. Responde `delivered=false` con `SESSION_NOT_FOUND` o, si el terminal no está conectado, `TERMINAL_NOT_CONNECTED` |
+| `GetTerminalStatus` | `CONNECTED` si el terminal tiene el WebSocket abierto, con `connected_since` de la conexión más antigua, y `DISCONNECTED` si no. El comercio sale de su sesión activa, si tiene una |
+
+`delivered=true` significa que el comprobante quedó en la cola de la conexión: si el terminal se desconecta justo después,
+puede no recibirlo.
+
+## 7b. WebSocket de terminales
+
+Terminal Gateway escucha en `WS_PORT` (8082), en `GET /ws`, con el mismo TLS que la API HTTP. Desde afuera se llega por el
+[API Gateway](GATEWAY.md), en `ws://<host>:8000/ws`. Un navegador solo se conecta desde los orígenes de
+`CORS_ALLOWED_ORIGINS`; desde otro, el handshake responde `403`.
+
+**Autenticación.** El primer mensaje del terminal, dentro de 10 s, tiene que ser:
+
+| Modo | Mensaje |
+|---|---|
+| Con `TERMINAL_TOKENS_FILE` | `{"type":"auth","token":"<token del terminal>"}` |
+| Sin tokens, solo en desarrollo | `{"type":"auth","terminal_id":"<UUID>"}` |
+
+Se usa el primer mensaje y no un encabezado porque un navegador no puede enviar `Authorization` al abrir un WebSocket. El
+token pasa por el mismo límite de intentos que la API HTTP. Si es válido, el servidor responde
+`{"type":"auth.ok","terminal_id":"..."}`; si no, `{"type":"error","code":"..."}` y cierra con el código 1008:
+
+| `code` | Cuándo |
+|---|---|
+| `AUTH_REQUIRED` | El primer mensaje no es `auth` |
+| `UNAUTHORIZED` | Token ausente o inválido |
+| `TOO_MANY_ATTEMPTS` | Se superó el límite de intentos de esa IP |
+| `INVALID_TERMINAL_ID` | Sin tokens, `terminal_id` no es un UUID |
+
+**Mensajes del servidor.** Después de autenticarse, el terminal solo recibe:
+
+| `type` | Cuándo | Campos |
+|---|---|---|
+| `session.created` | Se creó una sesión del terminal | `transaction_id`, `amount_cents`, `currency`, `channel`, `expires_at` |
+| `session.result` | La sesión terminó aprobada o rechazada | `transaction_id`, `state`, `auth_code`, `rejection_code`, `rejection_reason`, `capture_card` |
+| `session.expired` | La sesión venció sin pagarse | `transaction_id` |
+| `receipt` | Notification envió el comprobante | Los del comprobante: `transaction_id`, `result`, `amount_cents`, `currency`, `auth_code`, etc. |
+
+**Conexión.** Un terminal puede tener varias conexiones, por ejemplo dos pestañas del cajero: todas reciben lo mismo. El
+servidor envía un ping cada 30 s y desconecta al terminal que no responde, o al que no lee sus mensajes y llena su cola (32).
+Al apagar, cierra todas las conexiones con el código 1001.
 
 Errores: `InvalidArgument` por datos inválidos e `Internal` por fallos de base de datos.
 
@@ -619,7 +660,7 @@ Cada comando y consulta abre un span (`command.ProcessPayment`, `query.GetSessio
 | `PAY_TOKEN_REQUIRED` | `true`, salvo en desarrollo | Sí; `/pay` y `/status` exigen el token. Un valor distinto de `true` o `false` impide arrancar |
 | `CORS_ALLOWED_ORIGINS` | Frontend de pago | Sí; orígenes separados por comas, como `https://pagos.example.com`. `*` permite cualquiera |
 | `GRPC_PORT` | `9091` | **No**: el puerto está fijo en 9091 |
-| `WS_PORT` | `8082` | **No**: no hay servidor WebSocket |
+| `WS_PORT` | `8082` | Sí; puerto del [WebSocket de terminales](#7b-websocket-de-terminales) |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_CA_PATH` | Vacías | **No**: nada usa esta configuración |
 | `SESSION_TTL_SECONDS` | `300` | **No**: el TTL está fijo en 5 minutos |
 | `SESSION_CLEANUP_EVERY` | `1m` | Sí; cada cuánto vencen las sesiones sin pagar. Si no es positivo, el servicio no arranca |
@@ -634,7 +675,7 @@ docker compose -f deployments/docker/docker-compose.yml up -d --build terminal-g
 ```
 
 `docker-compose.yml` fija los puertos del servicio, por encima de los genéricos de `.env.docker`.
-También publica el 8082, aunque nada escuche en él. Sin Docker, con Postgres y NATS disponibles:
+También publica el 8082, el del WebSocket. Sin Docker, con Postgres y NATS disponibles:
 
 ```bash
 POSTGRES_DSN='postgres://...' NATS_URL='nats://localhost:4222' go run ./cmd/terminal-gateway
@@ -696,9 +737,8 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| `MockNotifier` en lugar de WebSocket | Ningún terminal recibe el resultado | `tg_wire.go` |
-| `SendReceipt` responde `delivered=true` sin entregar | Notification puede registrar como entregado un comprobante que no se envió | `tg_grpc_server.go` |
-| `GetTerminalStatus` no mide la conexión | Un terminal conectado sin sesión figura como `DISCONNECTED` | `tg_grpc_server.go` |
+| Las conexiones WebSocket son por instancia | Con varias instancias, el resultado lo procesa la que consume el evento de NATS, que puede no ser la que tiene la conexión del terminal: el aviso no llega, y el terminal se entera al consultar. Hace falta repartir los avisos entre instancias | `hub.go` |
+| Sin terminales físicos con mTLS | El WebSocket autentica con el token del terminal. `certificate_cn` y `TLS_*_PATH` siguen sin uso | `server.go` |
 | Sin parsing de ISO 8583 | `iso8583_raw` y `emv_data_b64` viajan vacíos | `tg_qr_handler.go` |
 
 ### Operación

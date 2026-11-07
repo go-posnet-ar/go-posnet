@@ -71,6 +71,10 @@ type responseWriter struct {
 	statusCode int
 }
 
+// Unwrap deja que http.ResponseController llegue al ResponseWriter original: lo necesita un
+// proxy para pasar una conexión a WebSocket o limpiar sus deadlines.
+func (rw *responseWriter) Unwrap() http.ResponseWriter { return rw.ResponseWriter }
+
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)

@@ -14,8 +14,8 @@ en `DEAD` lo que no pudo entregar. No toma decisiones de negocio.
 El mecanismo de reintentos funciona, pero **que una notificación figure como `SENT` no garantiza que
 haya llegado**, y tres fallas afectan a la operación:
 
-- **Los comprobantes al terminal se marcan como `SENT` sin entregarse**, porque Terminal Gateway responde
-  `delivered=true` sin enviar nada.
+- **Un comprobante al terminal solo se entrega si el terminal tiene abierto el WebSocket de Terminal Gateway.** Si no,
+  pasa por los reintentos hasta llegar a `DEAD`.
 - **Todos los webhooks van a una misma URL**, sea cual sea el comercio.
 - **`force-retry` no recupera las notificaciones `DEAD`:** vuelve a enviar, pero el estado no cambia.
 
@@ -119,7 +119,7 @@ llega a guardarse: tras un fallo, la notificación se guarda en `RETRYING` o `DE
 | Canal | `SENT` significa |
 |---|---|
 | `WEBHOOK` | El endpoint respondió con un `2xx` |
-| `TERMINAL_WEBSOCKET` | Terminal Gateway encontró la sesión; **el terminal no recibió nada** |
+| `TERMINAL_WEBSOCKET` | Terminal Gateway lo puso en la cola de la conexión WebSocket del terminal |
 
 ### 4.3 Política de reintentos
 
@@ -191,12 +191,12 @@ más que el intervalo del job, la misma notificación puede enviarse dos veces.
 ### 5.3 Comprobante al terminal
 
 1. Llama a `SendReceipt` en Terminal Gateway por gRPC, con [mTLS](#7-grpc) si está configurado y **sin timeout**.
-2. Terminal Gateway verifica que la sesión exista y responde `delivered=true`, sin enviar nada.
-3. La notificación pasa a `SENT`.
+2. Terminal Gateway busca la sesión y envía el comprobante por el WebSocket al terminal de la sesión.
+3. Si lo pudo enviar, responde `delivered=true` y la notificación pasa a `SENT`.
 
-Si la sesión ya no existe, responde `SESSION_NOT_FOUND`: se registra como `terminal not connected`, y
-la notificación pasa por los reintentos hasta llegar a `DEAD`. Es lo que ocurre con una aprobación
-tardía cuya sesión borró el job de limpieza de Terminal Gateway.
+Si la sesión no existe (`SESSION_NOT_FOUND`) o el terminal no tiene el WebSocket abierto (`TERMINAL_NOT_CONNECTED`), se
+registra como `terminal not connected`, y la notificación pasa por los reintentos hasta llegar a `DEAD`. Con el cajero de
+`posnet-front` cerrado, eso le pasa a cada venta.
 
 El cliente tampoco envía `transaction_at`, aunque el contrato lo prevé.
 
@@ -538,7 +538,7 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| Los comprobantes al terminal figuran `SENT` sin entregarse | El historial y las métricas indican éxito, aunque ningún terminal reciba nada | `tg_grpc_server.go`, `dispatch` |
+| Un terminal desconectado lleva sus comprobantes a `DEAD` | Si el terminal no tiene el WebSocket abierto durante los reintentos, el comprobante no se entrega nunca: no se guarda para cuando vuelva a conectarse | `dispatch` |
 | Las notificaciones en `PENDING` nunca se reintentan | Una caída durante el envío o un fallo al guardar las deja perdidas, sin error visible | `FindPendingRetries`, `dispatch` |
 | `force-retry` no saca de `DEAD` | Responde `202` y puede entregar, pero el estado no cambia y sigue en la lista | `ForceRetry`, `CanTransitionTo` |
 | `force-retry` acepta cualquier estado | Puede reenviar comprobantes ya entregados | `ForceRetry` |

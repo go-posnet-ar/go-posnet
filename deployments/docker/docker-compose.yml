@@ -193,6 +193,7 @@ services:
       # Por la red edge, para que los servicios vean la IP fija del gateway.
       TERMINAL_GATEWAY_URL: http://terminal-gateway-edge:8081
       SETTLEMENT_URL: http://settlement-edge:8084
+      TERMINAL_GATEWAY_WS_URL: http://terminal-gateway-edge:8082
       GATEWAY_CORS_ALLOWED_ORIGINS: "http://localhost:5173,http://192.168.0.2:5173"
       # posnet-front (nginx), con IP fija en la red edge: así el límite por IP de /pay y /status ve
       # a cada teléfono y no a nginx. Ver el README de posnet-front.

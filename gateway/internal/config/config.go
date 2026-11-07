@@ -21,6 +21,8 @@ type Config struct {
 	// TerminalGatewayURL es obligatoria. SettlementURL es opcional: vacía, sus rutas no se publican.
 	TerminalGatewayURL string
 	SettlementURL      string
+	// TerminalGatewayWSURL es el WebSocket de los terminales. Vacía, /ws no se publica.
+	TerminalGatewayWSURL string
 	// UpstreamCA verifica a los servicios que usan HTTPS con un certificado propio.
 	UpstreamCA string
 
@@ -56,8 +58,9 @@ func Load() (*Config, error) {
 
 		TerminalGatewayURL: envStr("TERMINAL_GATEWAY_URL", "http://localhost:8081"),
 		// Definida y vacía, desactiva sus rutas.
-		SettlementURL: envOptional("SETTLEMENT_URL", "http://localhost:8084"),
-		UpstreamCA:    envStr("GATEWAY_UPSTREAM_CA", ""),
+		SettlementURL:        envOptional("SETTLEMENT_URL", "http://localhost:8084"),
+		TerminalGatewayWSURL: envOptional("TERMINAL_GATEWAY_WS_URL", "http://localhost:8082"),
+		UpstreamCA:           envStr("GATEWAY_UPSTREAM_CA", ""),
 
 		CORSAllowedOrigins: envList("GATEWAY_CORS_ALLOWED_ORIGINS", "http://localhost:5173"),
 
@@ -90,6 +93,11 @@ func (c *Config) validate() error {
 	if c.SettlementURL != "" {
 		if err := validateUpstream(c.SettlementURL); err != nil {
 			errs = append(errs, fmt.Errorf("SETTLEMENT_URL=%q: %w", c.SettlementURL, err))
+		}
+	}
+	if c.TerminalGatewayWSURL != "" {
+		if err := validateUpstream(c.TerminalGatewayWSURL); err != nil {
+			errs = append(errs, fmt.Errorf("TERMINAL_GATEWAY_WS_URL=%q: %w", c.TerminalGatewayWSURL, err))
 		}
 	}
 	if c.Port == c.AdminPort {

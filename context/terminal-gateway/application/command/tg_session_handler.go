@@ -3,6 +3,7 @@ package command
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -128,11 +129,9 @@ func (h *SessionHandler) CreateSession(ctx context.Context, cmd port.CreateSessi
 
 	// Notificar al terminal (QR en pantalla o NFC activo)
 	if err := h.notifier.NotifySessionCreated(ctx, session); err != nil {
-		log.Error("failed to notify terminal of session creation",
-			slog.String("transaction_id", session.ID().String()),
-			slog.String("error", err.Error()),
-		)
-		// No es fatal — el terminal puede reintentar vía reconexión WebSocket
+		// No es fatal: el terminal ve la sesión en la respuesta de create.
+		logNotifyError(ctx, "failed to notify terminal of session creation", err,
+			slog.String("transaction_id", session.ID().String()))
 	}
 
 	log.Info("payment session created",
@@ -148,6 +147,17 @@ func (h *SessionHandler) CreateSession(ctx context.Context, cmd port.CreateSessi
 		Channel:       session.Channel().String(),
 		Amount:        session.Amount(),
 	}, nil
+}
+
+// logNotifyError registra un aviso al terminal que no se pudo enviar. Que el terminal no esté
+// conectado es esperable, porque el cajero también consulta el estado: queda en INFO.
+func logNotifyError(ctx context.Context, msg string, err error, attrs ...any) {
+	log := observability.FromContext(ctx).With(attrs...)
+	if errors.Is(err, service.ErrTerminalNotConnected) {
+		log.Info(msg + " — terminal not connected")
+		return
+	}
+	log.Error(msg, slog.String("error", err.Error()))
 }
 
 // expireBatch limita cuántas sesiones vence cada consulta.
@@ -169,10 +179,9 @@ func (h *SessionHandler) ExpireSessions(ctx context.Context) (int, error) {
 		for _, s := range expired {
 			// El estado ya quedó guardado: si el aviso falla, el terminal lo ve al consultar.
 			if err := h.notifier.NotifySessionExpired(ctx, s.TerminalID, s.TransactionID); err != nil {
-				observability.FromContext(ctx).Warn("failed to notify terminal of session expiry",
+				logNotifyError(ctx, "failed to notify terminal of session expiry", err,
 					slog.String("transaction_id", s.TransactionID.String()),
-					slog.String("terminal_id", s.TerminalID.String()),
-					slog.String("error", err.Error()))
+					slog.String("terminal_id", s.TerminalID.String()))
 			}
 		}
 		total += len(expired)
@@ -274,10 +283,8 @@ func (h *SessionHandler) ApplyApproval(ctx context.Context, cmd port.ApplyApprov
 	if processed {
 		h.metrics.RecordApproved(ctx, session.CreatedAt())
 		if err := h.notifier.NotifyResult(ctx, session); err != nil {
-			observability.FromContext(ctx).Error("failed to notify terminal of approval",
-				slog.String("transaction_id", cmd.TransactionID),
-				slog.String("error", err.Error()),
-			)
+			logNotifyError(ctx, "failed to notify terminal of approval", err,
+				slog.String("transaction_id", cmd.TransactionID))
 		}
 	}
 
@@ -333,11 +340,9 @@ func (h *SessionHandler) ApplyRejection(ctx context.Context, cmd port.ApplyRejec
 			)
 		}
 		if err := h.notifier.NotifyResult(ctx, session); err != nil {
-			observability.FromContext(ctx).Error("failed to notify terminal of rejection",
+			logNotifyError(ctx, "failed to notify terminal of rejection", err,
 				slog.String("transaction_id", cmd.TransactionID),
-				slog.Bool("capture_card", cmd.CaptureCard),
-				slog.String("error", err.Error()),
-			)
+				slog.Bool("capture_card", cmd.CaptureCard))
 		}
 	}
 

@@ -40,9 +40,11 @@ type app struct {
 
 	sessionHandler *command.SessionHandler
 	cleanupEvery   time.Duration
-	tokens         *httpinfra.TerminalTokens // nil = API abierta, solo en desarrollo
-	grpcOpts       []grpc.ServerOption
-	// wsSrv   *websocket.Server  ← agregar cuando se implemente infrastructure/websocket/
+
+	ws       *wsinfra.Server
+	wsSrv    *http.Server
+	tokens   *httpinfra.TerminalTokens // nil = API abierta, solo en desarrollo
+	grpcOpts []grpc.ServerOption
 
 	// wg sincroniza el apagado de los jobs de background (outbox relay,
 	// cleaner de sesiones) con el cierre de recursos compartidos (pool, NATS).
@@ -114,15 +116,14 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	outboxStore := outbox.NewStore("terminal_gateway")
 	outboxRelay := outbox.NewRelay(pool, js, "terminal_gateway", 500*time.Millisecond, 50)
 
-	// TerminalNotifier — implementado por el adaptador WebSocket.
-	// TODO: instanciar websocket.NewNotifier(wsSrv) cuando esté implementado.
-	// Por ahora nil; reemplazar en la siguiente iteración.
+	// Conexiones WebSocket de los terminales: les avisa a los casos de uso y al servidor gRPC.
+	hub := wsinfra.NewHub()
 
 	// ── Aplicación ─────────────────────────────────────────────────────────────
 	sessionHandler := command.NewSessionHandler(
 		sessionRepo,
 		terminalRepo,
-		wsinfra.NewMockNotifier(), // MockNotifier para MVP
+		hub,
 		eventPub,
 		idempotency,
 		outboxStore,
@@ -157,7 +158,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	subscriber := natsinfra.NewSubscriber(js, sessionHandler)
 
 	// gRPC Server — recibe SendReceipt desde el BC Notification
-	grpcSrv := grpcserver.NewTerminalGatewayServer(nil, queryHandler) // notifier = nil hasta websocket/
+	grpcSrv := grpcserver.NewTerminalGatewayServer(hub, queryHandler)
 
 	// HTTP Server — healthz, readyz, metrics, operaciones REST
 	allowedOrigins := cfg.CORSAllowedOrigins
@@ -177,8 +178,8 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	router := httpinfra.NewRouter(sessionHandler, queryHandler, pool, allowedOrigins,
-		httpinfra.NewTerminalAuth(tokens, trustedProxies), payTokens)
+	terminalAuth := httpinfra.NewTerminalAuth(tokens, trustedProxies)
+	router := httpinfra.NewRouter(sessionHandler, queryHandler, pool, allowedOrigins, terminalAuth, payTokens)
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,
@@ -194,9 +195,19 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		return nil, err
 	}
 
-	// WebSocket Server — conexiones mTLS de los terminales POSNET
-	// TODO: wsSrv := websocket.NewServer(cfg.TLS, sessionHandler, terminalRepo)
-	// Se arrancará en cfg.WSPort en app.start()
+	// WebSocket de los terminales, en su propio puerto. Usa el mismo TLS que la API: el token del
+	// terminal viaja por ahí. Sin timeouts de lectura o escritura, que cortarían las conexiones.
+	var wsAuth wsinfra.Authenticator
+	if terminalAuth != nil {
+		wsAuth = terminalAuth
+	}
+	ws := wsinfra.NewServer(hub, wsAuth, allowedOrigins)
+	wsSrv := &http.Server{
+		Addr:              fmt.Sprintf(":%d", cfg.WSPort),
+		Handler:           ws.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		TLSConfig:         httpSrv.TLSConfig,
+	}
 
 	return &app{
 		pool:        pool,
@@ -211,6 +222,9 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 
 		sessionHandler: sessionHandler,
 		cleanupEvery:   cfg.Session.ExpiredCleanupEvery,
+
+		ws:    ws,
+		wsSrv: wsSrv,
 	}, nil
 }
 
@@ -246,8 +260,17 @@ func (a *app) start(ctx context.Context) error {
 	}()
 	slog.Info("HTTP server starting", slog.String("addr", a.httpSrv.Addr))
 
-	// WebSocket server — en puerto separado con mTLS
-	// TODO: go func() { wsSrv.ListenAndServeTLS(cfg.WSPort, cfg.TLS) }()
+	// WebSocket de los terminales
+	serveWS := a.wsSrv.ListenAndServe
+	if a.wsSrv.TLSConfig != nil {
+		serveWS = func() error { return a.wsSrv.ListenAndServeTLS("", "") }
+	}
+	go func() {
+		if err := serveWS(); err != nil && err != http.ErrServerClosed {
+			slog.Error("WebSocket server stopped", slog.String("error", err.Error()))
+		}
+	}()
+	slog.Info("WebSocket server starting", slog.String("addr", a.wsSrv.Addr))
 
 	// Outbox relay — publica eventos pendientes a NATS con reintentos automáticos
 	a.wg.Add(1)
@@ -329,6 +352,14 @@ func (a *app) close() {
 			if err := a.httpSrv.Shutdown(shutdownCtx); err != nil {
 				slog.Error("HTTP graceful shutdown failed", slog.String("error", err.Error()))
 			}
+		}
+
+		if a.ws != nil {
+			slog.Info("closing terminal WebSocket connections")
+			a.ws.Close()
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = a.wsSrv.Shutdown(shutdownCtx)
+			cancel()
 		}
 
 		slog.Info("waiting for background jobs to finish")

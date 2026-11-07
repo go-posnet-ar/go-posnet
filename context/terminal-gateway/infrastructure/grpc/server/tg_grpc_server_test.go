@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"errors"
+	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/service"
 	"net"
 	"strings"
 	"testing"
@@ -208,22 +209,85 @@ func TestSendReceipt_QueryErrorIsInternal(t *testing.T) {
 	}
 }
 
-func TestSendReceipt_Success(t *testing.T) {
+// fakeConnections simula las conexiones WebSocket de los terminales.
+type fakeConnections struct {
+	connected map[domain.TerminalID]time.Time
+	sendErr   error
+	sent      []sentReceipt
+}
+
+type sentReceipt struct {
+	terminalID domain.TerminalID
+	receipt    service.Receipt
+}
+
+func (f *fakeConnections) SendReceipt(_ context.Context, id domain.TerminalID, r service.Receipt) error {
+	if f.sendErr != nil {
+		return f.sendErr
+	}
+	if _, ok := f.connected[id]; !ok {
+		return service.ErrTerminalNotConnected
+	}
+	f.sent = append(f.sent, sentReceipt{id, r})
+	return nil
+}
+
+func (f *fakeConnections) ConnectedSince(id domain.TerminalID) (time.Time, bool) {
+	t, ok := f.connected[id]
+	return t, ok
+}
+
+func TestSendReceipt_DeliveredToTheSessionTerminal(t *testing.T) {
 	terminalID := domain.NewTerminalID()
 	session := newSession(t, terminalID)
-	repo := &fakeSessionRepo{findResult: session}
-	srv := server.NewTerminalGatewayServer(nil, query.NewSessionQueryHandler(repo))
+	conns := &fakeConnections{connected: map[domain.TerminalID]time.Time{terminalID: time.Now()}}
+	srv := server.NewTerminalGatewayServer(conns, query.NewSessionQueryHandler(&fakeSessionRepo{findResult: session}))
 
-	req := validSendReceiptReq(terminalID.String(), session.ID().String())
+	// El pedido declara otro terminal: el comprobante va al de la sesión.
+	req := validSendReceiptReq(domain.NewTerminalID().String(), session.ID().String())
 	resp, err := srv.SendReceipt(context.Background(), req)
 	if err != nil {
 		t.Fatalf("SendReceipt() error = %v", err)
 	}
-	if !resp.Delivered {
-		t.Error("Delivered = false, want true")
+	if !resp.Delivered || resp.ErrorReason != "" {
+		t.Errorf("resp = %+v, want delivered", resp)
 	}
-	if resp.ErrorReason != "" {
-		t.Errorf("ErrorReason = %q, want empty", resp.ErrorReason)
+	if len(conns.sent) != 1 || conns.sent[0].terminalID != terminalID || conns.sent[0].receipt.TransactionID != req.Receipt.TransactionId {
+		t.Errorf("sent = %+v", conns.sent)
+	}
+}
+
+func TestSendReceipt_NotDelivered(t *testing.T) {
+	terminalID := domain.NewTerminalID()
+	session := newSession(t, terminalID)
+	req := validSendReceiptReq(terminalID.String(), session.ID().String())
+
+	for name, conns := range map[string]service.TerminalConnections{
+		"sin WebSocket":         nil,
+		"terminal desconectado": &fakeConnections{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := server.NewTerminalGatewayServer(conns, query.NewSessionQueryHandler(&fakeSessionRepo{findResult: session}))
+			resp, err := srv.SendReceipt(context.Background(), req)
+			if err != nil {
+				t.Fatalf("SendReceipt() error = %v", err)
+			}
+			if resp.Delivered || resp.ErrorReason != "TERMINAL_NOT_CONNECTED" {
+				t.Errorf("resp = %+v, want TERMINAL_NOT_CONNECTED", resp)
+			}
+		})
+	}
+}
+
+func TestSendReceipt_SendError(t *testing.T) {
+	terminalID := domain.NewTerminalID()
+	session := newSession(t, terminalID)
+	conns := &fakeConnections{sendErr: errors.New("boom")}
+	srv := server.NewTerminalGatewayServer(conns, query.NewSessionQueryHandler(&fakeSessionRepo{findResult: session}))
+
+	_, err := srv.SendReceipt(context.Background(), validSendReceiptReq(terminalID.String(), session.ID().String()))
+	if grpcStatusCode(t, err) != grpccodes.Internal {
+		t.Fatalf("code = %v, want Internal", grpcStatusCode(t, err))
 	}
 }
 
@@ -247,47 +311,57 @@ func TestGetTerminalStatus_InvalidTerminalID(t *testing.T) {
 	}
 }
 
-func TestGetTerminalStatus_QueryError(t *testing.T) {
-	repo := &fakeSessionRepo{findActiveErr: errors.New("connection reset")}
-	srv := server.NewTerminalGatewayServer(nil, query.NewSessionQueryHandler(repo))
+func TestGetTerminalStatus_WithoutWebSocketIsUnknown(t *testing.T) {
+	srv := server.NewTerminalGatewayServer(nil, query.NewSessionQueryHandler(&fakeSessionRepo{}))
 
-	_, err := srv.GetTerminalStatus(context.Background(), &tgv1.GetTerminalStatusRequest{TerminalId: domain.NewTerminalID().String()})
-	if grpcStatusCode(t, err) != grpccodes.Internal {
-		t.Fatalf("code = %v, want %v", grpcStatusCode(t, err), grpccodes.Internal)
+	resp, err := srv.GetTerminalStatus(context.Background(), &tgv1.GetTerminalStatusRequest{TerminalId: domain.NewTerminalID().String()})
+	if err != nil {
+		t.Fatalf("GetTerminalStatus() error = %v", err)
+	}
+	if resp.Status != tgv1.TerminalConnectionStatus_TERMINAL_CONNECTION_STATUS_UNKNOWN {
+		t.Errorf("Status = %v, want UNKNOWN", resp.Status)
 	}
 }
 
 func TestGetTerminalStatus_Disconnected(t *testing.T) {
-	repo := &fakeSessionRepo{findActiveResult: nil}
-	srv := server.NewTerminalGatewayServer(nil, query.NewSessionQueryHandler(repo))
-
-	terminalID := domain.NewTerminalID().String()
-	resp, err := srv.GetTerminalStatus(context.Background(), &tgv1.GetTerminalStatusRequest{TerminalId: terminalID})
-	if err != nil {
-		t.Fatalf("GetTerminalStatus() error = %v", err)
-	}
-	if resp.Status != tgv1.TerminalConnectionStatus_TERMINAL_CONNECTION_STATUS_DISCONNECTED {
-		t.Errorf("Status = %v, want DISCONNECTED", resp.Status)
-	}
-	if resp.TerminalId != terminalID {
-		t.Errorf("TerminalId = %q, want %q", resp.TerminalId, terminalID)
-	}
-}
-
-func TestGetTerminalStatus_Connected(t *testing.T) {
+	// Una sesión activa no significa que el terminal esté conectado.
 	terminalID := domain.NewTerminalID()
-	session := newSession(t, terminalID)
-	repo := &fakeSessionRepo{findActiveResult: session}
-	srv := server.NewTerminalGatewayServer(nil, query.NewSessionQueryHandler(repo))
+	repo := &fakeSessionRepo{findActiveResult: newSession(t, terminalID)}
+	srv := server.NewTerminalGatewayServer(&fakeConnections{}, query.NewSessionQueryHandler(repo))
 
 	resp, err := srv.GetTerminalStatus(context.Background(), &tgv1.GetTerminalStatusRequest{TerminalId: terminalID.String()})
 	if err != nil {
 		t.Fatalf("GetTerminalStatus() error = %v", err)
 	}
-	if resp.Status != tgv1.TerminalConnectionStatus_TERMINAL_CONNECTION_STATUS_CONNECTED {
-		t.Errorf("Status = %v, want CONNECTED", resp.Status)
+	if resp.Status != tgv1.TerminalConnectionStatus_TERMINAL_CONNECTION_STATUS_DISCONNECTED || resp.TerminalId != terminalID.String() {
+		t.Errorf("resp = %+v, want DISCONNECTED", resp)
 	}
-	if resp.MerchantId != session.MerchantID().String() {
-		t.Errorf("MerchantId = %q, want %q", resp.MerchantId, session.MerchantID().String())
-	}
+}
+
+func TestGetTerminalStatus_Connected(t *testing.T) {
+	terminalID := domain.NewTerminalID()
+	since := time.Date(2026, 11, 7, 15, 0, 0, 0, time.UTC)
+	conns := &fakeConnections{connected: map[domain.TerminalID]time.Time{terminalID: since}}
+
+	t.Run("sin sesión activa", func(t *testing.T) {
+		srv := server.NewTerminalGatewayServer(conns, query.NewSessionQueryHandler(&fakeSessionRepo{}))
+		resp, err := srv.GetTerminalStatus(context.Background(), &tgv1.GetTerminalStatusRequest{TerminalId: terminalID.String()})
+		if err != nil {
+			t.Fatalf("GetTerminalStatus() error = %v", err)
+		}
+		if resp.Status != tgv1.TerminalConnectionStatus_TERMINAL_CONNECTION_STATUS_CONNECTED || resp.ConnectedSince != "2026-11-07T15:00:00Z" {
+			t.Errorf("resp = %+v, want CONNECTED desde la conexión", resp)
+		}
+	})
+	t.Run("con sesión activa, informa el comercio", func(t *testing.T) {
+		session := newSession(t, terminalID)
+		srv := server.NewTerminalGatewayServer(conns, query.NewSessionQueryHandler(&fakeSessionRepo{findActiveResult: session}))
+		resp, err := srv.GetTerminalStatus(context.Background(), &tgv1.GetTerminalStatusRequest{TerminalId: terminalID.String()})
+		if err != nil {
+			t.Fatalf("GetTerminalStatus() error = %v", err)
+		}
+		if resp.MerchantId != session.MerchantID().String() {
+			t.Errorf("MerchantId = %q, want %q", resp.MerchantId, session.MerchantID().String())
+		}
+	})
 }

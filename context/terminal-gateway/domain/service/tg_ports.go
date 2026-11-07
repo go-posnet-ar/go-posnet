@@ -3,10 +3,44 @@ package service
 
 import (
 	"context"
+	"errors"
+	"time"
 
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/aggregate"
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
+
+// ErrTerminalNotConnected indica que el terminal no tiene una conexión WebSocket abierta.
+var ErrTerminalNotConnected = errors.New("terminal not connected")
+
+// TerminalConnections son las conexiones abiertas de los terminales: el servidor gRPC las usa
+// para entregar comprobantes y para informar si un terminal está conectado.
+type TerminalConnections interface {
+	// SendReceipt envía el comprobante al terminal. Devuelve ErrTerminalNotConnected si no tiene
+	// una conexión abierta.
+	SendReceipt(ctx context.Context, terminalID domain.TerminalID, receipt Receipt) error
+
+	// ConnectedSince devuelve desde cuándo está conectado el terminal, si lo está.
+	ConnectedSince(terminalID domain.TerminalID) (time.Time, bool)
+}
+
+// Receipt es el comprobante que envía Notification para el terminal.
+type Receipt struct {
+	TransactionID   string
+	Result          string // APPROVED, REJECTED o REVERSED
+	MerchantName    string
+	MerchantAddress string
+	TerminalCode    string
+	AuthCode        string
+	RejectionCode   string
+	RejectionReason string
+	AmountCents     int64
+	Currency        string
+	CardLast4       string
+	CardNetwork     string
+	EntryMode       string
+	TransactionAt   string
+}
 
 // TerminalNotifier es el puerto de salida hacia el WebSocket del terminal.
 // El adaptador WebSocket lo implementa manteniendo un mapa de conexiones activas.

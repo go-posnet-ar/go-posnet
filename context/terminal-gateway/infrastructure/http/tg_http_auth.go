@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -194,44 +195,61 @@ func NewTerminalAuth(tokens *TerminalTokens, trustedProxies []netip.Prefix) *Ter
 	return &TerminalAuth{tokens: tokens, trustedProxies: trustedProxies, limiter: newAuthLimiter()}
 }
 
+// Errores de Verify.
+var (
+	ErrInvalidTerminalToken = errors.New("missing or invalid terminal token")
+	ErrTooManyAttempts      = errors.New("too many failed attempts")
+)
+
+// Verify autentica el token de un terminal que llega en el pedido r, con el límite de intentos
+// por IP. Con ErrTooManyAttempts, retryAfter es cuánto falta para volver a intentar. Lo usan la
+// API HTTP y el WebSocket, para que el límite sea uno solo.
+func (a *TerminalAuth) Verify(r *http.Request, token string) (id domain.TerminalID, retryAfter time.Duration, err error) {
+	ip := a.clientIP(r)
+	if remaining, blocked := a.limiter.blocked(ip); blocked {
+		return domain.TerminalID{}, remaining, ErrTooManyAttempts
+	}
+	if token == "" {
+		// Sin token no es un intento de adivinarlo: no cuenta para el límite.
+		return domain.TerminalID{}, 0, ErrInvalidTerminalToken
+	}
+	id, ok := a.tokens.Authenticate(token)
+	if !ok {
+		a.limiter.fail(ip)
+		return domain.TerminalID{}, 0, ErrInvalidTerminalToken
+	}
+	a.limiter.succeed(ip)
+	return id, 0, nil
+}
+
 // requireTerminal exige un token de terminal válido. Sin autenticación configurada no exige nada.
 func (a *TerminalAuth) requireTerminal(next http.HandlerFunc) http.HandlerFunc {
 	if a == nil {
 		return next
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := a.clientIP(r)
 		log := observability.FromContext(r.Context()).With(
 			slog.String("method", r.Method),
 			slog.String("path", r.URL.Path),
-			slog.String("client_ip", ip.String()),
+			slog.String("client_ip", a.clientIP(r).String()),
 		)
-		if remaining, blocked := a.limiter.blocked(ip); blocked {
+		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok {
+			token = ""
+		}
+		id, retryAfter, err := a.Verify(r, token)
+		switch {
+		case errors.Is(err, ErrTooManyAttempts):
 			log.Warn("rejected terminal request — too many failed attempts")
-			w.Header().Set("Retry-After", strconv.Itoa(int(remaining.Seconds())+1))
+			w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())+1))
 			writeJSON(w, http.StatusTooManyRequests, errResp("TOO_MANY_ATTEMPTS", "too many failed attempts; try again later"))
 			return
-		}
-
-		token, hasBearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		var (
-			id domain.TerminalID
-			ok bool
-		)
-		if hasBearer && token != "" {
-			id, ok = a.tokens.Authenticate(token)
-		}
-		if !ok {
-			// Sin token no es un intento de adivinarlo: no cuenta para el límite.
-			if hasBearer && token != "" {
-				a.limiter.fail(ip)
-			}
+		case err != nil:
 			log.Warn("rejected terminal request")
 			w.Header().Set("WWW-Authenticate", `Bearer realm="terminal-gateway"`)
 			writeJSON(w, http.StatusUnauthorized, errResp("UNAUTHORIZED", "missing or invalid terminal token"))
 			return
 		}
-		a.limiter.succeed(ip)
 		next(w, r.WithContext(context.WithValue(r.Context(), terminalKey{}, id)))
 	}
 }

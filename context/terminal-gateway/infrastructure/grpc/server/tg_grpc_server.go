@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -23,7 +24,9 @@ import (
 // TerminalGatewayServer implementa tgv1.TerminalGatewayServiceServer.
 type TerminalGatewayServer struct {
 	tgv1.UnimplementedTerminalGatewayServiceServer
-	notifier     service.TerminalNotifier
+	// conns son las conexiones WebSocket de los terminales. nil = sin WebSocket: no se puede
+	// entregar ni saber si un terminal está conectado.
+	conns        service.TerminalConnections
 	queryHandler *query.SessionQueryHandler
 
 	// grpcServer es la referencia al *grpc.Server real de la librería,
@@ -39,11 +42,11 @@ type TerminalGatewayServer struct {
 }
 
 func NewTerminalGatewayServer(
-	notifier service.TerminalNotifier,
+	conns service.TerminalConnections,
 	queryHandler *query.SessionQueryHandler,
 ) *TerminalGatewayServer {
 	return &TerminalGatewayServer{
-		notifier:     notifier,
+		conns:        conns,
 		queryHandler: queryHandler,
 		ready:        make(chan struct{}),
 	}
@@ -106,7 +109,7 @@ func (s *TerminalGatewayServer) SendReceipt(
 		return nil, status.Errorf(codes.InvalidArgument, "invalid transaction_id: %v", err)
 	}
 
-	_, err = s.queryHandler.GetSessionStatus(ctx, txID)
+	session, err := s.queryHandler.GetSessionStatus(ctx, txID)
 	if err != nil {
 		var notFound *pkgerrors.NotFoundError
 		if errors.As(err, &notFound) {
@@ -118,13 +121,45 @@ func (s *TerminalGatewayServer) SendReceipt(
 		observability.RecordError(ctx, err)
 		return nil, status.Error(codes.Internal, "internal error")
 	}
+	// Se entrega al terminal de la sesión, según la base: no al que declara el pedido.
+	terminalID, err := domain.ParseTerminalID(session.TerminalID)
+	if err != nil {
+		observability.RecordError(ctx, err)
+		return nil, status.Error(codes.Internal, "internal error")
+	}
+	if s.conns == nil {
+		return &tgv1.SendReceiptResponse{Delivered: false, ErrorReason: "TERMINAL_NOT_CONNECTED"}, nil
+	}
+	if err := s.conns.SendReceipt(ctx, terminalID, toReceipt(req.Receipt)); err != nil {
+		if errors.Is(err, service.ErrTerminalNotConnected) {
+			return &tgv1.SendReceiptResponse{Delivered: false, ErrorReason: "TERMINAL_NOT_CONNECTED"}, nil
+		}
+		observability.RecordError(ctx, err)
+		return nil, status.Error(codes.Internal, "internal error")
+	}
 
 	slog.InfoContext(ctx, "receipt sent to terminal",
-		slog.String("terminal_id", req.TerminalId),
+		slog.String("terminal_id", terminalID.String()),
 		slog.String("transaction_id", req.TransactionId),
 	)
-
 	return &tgv1.SendReceiptResponse{Delivered: true}, nil
+}
+
+// toReceipt traduce el comprobante del contrato gRPC.
+func toReceipt(r *tgv1.Receipt) service.Receipt {
+	result := map[tgv1.ReceiptResult]string{
+		tgv1.ReceiptResult_RECEIPT_RESULT_APPROVED: "APPROVED",
+		tgv1.ReceiptResult_RECEIPT_RESULT_REJECTED: "REJECTED",
+		tgv1.ReceiptResult_RECEIPT_RESULT_REVERSED: "REVERSED",
+	}[r.Result]
+	return service.Receipt{
+		TransactionID: r.TransactionId, Result: result,
+		MerchantName: r.MerchantName, MerchantAddress: r.MerchantAddress, TerminalCode: r.TerminalCode,
+		AuthCode: r.AuthCode, RejectionCode: r.RejectionCode, RejectionReason: r.RejectionReason,
+		AmountCents: r.AmountCents, Currency: r.Currency,
+		CardLast4: r.CardLast4, CardNetwork: r.CardNetwork, EntryMode: r.EntryMode,
+		TransactionAt: r.TransactionAt,
+	}
 }
 
 // GetTerminalStatus retorna el estado de conexión de un terminal.
@@ -144,23 +179,27 @@ func (s *TerminalGatewayServer) GetTerminalStatus(
 		return nil, status.Errorf(codes.InvalidArgument, "invalid terminal_id: %v", err)
 	}
 
-	activeSession, err := s.queryHandler.GetActiveSession(ctx, terminalID)
-	if err != nil {
-		observability.RecordError(ctx, err)
-		return nil, status.Error(codes.Internal, "internal error")
+	if s.conns == nil {
+		return &tgv1.GetTerminalStatusResponse{
+			TerminalId: req.TerminalId,
+			Status:     tgv1.TerminalConnectionStatus_TERMINAL_CONNECTION_STATUS_UNKNOWN,
+		}, nil
 	}
-
-	if activeSession == nil {
+	since, connected := s.conns.ConnectedSince(terminalID)
+	if !connected {
 		return &tgv1.GetTerminalStatusResponse{
 			TerminalId: req.TerminalId,
 			Status:     tgv1.TerminalConnectionStatus_TERMINAL_CONNECTION_STATUS_DISCONNECTED,
 		}, nil
 	}
-
-	return &tgv1.GetTerminalStatusResponse{
+	resp := &tgv1.GetTerminalStatusResponse{
 		TerminalId:     req.TerminalId,
 		Status:         tgv1.TerminalConnectionStatus_TERMINAL_CONNECTION_STATUS_CONNECTED,
-		MerchantId:     activeSession.MerchantID,
-		ConnectedSince: activeSession.CreatedAt,
-	}, nil
+		ConnectedSince: since.UTC().Format(time.RFC3339),
+	}
+	// El comercio sale de la sesión activa, si hay una: la conexión no lo conoce.
+	if active, err := s.queryHandler.GetActiveSession(ctx, terminalID); err == nil && active != nil {
+		resp.MerchantId = active.MerchantID
+	}
+	return resp, nil
 }
