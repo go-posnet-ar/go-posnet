@@ -88,6 +88,8 @@ go-posnet/
 │   ├── settlement/
 │   └── notification/
 │
+├── gateway/                    # API Gateway: único punto de entrada HTTP (:8000)
+│
 ├── context/                    # Bounded Contexts
 │   ├── terminal-gateway/
 │   ├── authorization/
@@ -382,6 +384,7 @@ posnet_webhook_delivery_failures_total     # Fallos de webhook por comercio
 | [docs/adr/002-nats-jetstream.md](docs/adr/002-nats-jetstream.md) | Por qué NATS sobre Kafka |
 | [docs/adr/003-hexagonal-ddd.md](docs/adr/003-hexagonal-ddd.md) | Hexagonal + DDD + monorepo |
 | [docs/adr/004-sqlc-over-orm.md](docs/adr/004-sqlc-over-orm.md) | Por qué sqlc sobre GORM |
+| [docs/technical/GATEWAY.md](docs/technical/GATEWAY.md) | API Gateway: rutas publicadas, límites, CORS y TLS |
 | [docs/runbooks/incident-response.md](docs/runbooks/incident-response.md) | Respuesta ante incidentes |
 | [docs/runbooks/batch-close-failure.md](docs/runbooks/batch-close-failure.md) | Fallo en cierre de lote |
 | [docs/runbooks/nats-dlq-reprocess.md](docs/runbooks/nats-dlq-reprocess.md) | Reprocesamiento desde DLQ |

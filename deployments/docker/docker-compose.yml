@@ -163,6 +163,39 @@ services:
       retries: 5
       start_period: 20s
 
+  # Único punto de entrada HTTP hacia los servicios. No carga .env.docker: no necesita
+  # credenciales. 8001 (/healthz, /readyz, /metrics) queda solo en la red interna.
+  gateway:
+    build:
+      context: ../..
+      dockerfile: deployments/docker/Dockerfile.gateway
+      network: host
+    container_name: posnet-gateway
+    restart: unless-stopped
+    networks: [posnet]
+    ports:
+      - "8000:8000"
+    environment:
+      GATEWAY_PORT: "8000"
+      GATEWAY_ADMIN_PORT: "8001"
+      TERMINAL_GATEWAY_URL: http://terminal-gateway:8081
+      SETTLEMENT_URL: http://settlement:8084
+      GATEWAY_CORS_ALLOWED_ORIGINS: "http://localhost:5173,http://192.168.0.2:5173"
+      ENVIRONMENT: development
+      OTEL_SERVICE_NAME: posnet-gateway
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+    depends_on:
+      terminal-gateway:
+        condition: service_healthy
+      settlement:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:8001/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   terminal-gateway:
     build:
       context: ../..

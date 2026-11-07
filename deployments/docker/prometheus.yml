@@ -37,3 +37,5 @@ scrape_configs:
         labels: { bc: settlement }
       - targets: ["notification:8085"]
         labels: { bc: notification }
+      - targets: ["gateway:8001"]
+        labels: { bc: gateway }

@@ -1,0 +1,38 @@
+# =============================================================================
+# Dockerfile — API Gateway
+# =============================================================================
+
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates tzdata
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-w -s" \
+    -o /app/bin/gateway \
+    ./gateway/cmd/gateway/
+
+FROM alpine:3.19
+
+RUN apk add --no-cache ca-certificates tzdata wget
+
+WORKDIR /app
+
+COPY --from=builder /app/bin/gateway .
+
+RUN addgroup -S posnet && adduser -S posnet -G posnet
+USER posnet
+
+# 8000 es el puerto público; 8001, el de /healthz, /readyz y /metrics, solo para la red interna.
+EXPOSE 8000 8001
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -q --spider http://localhost:8001/healthz || exit 1
+
+ENTRYPOINT ["./gateway"]

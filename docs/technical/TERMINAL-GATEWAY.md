@@ -205,7 +205,9 @@ verán el estado `EXPIRED`.
 
 ## 6. API HTTP
 
-Puerto `HTTP_PORT` (8081 por defecto). Los errores tienen la forma `{"error": "CODIGO", "message": "..."}`.
+Puerto `HTTP_PORT` (8081 por defecto). Los errores tienen la forma `{"error": "CODIGO", "message": "..."}`. Desde afuera,
+se accede por el [API Gateway](GATEWAY.md), en el puerto 8000, con los mismos paths. Para que el límite de intentos vea la
+IP del cliente, el gateway tiene que estar en `TRUSTED_PROXIES`.
 
 ### Autenticación de terminales
 
