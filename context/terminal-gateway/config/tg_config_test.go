@@ -355,3 +355,41 @@ func TestLoad_CORSAllowedOrigins(t *testing.T) {
 		t.Errorf("CORSAllowedOrigins = %q", got)
 	}
 }
+
+func TestLoad_HTTPTLS(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "postgres://x")
+	t.Setenv("NATS_URL", "nats://x")
+
+	cases := []struct {
+		name                           string
+		env, cert, key, external, cidr string
+		wantErr                        bool
+	}{
+		{name: "desarrollo sin TLS", env: "development"},
+		{name: "producción sin TLS", env: "production", wantErr: true},
+		{name: "staging sin TLS", env: "staging", wantErr: true},
+		{name: "producción con certificado", env: "production", cert: "c.pem", key: "k.pem"},
+		{name: "producción detrás de un proxy TLS", env: "production", external: "true"},
+		{name: "certificado sin clave", env: "development", cert: "c.pem", wantErr: true},
+		{name: "proxy de confianza válido", env: "development", cidr: "10.0.0.0/8, 192.168.1.10/32"},
+		{name: "proxy de confianza inválido", env: "development", cidr: "10.0.0.0/33", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ENVIRONMENT", tc.env)
+			t.Setenv("HTTP_TLS_CERT", tc.cert)
+			t.Setenv("HTTP_TLS_KEY", tc.key)
+			t.Setenv("HTTP_TLS_EXTERNAL", tc.external)
+			t.Setenv("TRUSTED_PROXIES", tc.cidr)
+			cfg, err := Load()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Load() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err == nil && tc.cidr != "" {
+				if prefixes, _ := cfg.TrustedProxyPrefixes(); len(prefixes) != 2 {
+					t.Errorf("TrustedProxyPrefixes() = %v, want 2", prefixes)
+				}
+			}
+		})
+	}
+}

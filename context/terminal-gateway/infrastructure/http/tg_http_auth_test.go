@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,7 +130,7 @@ func TestTerminalTokens_Authenticate(t *testing.T) {
 func TestRouter_TerminalEndpointsRequireToken(t *testing.T) {
 	terminal := domain.NewTerminalID()
 	router := NewRouter(&fakeSessionService{createSessionResult: mustSessionCreatedResult(t)},
-		query.NewSessionQueryHandler(&fakeSessionRepo{}), &fakePool{}, nil, tokensFor(t, terminal))
+		query.NewSessionQueryHandler(&fakeSessionRepo{}), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, terminal), nil))
 	id := domain.NewTransactionID().String()
 
 	protected := []struct{ method, path, body string }{
@@ -177,7 +178,7 @@ func TestRouter_TerminalComesFromToken(t *testing.T) {
 	id := domain.NewTransactionID().String()
 
 	newRouter := func(svc *fakeSessionService) http.Handler {
-		return NewRouter(svc, query.NewSessionQueryHandler(&fakeSessionRepo{}), &fakePool{}, nil, tokensFor(t, terminal))
+		return NewRouter(svc, query.NewSessionQueryHandler(&fakeSessionRepo{}), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, terminal), nil))
 	}
 
 	t.Run("create usa el terminal del token, sin comercio por defecto", func(t *testing.T) {
@@ -239,14 +240,14 @@ func TestRouter_SessionOfAnotherTerminalIsNotFound(t *testing.T) {
 	session := newSession(t)
 	repo := &fakeSessionRepo{findResult: session}
 
-	ownRouter := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(repo), &fakePool{}, nil, tokensFor(t, session.TerminalID()))
+	ownRouter := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(repo), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, session.TerminalID()), nil))
 	rec := httptest.NewRecorder()
 	ownRouter.ServeHTTP(rec, authRequest(http.MethodGet, "/sessions/"+session.ID().String(), "", testToken))
 	if rec.Code != http.StatusOK {
 		t.Errorf("propia: status = %d, want 200", rec.Code)
 	}
 
-	otherRouter := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(repo), &fakePool{}, nil, tokensFor(t, domain.NewTerminalID()))
+	otherRouter := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(repo), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, domain.NewTerminalID()), nil))
 	rec = httptest.NewRecorder()
 	otherRouter.ServeHTTP(rec, authRequest(http.MethodGet, "/sessions/"+session.ID().String(), "", testToken))
 	if rec.Code != http.StatusNotFound {
@@ -298,5 +299,139 @@ func TestRouter_ValidationErrorsAreBadRequests(t *testing.T) {
 	router.ServeHTTP(rec, authRequest(http.MethodPost, "/api/sessions/create", `{"amount_cents":1000}`, ""))
 	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "pq:") {
 		t.Errorf("status = %d, body = %s", rec.Code, rec.Body)
+	}
+}
+
+// ─── Recarga ──────────────────────────────────────────────────────────────────
+
+func TestTerminalTokens_Reload(t *testing.T) {
+	id := domain.NewTerminalID()
+	entry := func(token string) string {
+		return `{"terminal_id":"` + id.String() + `","sha256":"` + sha256Hex(token) + `"}`
+	}
+	path := writeTokensFile(t, `[`+entry("viejo")+`]`)
+	tokens, err := LoadTerminalTokens(path)
+	if err != nil {
+		t.Fatalf("LoadTerminalTokens() error = %v", err)
+	}
+
+	if changed, err := tokens.Reload(); err != nil || changed {
+		t.Errorf("Reload() sin cambios = %v, %v, want false, nil", changed, err)
+	}
+
+	// Rotación: el nuevo vale y el viejo deja de valer.
+	if err := os.WriteFile(path, []byte(`[`+entry("nuevo")+`]`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if changed, err := tokens.Reload(); err != nil || !changed {
+		t.Fatalf("Reload() = %v, %v, want true, nil", changed, err)
+	}
+	if _, ok := tokens.Authenticate("nuevo"); !ok {
+		t.Error("el token nuevo no vale")
+	}
+	if _, ok := tokens.Authenticate("viejo"); ok {
+		t.Error("el token revocado sigue valiendo")
+	}
+
+	// Un archivo a medio escribir no deja afuera a nadie.
+	if err := os.WriteFile(path, []byte(`[{"terminal_id":`), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if _, err := tokens.Reload(); err == nil {
+		t.Error("Reload() error = nil con un archivo inválido")
+	}
+	if _, ok := tokens.Authenticate("nuevo"); !ok {
+		t.Error("un archivo inválido descartó los tokens vigentes")
+	}
+}
+
+// ─── Límite de intentos ───────────────────────────────────────────────────────
+
+func TestTerminalAuth_BlocksRepeatedFailures(t *testing.T) {
+	terminal := domain.NewTerminalID()
+	auth := NewTerminalAuth(tokensFor(t, terminal), nil)
+	now := time.Date(2026, 11, 7, 12, 0, 0, 0, time.UTC)
+	auth.limiter.now = func() time.Time { return now }
+	handler := auth.requireTerminal(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	do := func(ip, token string) *httptest.ResponseRecorder {
+		req := authRequest(http.MethodGet, "/sessions/x", "", token)
+		req.RemoteAddr = ip + ":40000"
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		return rec
+	}
+
+	// Sin token no es un intento de adivinarlo: no cuenta.
+	for i := 0; i < authMaxFailures+5; i++ {
+		do("10.0.0.1", "")
+	}
+	if rec := do("10.0.0.1", testToken); rec.Code != http.StatusOK {
+		t.Fatalf("sin token no debe bloquear: status = %d", rec.Code)
+	}
+
+	for i := 0; i < authMaxFailures; i++ {
+		do("10.0.0.2", "incorrecto")
+	}
+	rec := do("10.0.0.2", testToken)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("status = %d, Retry-After = %q, want 429 aun con el token correcto", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if rec := do("10.0.0.3", testToken); rec.Code != http.StatusOK {
+		t.Errorf("otra IP: status = %d, want 200", rec.Code)
+	}
+
+	now = now.Add(authBlock + time.Second)
+	if rec := do("10.0.0.2", testToken); rec.Code != http.StatusOK {
+		t.Errorf("después del bloqueo: status = %d, want 200", rec.Code)
+	}
+}
+
+// Un éxito desde la misma IP borra los fallos: un terminal mal configurado no bloquea al resto
+// de su local.
+func TestTerminalAuth_SuccessResetsFailures(t *testing.T) {
+	auth := NewTerminalAuth(tokensFor(t, domain.NewTerminalID()), nil)
+	handler := auth.requireTerminal(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	do := func(token string) int {
+		req := authRequest(http.MethodGet, "/sessions/x", "", token)
+		req.RemoteAddr = "10.0.0.9:40000"
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		return rec.Code
+	}
+	for round := 0; round < 3; round++ {
+		for i := 0; i < authMaxFailures-1; i++ {
+			do("incorrecto")
+		}
+		if code := do(testToken); code != http.StatusOK {
+			t.Fatalf("ronda %d: status = %d, want 200", round, code)
+		}
+	}
+}
+
+func TestTerminalAuth_ClientIP(t *testing.T) {
+	proxy := netip.MustParsePrefix("10.1.0.0/16")
+	cases := []struct {
+		name    string
+		proxies []netip.Prefix
+		remote  string
+		xff     string
+		want    string
+	}{
+		{"sin proxy se ignora X-Forwarded-For", nil, "203.0.113.7:1", "198.51.100.1", "203.0.113.7"},
+		{"desde un proxy de confianza", []netip.Prefix{proxy}, "10.1.0.5:1", "198.51.100.1", "198.51.100.1"},
+		{"el cliente no puede agregar hops falsos", []netip.Prefix{proxy}, "10.1.0.5:1", "1.2.3.4, 198.51.100.1", "198.51.100.1"},
+		{"cadena de proxies de confianza", []netip.Prefix{proxy}, "10.1.0.5:1", "198.51.100.1, 10.1.0.6", "198.51.100.1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &TerminalAuth{trustedProxies: tc.proxies}
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.RemoteAddr = tc.remote
+			req.Header.Set("X-Forwarded-For", tc.xff)
+			if got := a.clientIP(req).String(); got != tc.want {
+				t.Errorf("clientIP() = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }

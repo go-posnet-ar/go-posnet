@@ -20,7 +20,7 @@ type Handler struct {
 	sessionService port.SessionService
 	queryHandler   *query.SessionQueryHandler
 	pool           pgutil.PgxPool
-	tokens         *TerminalTokens // nil = sin autenticación, solo en desarrollo
+	auth           *TerminalAuth // nil = sin autenticación, solo en desarrollo
 }
 
 func NewHandler(
@@ -39,10 +39,10 @@ func NewHandler(
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET  /healthz", h.handleHealth)
 	mux.HandleFunc("GET  /readyz", h.handleReady)
-	mux.HandleFunc("GET  /sessions/{id}", h.tokens.requireTerminal(h.handleGetSession))
-	mux.HandleFunc("POST /sessions/{id}/cancel", h.tokens.requireTerminal(h.handleCancelSession))
-	mux.HandleFunc("POST /sessions/{id}/reversal", h.tokens.requireTerminal(h.handleRequestReversal))
-	mux.HandleFunc("POST /batch-close", h.tokens.requireTerminal(h.handleBatchClose))
+	mux.HandleFunc("GET  /sessions/{id}", h.auth.requireTerminal(h.handleGetSession))
+	mux.HandleFunc("POST /sessions/{id}/cancel", h.auth.requireTerminal(h.handleCancelSession))
+	mux.HandleFunc("POST /sessions/{id}/reversal", h.auth.requireTerminal(h.handleRequestReversal))
+	mux.HandleFunc("POST /batch-close", h.auth.requireTerminal(h.handleBatchClose))
 }
 
 // GET /healthz — liveness probe

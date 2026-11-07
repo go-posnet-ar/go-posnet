@@ -241,7 +241,29 @@ Un archivo inválido o inexistente impide arrancar. Un archivo vacío (`[]`) dej
 la API queda abierta como antes, y el servicio solo arranca con `ENVIRONMENT=development`:** usa `X-Terminal-ID` y el
 terminal de prueba de `01-init.sql`. Así funciona hoy el Docker Compose.
 
-Los cambios en el archivo requieren reiniciar el servicio.
+El servicio relee el archivo cada 30 s: un token revocado deja de valer en ese plazo, sin reiniciar. Si el archivo queda
+inválido, se conservan los tokens vigentes y queda un `ERROR` en el log.
+
+**Límite de intentos:** con 10 tokens inválidos en un minuto desde la misma IP (en IPv6, la misma `/64`), esa IP recibe
+`429` durante 5 minutos, aun con un token válido. Un pedido sin token no cuenta, y un pedido exitoso desde esa IP borra los
+fallos: un terminal mal configurado no bloquea al resto de su local mientras alguno se autentique. Vive en memoria, por
+instancia. Detrás de un proxy, hay que declararlo en `TRUSTED_PROXIES`: si no, todos los pedidos comparten su IP. Sin esa
+variable, `X-Forwarded-For` se ignora, porque cualquiera podría declarar otra IP.
+
+### TLS
+
+Con `HTTP_TLS_CERT` y `HTTP_TLS_KEY`, el puerto `HTTP_PORT` sirve solo HTTPS, desde TLS 1.2. Un certificado nuevo requiere
+reiniciar. Si TLS lo termina un proxy, hay que declararlo con `HTTP_TLS_EXTERNAL=true` y limitar el acceso directo al
+puerto. **Fuera de `ENVIRONMENT=development`, el servicio no arranca sin una de las dos opciones**, porque los tokens
+viajarían sin cifrar. Docker Compose no usa TLS.
+
+Con HTTPS hay que cambiar también lo que consulta ese puerto:
+
+| Cliente | Cambio |
+|---|---|
+| `healthcheck` de Docker Compose | `wget --no-check-certificate -q --spider https://localhost:8081/healthz` |
+| Prometheus | `scheme: https` en `prometheus.yml`, con la CA del certificado |
+| `posnet-frontend`, Postman y Locust | `https://` en la URL de Terminal Gateway |
 
 | Método y ruta | Uso | Éxito | Errores |
 |---|---|---|---|
@@ -519,6 +541,9 @@ Cada comando y consulta abre un span (`command.ProcessPayment`, `query.GetSessio
 | `ENVIRONMENT` | `development` | Sí |
 | `POSNET_HOST` | IP local detectada | Sí; define el host de `qr_content` y del origen CORS por defecto |
 | `TERMINAL_TOKENS_FILE` | Vacía | Sí; [tokens de los terminales](#autenticación-de-terminales). Vacía deja la API abierta, y solo se permite con `ENVIRONMENT=development`. Si el archivo no existe o es inválido, el servicio no arranca |
+| `HTTP_TLS_CERT`, `HTTP_TLS_KEY` | Vacías | Sí; habilitan [HTTPS](#tls). Van juntas. Si no se pueden cargar, el servicio no arranca |
+| `HTTP_TLS_EXTERNAL` | `false` | Sí; declara que un proxy termina TLS. Fuera de desarrollo, hace falta esto o `HTTP_TLS_CERT` |
+| `TRUSTED_PROXIES` | Vacía | Sí; CIDR separados por comas cuyo `X-Forwarded-For` se acepta para el límite de intentos. Uno inválido impide arrancar |
 | `CORS_ALLOWED_ORIGINS` | Frontend de pago | Sí; orígenes separados por comas, como `https://pagos.example.com`. `*` permite cualquiera |
 | `GRPC_PORT` | `9091` | **No**: el puerto está fijo en 9091 |
 | `WS_PORT` | `8082` | **No**: no hay servidor WebSocket |
@@ -584,9 +609,8 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
 | `/pay` y `/status` son públicos | Cualquiera con un ID de sesión puede pagarla o ver su estado. Requiere un token por sesión en `qr_content`, que cambia `posnet-frontend` | `tg_qr_handler.go` |
-| Los tokens viajan sin TLS | La API HTTP no tiene TLS: alguien en la red puede leer un token y operar como ese terminal | `tg_wire.go` |
-| Sin límite de intentos fallidos | Nada frena a quien prueba tokens. Con 256 bits aleatorios no es viable adivinarlos, pero un token débil sí se puede | `tg_http_auth.go` |
-| Los tokens no se recargan | Revocar o rotar uno exige reiniciar el servicio | `tg_http_auth.go` |
+| En desarrollo, los tokens pueden viajar sin TLS | Con `ENVIRONMENT=development` y un archivo de tokens, el servicio arranca sin TLS y lo advierte en el log | `tg_wire.go` |
+| El límite de intentos es por instancia | Con varias instancias detrás de un balanceador, un atacante tiene 10 intentos por minuto en cada una | `tg_http_auth.go` |
 | gRPC sin TLS | Tráfico interno sin cifrar ni autenticar | `tg_grpc_server.go` |
 
 ### Pagos y consistencia

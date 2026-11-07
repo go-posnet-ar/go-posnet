@@ -15,18 +15,18 @@ func NewRouter(
 	queryHandler *query.SessionQueryHandler,
 	pool pgutil.PgxPool,
 	allowedOrigins []string,
-	tokens *TerminalTokens,
+	auth *TerminalAuth,
 ) http.Handler {
 	mux := http.NewServeMux()
 
 	// Rutas existentes
 	h := NewHandler(sessionService, queryHandler, pool)
-	h.tokens = tokens
+	h.auth = auth
 	h.RegisterRoutes(mux)
 
 	// Rutas del flujo QR — simulador POSNET
 	qr := NewQRHandler(sessionService, queryHandler)
-	qr.tokens = tokens
+	qr.auth = auth
 	qr.RegisterQRRoutes(mux)
 
 	mux.Handle("GET /metrics", observability.MetricsHandler())

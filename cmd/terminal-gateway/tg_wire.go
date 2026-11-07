@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -34,6 +35,7 @@ type app struct {
 	grpcSrv     *grpcserver.TerminalGatewayServer
 	httpSrv     *http.Server
 	metrics     *command.Metrics
+	tokens      *httpinfra.TerminalTokens // nil = API abierta, solo en desarrollo
 	// wsSrv   *websocket.Server  ← agregar cuando se implemente infrastructure/websocket/
 
 	// wg sincroniza el apagado de los jobs de background (outbox relay,
@@ -161,13 +163,21 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	if err != nil {
 		return nil, err
 	}
-	router := httpinfra.NewRouter(sessionHandler, queryHandler, pool, allowedOrigins, tokens)
+	trustedProxies, err := cfg.TrustedProxyPrefixes()
+	if err != nil {
+		return nil, fmt.Errorf("wire: %w", err)
+	}
+	router := httpinfra.NewRouter(sessionHandler, queryHandler, pool, allowedOrigins,
+		httpinfra.NewTerminalAuth(tokens, trustedProxies))
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
+	}
+	if err := configureHTTPTLS(httpSrv, cfg, tokens.Configured()); err != nil {
+		return nil, err
 	}
 
 	// WebSocket Server — conexiones mTLS de los terminales POSNET
@@ -182,6 +192,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		grpcSrv:     grpcSrv,
 		httpSrv:     httpSrv,
 		metrics:     tgMetrics,
+		tokens:      tokens,
 	}, nil
 }
 
@@ -205,8 +216,13 @@ func (a *app) start(ctx context.Context) error {
 	slog.Info("gRPC server starting", slog.Int("port", 9091))
 
 	// HTTP server
+	serve := a.httpSrv.ListenAndServe
+	if a.httpSrv.TLSConfig != nil {
+		// El certificado ya está cargado en TLSConfig.
+		serve = func() error { return a.httpSrv.ListenAndServeTLS("", "") }
+	}
 	go func() {
-		if err := a.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := serve(); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server stopped", slog.String("error", err.Error()))
 		}
 	}()
@@ -222,6 +238,15 @@ func (a *app) start(ctx context.Context) error {
 		a.outboxRelay.Run(ctx)
 	}()
 	slog.Info("outbox relay active")
+
+	// Tokens de los terminales: un token revocado deja de valer sin reiniciar
+	if a.tokens != nil {
+		a.wg.Add(1)
+		go func() {
+			defer a.wg.Done()
+			a.tokens.Run(ctx, terminalTokensReload)
+		}()
+	}
 
 	// Job de limpieza de sesiones expiradas
 	a.wg.Add(1)
@@ -325,6 +350,27 @@ func terminalTokens(cfg *config.Config) (*httpinfra.TerminalTokens, error) {
 		return nil, nil
 	}
 	slog.Info("terminal tokens loaded", slog.Int("tokens", tokens.Count()))
-	slog.Warn("the HTTP API has no TLS — terminal tokens travel unencrypted")
 	return tokens, nil
+}
+
+// terminalTokensReload es cada cuánto se relee el archivo de tokens: lo que tarda en regir una
+// revocación.
+const terminalTokensReload = 30 * time.Second
+
+// configureHTTPTLS habilita HTTPS si hay certificado. La configuración ya exige TLS fuera de
+// desarrollo; acá solo se advierte el caso de desarrollo con tokens.
+func configureHTTPTLS(srv *http.Server, cfg *config.Config, withTokens bool) error {
+	if cfg.HTTPTLSCert == "" {
+		if withTokens && !cfg.HTTPTLSExternal {
+			slog.Warn("the HTTP API has no TLS — terminal tokens travel unencrypted")
+		}
+		return nil
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.HTTPTLSCert, cfg.HTTPTLSKey)
+	if err != nil {
+		return fmt.Errorf("wire: load HTTP TLS certificate: %w", err)
+	}
+	srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+	slog.Info("HTTP API serves HTTPS only")
+	return nil
 }

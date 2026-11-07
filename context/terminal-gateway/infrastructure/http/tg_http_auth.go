@@ -9,9 +9,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/juantevez/go-posnet/pkg/domain"
@@ -19,9 +24,12 @@ import (
 )
 
 // TerminalTokens autentica a los terminales. El archivo solo guarda el SHA-256 de cada token: si
-// se filtra, no alcanza para entrar. Un terminal puede tener varios tokens, para rotarlos.
+// se filtra, no alcanza para entrar. Un terminal puede tener varios tokens, para rotarlos, y el
+// archivo se puede cambiar sin reiniciar el servicio.
 type TerminalTokens struct {
-	entries []terminalToken
+	path    string
+	entries atomic.Pointer[[]terminalToken]
+	raw     []byte // Último contenido leído; solo lo usa Run
 	now     func() time.Time
 }
 
@@ -46,7 +54,51 @@ func LoadTerminalTokens(path string) (*TerminalTokens, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse terminal tokens file: %w", err)
 	}
-	return &TerminalTokens{entries: entries, now: time.Now}, nil
+	t := &TerminalTokens{path: path, raw: raw, now: time.Now}
+	t.entries.Store(&entries)
+	return t, nil
+}
+
+// Reload vuelve a leer el archivo. Si falla, se conservan los tokens vigentes: un archivo a
+// medio escribir no debe dejar afuera a todos los terminales.
+func (t *TerminalTokens) Reload() (changed bool, err error) {
+	raw, err := os.ReadFile(t.path)
+	if err != nil {
+		return false, err
+	}
+	if bytes.Equal(raw, t.raw) {
+		return false, nil
+	}
+	entries, err := parseTerminalTokens(raw)
+	if err != nil {
+		return false, err
+	}
+	t.entries.Store(&entries)
+	t.raw = raw
+	return true, nil
+}
+
+// Run relee el archivo periódicamente hasta que termine ctx. Así, un token revocado deja de
+// valer en interval, sin reiniciar el servicio.
+func (t *TerminalTokens) Run(ctx context.Context, interval time.Duration) {
+	if t == nil {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			changed, err := t.Reload()
+			if err != nil {
+				slog.Error("terminal tokens file not reloaded — keeping the current tokens", slog.String("error", err.Error()))
+			} else if changed {
+				slog.Warn("terminal tokens reloaded", slog.Int("tokens", t.Count()))
+			}
+		}
+	}
 }
 
 func parseTerminalTokens(raw []byte) ([]terminalToken, error) {
@@ -94,7 +146,7 @@ func (t *TerminalTokens) Count() int {
 	if t == nil {
 		return 0
 	}
-	return len(t.entries)
+	return len(*t.entries.Load())
 }
 
 // Authenticate devuelve el terminal del token. Compara contra todas las entradas, sin cortar,
@@ -106,8 +158,9 @@ func (t *TerminalTokens) Authenticate(token string) (domain.TerminalID, bool) {
 		found domain.TerminalID
 		ok    bool
 	)
-	for i := range t.entries {
-		e := &t.entries[i]
+	entries := *t.entries.Load()
+	for i := range entries {
+		e := &entries[i]
 		if subtle.ConstantTimeCompare(got[:], e.hash[:]) == 1 && (e.expiresAt.IsZero() || now.Before(e.expiresAt)) {
 			found, ok = e.terminalID, true
 		}
@@ -124,28 +177,197 @@ func authenticatedTerminal(ctx context.Context) (domain.TerminalID, bool) {
 	return id, ok
 }
 
-// requireTerminal exige un token de terminal válido. Sin tokens configurados no exige nada.
-func (t *TerminalTokens) requireTerminal(next http.HandlerFunc) http.HandlerFunc {
-	if !t.Configured() {
+// TerminalAuth reúne lo que necesita la autenticación de los terminales.
+type TerminalAuth struct {
+	tokens *TerminalTokens
+	// trustedProxies son los proxies cuyo X-Forwarded-For se acepta. Sin esto, el encabezado se
+	// ignora: cualquiera podría declarar otra IP para evitar el límite de intentos.
+	trustedProxies []netip.Prefix
+	limiter        *authLimiter
+}
+
+// NewTerminalAuth arma la autenticación. Sin tokens devuelve nil, y la API queda abierta.
+func NewTerminalAuth(tokens *TerminalTokens, trustedProxies []netip.Prefix) *TerminalAuth {
+	if !tokens.Configured() {
+		return nil
+	}
+	return &TerminalAuth{tokens: tokens, trustedProxies: trustedProxies, limiter: newAuthLimiter()}
+}
+
+// requireTerminal exige un token de terminal válido. Sin autenticación configurada no exige nada.
+func (a *TerminalAuth) requireTerminal(next http.HandlerFunc) http.HandlerFunc {
+	if a == nil {
 		return next
 	}
 	return func(w http.ResponseWriter, r *http.Request) {
+		ip := a.clientIP(r)
+		log := observability.FromContext(r.Context()).With(
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.String("client_ip", ip.String()),
+		)
+		if remaining, blocked := a.limiter.blocked(ip); blocked {
+			log.Warn("rejected terminal request — too many failed attempts")
+			w.Header().Set("Retry-After", strconv.Itoa(int(remaining.Seconds())+1))
+			writeJSON(w, http.StatusTooManyRequests, errResp("TOO_MANY_ATTEMPTS", "too many failed attempts; try again later"))
+			return
+		}
+
 		token, hasBearer := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		var (
 			id domain.TerminalID
 			ok bool
 		)
 		if hasBearer && token != "" {
-			id, ok = t.Authenticate(token)
+			id, ok = a.tokens.Authenticate(token)
 		}
 		if !ok {
-			observability.FromContext(r.Context()).Warn("rejected terminal request",
-				slog.String("method", r.Method), slog.String("path", r.URL.Path))
+			// Sin token no es un intento de adivinarlo: no cuenta para el límite.
+			if hasBearer && token != "" {
+				a.limiter.fail(ip)
+			}
+			log.Warn("rejected terminal request")
 			w.Header().Set("WWW-Authenticate", `Bearer realm="terminal-gateway"`)
 			writeJSON(w, http.StatusUnauthorized, errResp("UNAUTHORIZED", "missing or invalid terminal token"))
 			return
 		}
+		a.limiter.succeed(ip)
 		next(w, r.WithContext(context.WithValue(r.Context(), terminalKey{}, id)))
+	}
+}
+
+// clientIP devuelve la IP del cliente: la de la conexión o, si viene de un proxy de confianza,
+// la última dirección de X-Forwarded-For que no sea otro proxy de confianza.
+func (a *TerminalAuth) clientIP(r *http.Request) netip.Addr {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return netip.IPv4Unspecified()
+	}
+	ip = ip.Unmap()
+	if !a.trusted(ip) {
+		return ip
+	}
+	hops := strings.Split(strings.Join(r.Header.Values("X-Forwarded-For"), ","), ",")
+	for i := len(hops) - 1; i >= 0; i-- {
+		hop, err := netip.ParseAddr(strings.TrimSpace(hops[i]))
+		if err != nil {
+			return ip
+		}
+		hop = hop.Unmap()
+		if !a.trusted(hop) {
+			return hop
+		}
+		ip = hop
+	}
+	return ip
+}
+
+func (a *TerminalAuth) trusted(ip netip.Addr) bool {
+	for _, p := range a.trustedProxies {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// ─── Límite de intentos ───────────────────────────────────────────────────────
+
+const (
+	authMaxFailures = 10
+	authWindow      = time.Minute
+	authBlock       = 5 * time.Minute
+	authMaxClients  = 10_000
+)
+
+type authClient struct {
+	failures     int
+	windowStart  time.Time
+	blockedUntil time.Time
+}
+
+// authLimiter frena los intentos fallidos por cliente. Vive en memoria, por instancia. Un
+// intento exitoso desde la misma IP borra los fallos: un terminal mal configurado no bloquea a
+// los demás de su local mientras alguno se autentique.
+type authLimiter struct {
+	mu      sync.Mutex
+	clients map[netip.Prefix]*authClient
+	now     func() time.Time
+}
+
+func newAuthLimiter() *authLimiter {
+	return &authLimiter{clients: map[netip.Prefix]*authClient{}, now: time.Now}
+}
+
+// clientKey agrupa IPv6 por /64: un solo host suele disponer de toda esa red.
+func clientKey(ip netip.Addr) netip.Prefix {
+	ip = ip.Unmap()
+	bits := 32
+	if ip.Is6() {
+		bits = 64
+	}
+	key, err := ip.Prefix(bits)
+	if err != nil {
+		return netip.PrefixFrom(ip, ip.BitLen())
+	}
+	return key
+}
+
+// blocked devuelve cuánto falta para que el cliente pueda volver a intentar.
+func (l *authLimiter) blocked(ip netip.Addr) (time.Duration, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	c, ok := l.clients[clientKey(ip)]
+	if !ok {
+		return 0, false
+	}
+	remaining := c.blockedUntil.Sub(l.now())
+	return remaining, remaining > 0
+}
+
+func (l *authLimiter) fail(ip netip.Addr) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	key := clientKey(ip)
+	c, ok := l.clients[key]
+	if !ok {
+		if len(l.clients) >= authMaxClients {
+			l.purge(now)
+		}
+		// Sin lugar, no se registra: el token sigue siendo imposible de adivinar, y frenar a
+		// todos por esto le daría a un atacante una forma de cortar el servicio.
+		if len(l.clients) >= authMaxClients {
+			return
+		}
+		c = &authClient{windowStart: now}
+		l.clients[key] = c
+	}
+	if now.Sub(c.windowStart) > authWindow {
+		c.failures, c.windowStart = 0, now
+	}
+	c.failures++
+	if c.failures >= authMaxFailures {
+		c.blockedUntil = now.Add(authBlock)
+		c.failures, c.windowStart = 0, now
+	}
+}
+
+func (l *authLimiter) succeed(ip netip.Addr) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.clients, clientKey(ip))
+}
+
+func (l *authLimiter) purge(now time.Time) {
+	for key, c := range l.clients {
+		if now.After(c.blockedUntil) && now.Sub(c.windowStart) > authWindow {
+			delete(l.clients, key)
+		}
 	}
 }
 

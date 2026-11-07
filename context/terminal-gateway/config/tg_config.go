@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -23,6 +24,15 @@ type Config struct {
 	// TerminalTokensFile es el archivo con los tokens de los terminales. Sin él, la API de
 	// terminales queda abierta, y el servicio solo arranca con ENVIRONMENT=development.
 	TerminalTokensFile string
+
+	// HTTPTLSCert y HTTPTLSKey habilitan HTTPS en HTTP_PORT. Van juntos.
+	HTTPTLSCert string
+	HTTPTLSKey  string
+	// HTTPTLSExternal declara que un proxy termina TLS. Fuera de desarrollo hace falta esto o
+	// HTTPTLSCert: si no, el servicio no arranca, porque los tokens viajarían sin cifrar.
+	HTTPTLSExternal bool
+	// TrustedProxies son los CIDR, separados por comas, cuyo X-Forwarded-For se acepta.
+	TrustedProxies string
 
 	// CORSAllowedOrigins son los orígenes desde los que un navegador puede llamar a la API.
 	// Vacío usa los del frontend de pago.
@@ -120,9 +130,45 @@ func Load() (*Config, error) {
 
 		CORSAllowedOrigins: envList("CORS_ALLOWED_ORIGINS"),
 		TerminalTokensFile: envStr("TERMINAL_TOKENS_FILE", ""),
+		HTTPTLSCert:        envStr("HTTP_TLS_CERT", ""),
+		HTTPTLSKey:         envStr("HTTP_TLS_KEY", ""),
+		HTTPTLSExternal:    envStr("HTTP_TLS_EXTERNAL", "") == "true",
+		TrustedProxies:     envStr("TRUSTED_PROXIES", ""),
 	}
 
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
+}
+
+func (c *Config) validate() error {
+	if (c.HTTPTLSCert == "") != (c.HTTPTLSKey == "") {
+		return fmt.Errorf("config: HTTP_TLS_CERT and HTTP_TLS_KEY must be set together")
+	}
+	if c.OTEL.Environment != "development" && c.HTTPTLSCert == "" && !c.HTTPTLSExternal {
+		return fmt.Errorf("config: ENVIRONMENT=%s requires HTTP_TLS_CERT or HTTP_TLS_EXTERNAL=true: terminal tokens would travel unencrypted", c.OTEL.Environment)
+	}
+	if _, err := c.TrustedProxyPrefixes(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// TrustedProxyPrefixes interpreta TRUSTED_PROXIES.
+func (c *Config) TrustedProxyPrefixes() ([]netip.Prefix, error) {
+	var prefixes []netip.Prefix
+	for _, part := range strings.Split(c.TrustedProxies, ",") {
+		if part = strings.TrimSpace(part); part == "" {
+			continue
+		}
+		prefix, err := netip.ParsePrefix(part)
+		if err != nil {
+			return nil, fmt.Errorf("config: TRUSTED_PROXIES %q is not a CIDR: %w", part, err)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
 }
 
 // envList lee una lista separada por comas, sin elementos vacíos.

@@ -23,7 +23,7 @@ import (
 type QRHandler struct {
 	sessionService port.SessionService
 	queryHandler   *query.SessionQueryHandler
-	tokens         *TerminalTokens // nil = sin autenticación, solo en desarrollo
+	auth           *TerminalAuth // nil = sin autenticación, solo en desarrollo
 }
 
 func NewQRHandler(
@@ -38,7 +38,7 @@ func NewQRHandler(
 
 // RegisterQRRoutes registra los endpoints en el mux existente.
 func (h *QRHandler) RegisterQRRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /api/sessions/create", h.tokens.requireTerminal(h.handleCreateQRSession))
+	mux.HandleFunc("POST /api/sessions/create", h.auth.requireTerminal(h.handleCreateQRSession))
 	// /pay y /status los usa el teléfono del cliente, que no tiene el token del terminal.
 	mux.HandleFunc("POST /api/sessions/{id}/pay", h.handleSimulatePay)
 	mux.HandleFunc("GET  /api/sessions/{id}/status", h.handleSessionStatus)
