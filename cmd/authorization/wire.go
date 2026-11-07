@@ -43,6 +43,10 @@ type app struct {
 	callTimeout    time.Duration
 	stopReconciler context.CancelFunc
 	reconcilerWG   sync.WaitGroup
+
+	invalidRetention time.Duration
+	stopPurge        context.CancelFunc
+	purgeWG          sync.WaitGroup
 }
 
 // wire construye el grafo de dependencias completo del BC Authorization.
@@ -159,6 +163,8 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		reconcileEvery: cfg.Acquirer.ReconcileEvery,
 		stuckAfter:     cfg.Acquirer.StuckAfter,
 		callTimeout:    acquirerTimeout,
+
+		invalidRetention: cfg.InvalidTransactionsRetention,
 	}, nil
 }
 
@@ -227,7 +233,54 @@ func (a *app) start(ctx context.Context) error {
 		slog.Warn("reconciler disabled — unresolved transactions will not be reversed")
 	}
 
+	if a.invalidRetention > 0 {
+		purgeCtx, stop := context.WithCancel(ctx)
+		a.stopPurge = stop
+		a.purgeWG.Add(1)
+		go func() {
+			defer a.purgeWG.Done()
+			a.runInvalidPurge(purgeCtx)
+		}()
+		slog.Info("invalid transactions purge active", slog.Duration("retention", a.invalidRetention))
+	} else {
+		slog.Warn("invalid transactions purge disabled — the table will grow without limit")
+	}
+
 	return nil
+}
+
+// invalidPurgeEvery es cada cuánto se purgan las transacciones inválidas. La retención se mide en
+// días, así que no hace falta más precisión.
+const invalidPurgeEvery = time.Hour
+
+// runInvalidPurge borra periódicamente el registro vencido de las transacciones inválidas. También
+// corre al arrancar, para no depender de que una instancia viva más que el intervalo. Si falla,
+// reintenta en la corrida siguiente: lo vencido sigue ahí.
+func (a *app) runInvalidPurge(ctx context.Context) {
+	run := func() {
+		deleted, err := a.authHandler.PurgeInvalidRejections(ctx, time.Now(), a.invalidRetention)
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.Error("invalid transactions purge failed", slog.String("error", err.Error()))
+			}
+			return
+		}
+		if deleted > 0 {
+			slog.Info("invalid transactions purged", slog.Int64("deleted", deleted))
+		}
+	}
+
+	run()
+	ticker := time.NewTicker(invalidPurgeEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 // runReconciler resuelve periódicamente las transacciones sin un resultado conocido. También
@@ -267,6 +320,10 @@ func (a *app) close() {
 	if a.stopReconciler != nil {
 		a.stopReconciler()
 		a.reconcilerWG.Wait()
+	}
+	if a.stopPurge != nil {
+		a.stopPurge()
+		a.purgeWG.Wait()
 	}
 
 	if a.httpSrv != nil {

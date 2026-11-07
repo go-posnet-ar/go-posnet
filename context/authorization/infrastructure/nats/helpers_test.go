@@ -74,6 +74,18 @@ func (f *fakeRepo) Save(_ context.Context, tx *aggregate.Transaction) error {
 	return f.saveErr
 }
 
+func (f *fakeRepo) SaveInvalidRejection(context.Context, valueobject.InvalidTransactionRejection) error {
+	return nil
+}
+
+func (f *fakeRepo) DeleteInvalidRejectionsBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (f *fakeRepo) FindInvalidRejection(context.Context, domain.TransactionID) (*valueobject.InvalidTransactionRejection, error) {
+	return nil, nil
+}
+
 func (f *fakeRepo) FindByID(_ context.Context, _ domain.TransactionID) (*aggregate.Transaction, error) {
 	return f.findResult, f.findErr
 }
@@ -163,7 +175,7 @@ func (f *fakeDomainPublisher) PublishRejected(_ context.Context, _ *aggregate.Tr
 	return nil
 }
 
-func (f *fakeDomainPublisher) PublishInvalidRejected(_ context.Context, _ service.InvalidTransactionRejection) error {
+func (f *fakeDomainPublisher) PublishInvalidRejected(_ context.Context, _ valueobject.InvalidTransactionRejection) error {
 	f.invalidRejectedCalls++
 	return f.invalidRejectedErr
 }

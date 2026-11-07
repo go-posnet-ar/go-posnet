@@ -3,8 +3,10 @@ package command_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/pashagolub/pgxmock/v4"
@@ -105,28 +107,63 @@ func TestAuthorizeTransaction_InvalidDataPublishesRejection(t *testing.T) {
 	if publisher.fraudCheckCalls != 0 {
 		t.Errorf("PublishFraudCheckRequested calls = %d, want 0", publisher.fraudCheckCalls)
 	}
+	if len(repo.invalidSaved) != 1 || repo.invalidSaved[0].ValidationError != err.Error() {
+		t.Errorf("registros = %+v, want uno con el motivo %q", repo.invalidSaved, err.Error())
+	}
+}
+
+// Si no se puede registrar, la sesión igual tiene que enterarse del rechazo.
+func TestAuthorizeTransaction_InvalidDataRecordFailureStillPublishes(t *testing.T) {
+	cmd := validAuthorizeCmd(t)
+	cmd.CardNetwork = "BOGUS"
+	publisher := &fakePublisher{}
+
+	err := newInvalidDataHandler(&fakeRepo{invalidErr: errors.New("db down")}, publisher).
+		AuthorizeTransaction(context.Background(), cmd)
+
+	var ve *pkgerrors.ValidationError
+	if !errors.As(err, &ve) {
+		t.Errorf("error = %v, want a ValidationError", err)
+	}
+	if len(publisher.invalidRejections) != 1 {
+		t.Errorf("rechazos publicados = %d, want 1", len(publisher.invalidRejections))
+	}
 }
 
 // card_last4 lo envía el cliente sin validar: un PAN completo no puede salir por el evento
 // ni quedar en el error que se loguea.
-func TestAuthorizeTransaction_InvalidCardLast4IsNotForwarded(t *testing.T) {
+func TestAuthorizeTransaction_InvalidCardDataIsNotForwarded(t *testing.T) {
 	const pan = "4111111111111111"
-	cmd := validAuthorizeCmd(t)
-	cmd.CardLast4 = pan
-	publisher := &fakePublisher{}
+	tests := []struct {
+		name   string
+		mutate func(*port.AuthorizeTransactionCommand)
+	}{
+		{"en card_last4", func(c *port.AuthorizeTransactionCommand) { c.CardLast4 = pan }},
+		{"en card_network", func(c *port.AuthorizeTransactionCommand) { c.CardNetwork = pan }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := validAuthorizeCmd(t)
+			tc.mutate(&cmd)
+			repo := &fakeRepo{}
+			publisher := &fakePublisher{}
 
-	err := newInvalidDataHandler(&fakeRepo{}, publisher).AuthorizeTransaction(context.Background(), cmd)
-	if err == nil {
-		t.Fatal("AuthorizeTransaction() error = nil, want a validation error")
-	}
-	if strings.Contains(err.Error(), pan) {
-		t.Errorf("error = %q: no debe incluir card_last4", err.Error())
-	}
-	if len(publisher.invalidRejections) != 1 {
-		t.Fatalf("rechazos publicados = %d, want 1", len(publisher.invalidRejections))
-	}
-	if got := publisher.invalidRejections[0].CardLast4; got != "" {
-		t.Errorf("CardLast4 = %q, want vacío", got)
+			err := newInvalidDataHandler(repo, publisher).AuthorizeTransaction(context.Background(), cmd)
+			if err == nil {
+				t.Fatal("AuthorizeTransaction() error = nil, want a validation error")
+			}
+			if strings.Contains(err.Error(), pan) {
+				t.Errorf("error = %q: no debe incluir el dato de tarjeta", err.Error())
+			}
+			if len(publisher.invalidRejections) != 1 || len(repo.invalidSaved) != 1 {
+				t.Fatalf("publicados = %d, registrados = %d, want 1 y 1", len(publisher.invalidRejections), len(repo.invalidSaved))
+			}
+			for _, r := range []valueobject.InvalidTransactionRejection{publisher.invalidRejections[0], repo.invalidSaved[0]} {
+				if strings.Contains(fmt.Sprintf("%+v", r), pan) {
+					t.Errorf("rechazo = %+v: no debe incluir el dato de tarjeta", r)
+				}
+			}
+		})
 	}
 }
 
@@ -182,6 +219,28 @@ func TestAuthorizeTransaction_InvalidDataTransientErrorsAreRetried(t *testing.T)
 				t.Errorf("error = %v, want %v y que no sea de validación", err, boom)
 			}
 		})
+	}
+}
+
+func TestPurgeInvalidRejections(t *testing.T) {
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	repo := &fakeRepo{purgeDeleted: 3}
+
+	deleted, err := newInvalidDataHandler(repo, &fakePublisher{}).PurgeInvalidRejections(context.Background(), now, 24*time.Hour)
+	if err != nil || deleted != 3 {
+		t.Fatalf("PurgeInvalidRejections() = %d, %v, want 3, nil", deleted, err)
+	}
+	if want := now.Add(-24 * time.Hour); !repo.purgeCutoff.Equal(want) {
+		t.Errorf("cutoff = %v, want %v", repo.purgeCutoff, want)
+	}
+}
+
+func TestPurgeInvalidRejections_Error(t *testing.T) {
+	boom := errors.New("boom")
+	h := newInvalidDataHandler(&fakeRepo{purgeErr: boom}, &fakePublisher{})
+
+	if _, err := h.PurgeInvalidRejections(context.Background(), time.Now(), time.Hour); !errors.Is(err, boom) {
+		t.Errorf("error = %v, want %v", err, boom)
 	}
 }
 

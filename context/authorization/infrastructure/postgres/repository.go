@@ -138,6 +138,70 @@ func (r *TransactionRepo) InsertTx(ctx context.Context, dbTx pgx.Tx, tx *aggrega
 	return tag.RowsAffected() == 1, nil
 }
 
+// SaveInvalidRejection registra el rechazo de una transacción con datos inválidos. Un reintento
+// del mismo mensaje no lo duplica.
+func (r *TransactionRepo) SaveInvalidRejection(ctx context.Context, rejection valueobject.InvalidTransactionRejection) error {
+	const query = `
+		INSERT INTO pn_authorization.invalid_transactions (
+			transaction_id, terminal_id, merchant_id,
+			amount_cents, currency,
+			rejection_code, validation_error, rejected_at
+		) VALUES (
+			$1, NULLIF($2, '')::uuid, NULLIF($3, '')::uuid,
+			$4, NULLIF($5, ''),
+			$6, $7, $8
+		)
+		ON CONFLICT (transaction_id) DO NOTHING
+	`
+	_, err := r.pool.Exec(ctx, query,
+		rejection.TransactionID.String(), rejection.TerminalID, rejection.MerchantID,
+		rejection.AmountCents, rejection.Currency,
+		rejection.Rejection.Code(), rejection.ValidationError, rejection.RejectedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("TransactionRepo.SaveInvalidRejection: %w", err)
+	}
+	return nil
+}
+
+// FindInvalidRejection recupera el rechazo de una transacción con datos inválidos, o nil.
+func (r *TransactionRepo) FindInvalidRejection(ctx context.Context, id domain.TransactionID) (*valueobject.InvalidTransactionRejection, error) {
+	const query = `
+		SELECT
+			COALESCE(terminal_id::text, ''), COALESCE(merchant_id::text, ''),
+			amount_cents, COALESCE(currency, ''),
+			rejection_code, validation_error, rejected_at
+		FROM pn_authorization.invalid_transactions
+		WHERE transaction_id = $1
+	`
+	rejection := valueobject.InvalidTransactionRejection{TransactionID: id}
+	var code string
+	err := r.pool.QueryRow(ctx, query, id.String()).Scan(
+		&rejection.TerminalID, &rejection.MerchantID,
+		&rejection.AmountCents, &rejection.Currency,
+		&code, &rejection.ValidationError, &rejection.RejectedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("TransactionRepo.FindInvalidRejection: %w", err)
+	}
+	rejection.Rejection = valueobject.NewRejectionFromValidation(code)
+	return &rejection, nil
+}
+
+// DeleteInvalidRejectionsBefore purga los rechazos por datos inválidos anteriores a cutoff. Varias
+// instancias pueden correrlo a la vez: lo que una borra, la otra no lo encuentra.
+func (r *TransactionRepo) DeleteInvalidRejectionsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	const query = `DELETE FROM pn_authorization.invalid_transactions WHERE rejected_at < $1`
+	tag, err := r.pool.Exec(ctx, query, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("TransactionRepo.DeleteInvalidRejectionsBefore: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // fraudRulesJSON serializa las reglas activadas para la columna JSONB. Sin decisión de fraude
 // devuelve nil, que se guarda como NULL.
 func fraudRulesJSON(tx *aggregate.Transaction) ([]byte, error) {
@@ -324,6 +388,7 @@ var (
 		"pn_authorization.transactions",
 		"pn_authorization.processed_events",
 		"pn_authorization.blocked_cards",
+		"pn_authorization.invalid_transactions",
 	}
 	requiredColumns = []string{"card_token", "processing_started_at", "reversal_requested_at"}
 )

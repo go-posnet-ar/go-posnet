@@ -223,7 +223,8 @@ func (h *AuthorizationHandler) AuthorizeTransaction(ctx context.Context, cmd por
 }
 
 // newTransactionFromCommand valida el comando y crea el aggregate. Todos sus errores son de
-// validación. No incluye card_last4 en el mensaje, porque podría traer un PAN completo.
+// validación. El mensaje se loguea y se guarda, así que no incluye los datos de tarjeta que
+// envía el cliente: card_last4 podría traer un PAN completo, y card_network es texto libre.
 func newTransactionFromCommand(cmd port.AuthorizeTransactionCommand) (*aggregate.Transaction, error) {
 	txID, err := domain.ParseTransactionID(cmd.TransactionID)
 	if err != nil {
@@ -251,7 +252,7 @@ func newTransactionFromCommand(cmd port.AuthorizeTransactionCommand) (*aggregate
 	}
 	network, err := domain.ParseCardNetwork(cmd.CardNetwork)
 	if err != nil {
-		return nil, pkgerrors.NewValidationError("invalid card_network: " + err.Error())
+		return nil, pkgerrors.NewValidationError("invalid card_network: unknown value")
 	}
 	pan, err := domain.NewPAN(cmd.CardLast4, network)
 	if err != nil {
@@ -278,7 +279,9 @@ func newTransactionFromCommand(cmd port.AuthorizeTransactionCommand) (*aggregate
 }
 
 // rejectInvalid avisa del rechazo de una transacción con datos inválidos, para que su sesión
-// no quede en PROCESSING. No la guarda: sus datos no cumplen las invariantes del aggregate.
+// no quede en PROCESSING. Sus datos no cumplen las invariantes del aggregate, así que no entra
+// en transactions: se registra aparte, para que una consulta no la confunda con un ID que nunca
+// llegó.
 //
 // Devuelve cause para que el mensaje se descarte, salvo un error transitorio, que se reintenta
 // antes de descartarlo. Sin un transaction_id válido no hay a quién avisar, y si esa
@@ -302,7 +305,12 @@ func (h *AuthorizationHandler) rejectInvalid(
 		return cause
 	}
 
-	rejection := newInvalidRejection(cmd, txID)
+	rejection := newInvalidRejection(cmd, txID, cause)
+	// Sin este registro, el rechazo sigue siendo válido: lo importante es que la sesión se entere.
+	if err := h.repo.SaveInvalidRejection(ctx, rejection); err != nil {
+		observability.RecordError(ctx, err)
+		log.Error("could not record the invalid transaction", slog.String("error", err.Error()))
+	}
 	if err := h.publisher.PublishInvalidRejected(ctx, rejection); err != nil {
 		return fmt.Errorf("rejectInvalid: publish: %w", err)
 	}
@@ -312,11 +320,23 @@ func (h *AuthorizationHandler) rejectInvalid(
 	return cause
 }
 
+// PurgeInvalidRejections borra el registro de las transacciones inválidas más antiguas que
+// retention, y devuelve cuántos borró. Una consulta posterior por esos IDs responde NotFound.
+func (h *AuthorizationHandler) PurgeInvalidRejections(ctx context.Context, now time.Time, retention time.Duration) (int64, error) {
+	deleted, err := h.repo.DeleteInvalidRejectionsBefore(ctx, now.Add(-retention))
+	if err != nil {
+		return 0, fmt.Errorf("PurgeInvalidRejections: %w", err)
+	}
+	return deleted, nil
+}
+
 // newInvalidRejection arma el rechazo solo con los campos del comando que son válidos.
-func newInvalidRejection(cmd port.AuthorizeTransactionCommand, txID domain.TransactionID) service.InvalidTransactionRejection {
-	r := service.InvalidTransactionRejection{
-		TransactionID: txID,
-		Rejection:     valueobject.NewRejectionFromValidation(valueobject.CodeInvalidData),
+func newInvalidRejection(cmd port.AuthorizeTransactionCommand, txID domain.TransactionID, cause error) valueobject.InvalidTransactionRejection {
+	r := valueobject.InvalidTransactionRejection{
+		TransactionID:   txID,
+		Rejection:       valueobject.NewRejectionFromValidation(valueobject.CodeInvalidData),
+		ValidationError: cause.Error(),
+		RejectedAt:      time.Now().UTC(),
 	}
 	if id, err := domain.ParseTerminalID(cmd.TerminalID); err == nil {
 		r.TerminalID = id.String()

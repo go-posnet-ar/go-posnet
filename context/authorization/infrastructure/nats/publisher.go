@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
-	"github.com/juantevez/go-posnet/context/authorization/domain/service"
+	"github.com/juantevez/go-posnet/context/authorization/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	"github.com/juantevez/go-posnet/pkg/events"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
@@ -106,7 +106,7 @@ func (p *EventPublisher) PublishRejected(ctx context.Context, tx *aggregate.Tran
 
 // PublishInvalidRejected publica AuthorizationRejectedPayload para una transacción con datos
 // inválidos. Consumidores: Terminal Gateway, Notification.
-func (p *EventPublisher) PublishInvalidRejected(ctx context.Context, r service.InvalidTransactionRejection) error {
+func (p *EventPublisher) PublishInvalidRejected(ctx context.Context, r valueobject.InvalidTransactionRejection) error {
 	payload := events.AuthorizationRejectedPayload{
 		TransactionID:   r.TransactionID.String(),
 		TerminalID:      r.TerminalID,
@@ -121,7 +121,7 @@ func (p *EventPublisher) PublishInvalidRejected(ctx context.Context, r service.I
 		CardLast4:       r.CardLast4,
 		CardNetwork:     r.CardNetwork,
 		EntryMode:       r.EntryMode,
-		RejectedAt:      time.Now().UTC().Format(time.RFC3339),
+		RejectedAt:      r.RejectedAt.UTC().Format(time.RFC3339),
 	}
 
 	_, err := p.pub.Publish(ctx,

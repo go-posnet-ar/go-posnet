@@ -34,6 +34,13 @@ type fakeRepo struct {
 	alreadyExists bool
 	existsErr     error
 
+	invalidSaved []valueobject.InvalidTransactionRejection
+	invalidErr   error
+
+	purgeCutoff  time.Time
+	purgeDeleted int64
+	purgeErr     error
+
 	// claimErr, claimLost y claimed corresponden al guardado junto con el evento (SaveIfStateTx).
 	claimErr  error
 	claimLost bool
@@ -121,6 +128,23 @@ func (f *fakeRepo) InsertTx(_ context.Context, _ pgx.Tx, tx *aggregate.Transacti
 	return true, nil
 }
 
+func (f *fakeRepo) SaveInvalidRejection(_ context.Context, r valueobject.InvalidTransactionRejection) error {
+	if f.invalidErr != nil {
+		return f.invalidErr
+	}
+	f.invalidSaved = append(f.invalidSaved, r)
+	return nil
+}
+
+func (f *fakeRepo) DeleteInvalidRejectionsBefore(_ context.Context, cutoff time.Time) (int64, error) {
+	f.purgeCutoff = cutoff
+	return f.purgeDeleted, f.purgeErr
+}
+
+func (f *fakeRepo) FindInvalidRejection(context.Context, domain.TransactionID) (*valueobject.InvalidTransactionRejection, error) {
+	return nil, nil
+}
+
 func (f *fakeRepo) FindByID(_ context.Context, _ domain.TransactionID) (*aggregate.Transaction, error) {
 	return f.findResult, f.findErr
 }
@@ -202,7 +226,7 @@ type fakePublisher struct {
 	rejectedCalls int
 	rejectedErr   error
 
-	invalidRejections []service.InvalidTransactionRejection
+	invalidRejections []valueobject.InvalidTransactionRejection
 	invalidErr        error
 
 	fraudCheckCalls int
@@ -224,7 +248,7 @@ func (f *fakePublisher) PublishRejected(_ context.Context, _ *aggregate.Transact
 	return f.rejectedErr
 }
 
-func (f *fakePublisher) PublishInvalidRejected(_ context.Context, r service.InvalidTransactionRejection) error {
+func (f *fakePublisher) PublishInvalidRejected(_ context.Context, r valueobject.InvalidTransactionRejection) error {
 	if f.invalidErr != nil {
 		return f.invalidErr
 	}

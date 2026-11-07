@@ -19,6 +19,9 @@ import (
 // ─── fakeRepo ──────────────────────────────────────────────────────────────
 
 type fakeRepo struct {
+	invalidResult *valueobject.InvalidTransactionRejection
+	invalidErr    error
+
 	findResult *aggregate.Transaction
 	findErr    error
 }
@@ -41,6 +44,18 @@ func (f *fakeRepo) UpdateState(_ context.Context, _ domain.TransactionID, _ valu
 
 func (f *fakeRepo) ExistsByID(_ context.Context, _ domain.TransactionID) (bool, error) {
 	return false, nil
+}
+
+func (f *fakeRepo) SaveInvalidRejection(context.Context, valueobject.InvalidTransactionRejection) error {
+	return nil
+}
+
+func (f *fakeRepo) DeleteInvalidRejectionsBefore(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
+
+func (f *fakeRepo) FindInvalidRejection(context.Context, domain.TransactionID) (*valueobject.InvalidTransactionRejection, error) {
+	return f.invalidResult, f.invalidErr
 }
 
 func (f *fakeRepo) InsertTx(ctx context.Context, _ pgx.Tx, tx *aggregate.Transaction) (bool, error) {
@@ -334,5 +349,60 @@ func TestGetTransactionStatus_RejectedWithoutRejectedAt(t *testing.T) {
 	}
 	if result.RejectedAt != "" {
 		t.Errorf("RejectedAt = %q, want empty when the aggregate has no RejectedAt", result.RejectedAt)
+	}
+}
+
+func TestGetTransactionStatus_InvalidTransactionReadsAsRejected(t *testing.T) {
+	id := domain.NewTransactionID()
+	rejectedAt := time.Date(2026, 11, 6, 15, 0, 4, 0, time.UTC)
+	repo := &fakeRepo{
+		findErr: pkgerrors.NewNotFoundError("Transaction", id.String()),
+		invalidResult: &valueobject.InvalidTransactionRejection{
+			TransactionID:   id,
+			AmountCents:     5000,
+			Currency:        "ARS",
+			Rejection:       valueobject.NewRejectionFromValidation(valueobject.CodeInvalidData),
+			ValidationError: "invalid card_network: unknown value",
+			RejectedAt:      rejectedAt,
+		},
+	}
+
+	got, err := query.NewTransactionQueryHandler(repo).GetTransactionStatus(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetTransactionStatus() error = %v", err)
+	}
+	if got.State != "REJECTED" || got.RejectionCode != valueobject.CodeInvalidData ||
+		got.AmountCents != 5000 || got.RejectedAt != "2026-11-06T15:00:04Z" {
+		t.Errorf("result = %+v", got)
+	}
+	if strings.Contains(got.RejectionReason, "card_network") {
+		t.Errorf("RejectionReason = %q: el motivo exacto no se expone", got.RejectionReason)
+	}
+}
+
+func TestGetTransactionStatus_UnknownIDIsNotFound(t *testing.T) {
+	id := domain.NewTransactionID()
+	repo := &fakeRepo{findErr: pkgerrors.NewNotFoundError("Transaction", id.String())}
+
+	_, err := query.NewTransactionQueryHandler(repo).GetTransactionStatus(context.Background(), id)
+
+	var notFound *pkgerrors.NotFoundError
+	if !errors.As(err, &notFound) {
+		t.Errorf("error = %v, want NotFoundError", err)
+	}
+}
+
+func TestGetTransactionStatus_InvalidLookupErrorIsNotNotFound(t *testing.T) {
+	id := domain.NewTransactionID()
+	repo := &fakeRepo{
+		findErr:    pkgerrors.NewNotFoundError("Transaction", id.String()),
+		invalidErr: errors.New("db down"),
+	}
+
+	_, err := query.NewTransactionQueryHandler(repo).GetTransactionStatus(context.Background(), id)
+
+	var notFound *pkgerrors.NotFoundError
+	if err == nil || errors.As(err, &notFound) {
+		t.Errorf("error = %v, want a non-NotFound error", err)
 	}
 }

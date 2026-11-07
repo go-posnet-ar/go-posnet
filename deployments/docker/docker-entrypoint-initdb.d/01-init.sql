@@ -70,6 +70,19 @@ CREATE TABLE IF NOT EXISTS pn_authorization.blocked_cards (
     blocked_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Transacciones rechazadas por datos inválidos. Solo guarda valores validados: nunca el payload
+-- original, porque card_last4 llega sin validar y podría traer un PAN completo.
+CREATE TABLE IF NOT EXISTS pn_authorization.invalid_transactions (
+    transaction_id    UUID        PRIMARY KEY,
+    terminal_id       UUID,
+    merchant_id       UUID,
+    amount_cents      BIGINT      NOT NULL DEFAULT 0,
+    currency          CHAR(3),
+    rejection_code    VARCHAR(20) NOT NULL,
+    validation_error  TEXT        NOT NULL,
+    rejected_at       TIMESTAMPTZ NOT NULL
+);
+
 -- terminal_gateway
 CREATE TABLE IF NOT EXISTS terminal_gateway.terminals (
     id              UUID        PRIMARY KEY,

@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/juantevez/go-posnet/context/authorization/application/port"
@@ -31,11 +32,12 @@ func (h *TransactionQueryHandler) GetTransactionStatus(
 	defer span.End()
 
 	tx, err := h.repo.FindByID(ctx, id)
-	if err != nil {
+	var notFound *pkgerrors.NotFoundError
+	if err != nil && !errors.As(err, &notFound) {
 		return nil, fmt.Errorf("GetTransactionStatus: %w", err)
 	}
 	if tx == nil {
-		return nil, pkgerrors.NewNotFoundError("Transaction", id.String())
+		return h.invalidRejectionStatus(ctx, id)
 	}
 
 	result := &port.TransactionStatusResult{
@@ -65,4 +67,25 @@ func (h *TransactionQueryHandler) GetTransactionStatus(
 	}
 
 	return result, nil
+}
+
+// invalidRejectionStatus responde por una transacción que no existe como aggregate: la rechazada
+// por datos inválidos. El motivo exacto queda para auditoría: esta API no tiene autenticación.
+func (h *TransactionQueryHandler) invalidRejectionStatus(ctx context.Context, id domain.TransactionID) (*port.TransactionStatusResult, error) {
+	rejection, err := h.repo.FindInvalidRejection(ctx, id)
+	if err != nil {
+		return nil, fmt.Errorf("GetTransactionStatus: %w", err)
+	}
+	if rejection == nil {
+		return nil, pkgerrors.NewNotFoundError("Transaction", id.String())
+	}
+	return &port.TransactionStatusResult{
+		TransactionID:   id.String(),
+		State:           valueobject.StateRejected.String(),
+		AmountCents:     rejection.AmountCents,
+		Currency:        rejection.Currency,
+		RejectionCode:   rejection.Rejection.Code(),
+		RejectionReason: rejection.Rejection.Description(),
+		RejectedAt:      rejection.RejectedAt.UTC().Format("2006-01-02T15:04:05Z"),
+	}, nil
 }

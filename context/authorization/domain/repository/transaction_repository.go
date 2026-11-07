@@ -23,6 +23,17 @@ type TransactionRepository interface {
 	// devuelve false.
 	InsertTx(ctx context.Context, dbTx pgx.Tx, tx *aggregate.Transaction) (bool, error)
 
+	// SaveInvalidRejection registra el rechazo de una transacción con datos inválidos. Si ya
+	// está registrado, no cambia nada.
+	SaveInvalidRejection(ctx context.Context, rejection valueobject.InvalidTransactionRejection) error
+
+	// FindInvalidRejection recupera ese registro. Devuelve nil si no existe.
+	FindInvalidRejection(ctx context.Context, id domain.TransactionID) (*valueobject.InvalidTransactionRejection, error)
+
+	// DeleteInvalidRejectionsBefore borra esos registros, si son anteriores a cutoff, y devuelve
+	// cuántos borró.
+	DeleteInvalidRejectionsBefore(ctx context.Context, cutoff time.Time) (int64, error)
+
 	// FindByID recupera una Transaction por su ID.
 	// Retorna ErrNotFound si no existe.
 	FindByID(ctx context.Context, id domain.TransactionID) (*aggregate.Transaction, error)

@@ -2,6 +2,7 @@ package valueobject
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
@@ -168,6 +169,26 @@ func (r RejectionCode) IsRetryable() bool {
 
 func (r RejectionCode) String() string {
 	return fmt.Sprintf("%s(%s)", r.source, r.code)
+}
+
+// ─── InvalidTransactionRejection ─────────────────────────────────────────────
+
+// InvalidTransactionRejection es el rechazo de una transacción con datos inválidos, que no
+// existe como aggregate. Solo lleva los valores que pasaron la validación: los demás quedan
+// vacíos o en cero. Lo que no se validó no se publica ni se guarda, porque card_last4 podría
+// traer un PAN completo.
+type InvalidTransactionRejection struct {
+	TransactionID   domain.TransactionID
+	TerminalID      string
+	MerchantID      string
+	AmountCents     int64
+	Currency        string
+	CardLast4       string
+	CardNetwork     string
+	EntryMode       string
+	Rejection       RejectionCode
+	ValidationError string // Qué falló. Es para auditoría: no se publica
+	RejectedAt      time.Time
 }
 
 // ─── FraudDecision ───────────────────────────────────────────────────────────

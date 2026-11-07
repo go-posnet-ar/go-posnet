@@ -137,7 +137,7 @@ respuesta tardía del adquirente no pisa lo que ya resolvió el conciliador.
 | `BLOCKLIST` | `CARD_BLOCKED` | La tarjeta está en la blocklist | Sí |
 | `ACQUIRER` | ISO 8583 (`05`, `51`, etc.) | El emisor rechazó | Solo `04`, `41` y `43` |
 | `VALIDATION` | `UNKNOWN_RESPONSE` | El adquirente respondió sin código | No |
-| `VALIDATION` | `INVALID_DATA` | `transaction.received` trae datos inválidos. No se guarda: ver [§5.5](#55-qué-pasa-cuando-falla-cada-paso) | No |
+| `VALIDATION` | `INVALID_DATA` | `transaction.received` trae datos inválidos. Se registra aparte: ver [§5.5](#55-qué-pasa-cuando-falla-cada-paso) | No |
 | `TIMEOUT` | `TIMEOUT` | Definido, pero ningún flujo lo genera | No |
 
 Solo los códigos `91` y `96` se publican con `is_retryable=true`. La retención se decide por la
@@ -217,7 +217,8 @@ descuenta. **Terminal Gateway no se entera:** ya respondió `202` e ignora este 
 
 | Fallo | Resultado | ¿Se recupera solo? |
 |---|---|---|
-| `transaction.received` con datos inválidos | Publica `auth.rejected` con `INVALID_DATA` y `Term`; no se guarda | **Sí**: la sesión pasa a rechazada |
+| `transaction.received` con datos inválidos | Publica `auth.rejected` con `INVALID_DATA`, lo registra en `invalid_transactions` y `Term` | **Sí**: la sesión pasa a rechazada |
+| Ídem, y falla ese registro | Se loguea, y el rechazo se publica igual. La consulta responde `404` | La sesión, sí. El registro, no |
 | Ídem, sin un `transaction_id` válido o con uno que ya existe | `Term`; no se publica nada | No hace falta: no hay sesión a la que avisar, o vale la transacción original |
 | Ídem, y falla la consulta o la publicación del rechazo | `Nak` y reintento. Al agotar las entregas, se pierde | **Sí**, si se recupera antes |
 | Error de base de datos antes de marcar el evento | `Nak` y reintento | **Sí** |
@@ -234,9 +235,16 @@ descuenta. **Terminal Gateway no se entera:** ya respondió `202` e ignora este 
 | Falla la publicación del resultado | Se registra y se confirma; la base queda correcta, pero nadie se entera | No |
 
 El rechazo por `INVALID_DATA` solo lleva los campos que pasaron la validación; los demás van vacíos o en cero. Un
-`card_last4` inválido tampoco se loguea, porque podría traer un PAN completo. Como no hay una fila,
-`GET /transactions/{id}` responde `404`. Notification descarta el evento si el comercio no es válido o el monto no es
-positivo, pero Terminal Gateway solo necesita el `transaction_id`.
+`card_last4` o `card_network` inválido tampoco se loguea ni se guarda, porque podría traer un PAN completo.
+
+No entran en `transactions`, porque no cumplen sus restricciones y Fraud Detection lee esa tabla. `GET /transactions/{id}` y
+`GetTransactionStatus` las informan como `REJECTED`. Un `404` significa que el ID nunca llegó, que no se pudo registrar o
+que su registro [ya venció](#retención-de-transacciones-inválidas).
+El motivo exacto solo está en `validation_error`, porque esas APIs no tienen autenticación.
+
+Notification descarta el evento si el comercio no es válido o el monto no es positivo, con un `ERROR` y
+`posnet_nats_messages_failed_total`. Terminal Gateway no depende de eso: solo necesita el `transaction_id`. En el flujo de
+`/pay` no ocurre, porque esos campos salen de la sesión y el cliente solo envía los de tarjeta.
 
 En los casos sin resultado publicado, Terminal Gateway mantiene la sesión en `PROCESSING` hasta
 que su job de limpieza la borra.
@@ -411,6 +419,7 @@ usa el schema `authorization` y no incluye la blocklist.
 | `transactions` | Transacciones | PK `id`; índice parcial en `card_token` |
 | `processed_events` | Idempotencia de eventos | PK `event_id` |
 | `blocked_cards` | Blocklist | PK `card_token`; sin FK, para sobrevivir a purgas de transacciones |
+| `invalid_transactions` | Rechazos por datos inválidos. Solo valores validados, nunca el payload original | PK `transaction_id` |
 
 ### Aplicar la migración de conciliación
 
@@ -427,6 +436,28 @@ Son idempotentes. **Al arrancar, el conciliador revierte en el adquirente las `I
 adquirente real conectado, revisalas antes. `000002_processing_started_at.down.sql` la revierte: falla sin cambiar nada si
 hay transacciones en `PROCESSING` o `INDETERMINATE`, y exige volver antes a la versión anterior del servicio.
 `000003_reversal_requested_at.down.sql` exige lo mismo, y falla si hay reversas pendientes.
+
+### Aplicar la migración de transacciones inválidas
+
+**Una base existente necesita `000004` antes de desplegar esta versión.** Sin ella, las ventas válidas funcionan, pero
+`/readyz` responde `503`, Docker marca el contenedor `unhealthy`, y `GET /transactions/{id}` responde `500` con un ID
+desconocido. Se puede aplicar con el servicio anterior en marcha:
+
+```bash
+psql "$POSTGRES_DSN" -f migrations/pn_authorization/000004_invalid_transactions.up.sql
+```
+
+Es idempotente. `000004_invalid_transactions.down.sql` borra ese registro, que no se puede reconstruir, y exige volver antes
+a la versión anterior del servicio.
+
+### Retención de transacciones inválidas
+
+`invalid_transactions` sirve para soporte e incidentes de integración, no para analítica. Al arrancar y cada hora, el
+servicio borra lo que supera `INVALID_TRANSACTIONS_RETENTION`, 90 días por defecto. Si la purga falla, queda un `ERROR` en el
+log y reintenta en la corrida siguiente. Con varias instancias, cada una la corre por su cuenta, sin efectos entre ellas.
+
+Después de ese plazo, `GET /transactions/{id}` vuelve a responder `404`. Para conservar los datos más tiempo, hay que
+exportarlos antes o aumentar la variable.
 
 ### Aplicar la migración de blocklist
 
@@ -453,7 +484,7 @@ entorno con datos reales, exportarlos antes de ejecutarlo.
 
 ### Apagado
 
-Ante `SIGINT` o `SIGTERM`: detiene HTTP (hasta 10 s) y el conciliador, drena y cierra NATS, espera las llamadas al
+Ante `SIGINT` o `SIGTERM`: detiene el conciliador, la purga y HTTP (hasta 10 s), drena y cierra NATS, espera las llamadas al
 adquirente en curso, hasta su timeout más 5 s, y cierra el pool de Postgres. Lo que no termine a tiempo lo retoma el
 conciliador. El servidor gRPC no se detiene de forma ordenada.
 
@@ -527,6 +558,7 @@ métrica cuenta las publicaciones fallidas.
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel-collector:4317` | Sí |
 | `ENVIRONMENT` | `development` | Sí |
 | `GRPC_PORT` | `9090` | **No**: el puerto está fijo en 9090 |
+| `INVALID_TRANSACTIONS_RETENTION` | `2160h` (90 días) | Sí; cuánto se conservan las [transacciones inválidas](#retención-de-transacciones-inválidas), y `0` desactiva la purga. Va en horas: con un valor como `30d`, o negativo, el servicio no arranca |
 | `ACQUIRER_RECONCILE_EVERY` | `30s` | Sí; cada cuánto corre el conciliador, y `0` lo desactiva. Docker Compose usa `2s`. Si es negativo, el servicio no arranca |
 | `ACQUIRER_STUCK_AFTER` | `2m` | Sí; Docker Compose usa `10s`. Cuánto puede seguir una transacción en `PROCESSING`. Si no supera `ACQUIRER_TIMEOUT_SECONDS`, el servicio no arranca: revertiría llamadas en curso |
 | `ACQUIRER_MODE` | `mock` | Sí; `mock` o `iso8583`. Docker Compose usa `iso8583`. Con otro valor, o con `iso8583` y `ENVIRONMENT=production`, el servicio no arranca |

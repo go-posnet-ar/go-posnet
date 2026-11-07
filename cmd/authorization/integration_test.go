@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -29,11 +30,13 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	authquery "github.com/juantevez/go-posnet/context/authorization/application/query"
 	"github.com/juantevez/go-posnet/context/authorization/config"
 	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/authorization/domain/valueobject"
 	authpostgres "github.com/juantevez/go-posnet/context/authorization/infrastructure/postgres"
 	"github.com/juantevez/go-posnet/pkg/domain"
+	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
 	"github.com/juantevez/go-posnet/pkg/events"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 	natsclient "github.com/nats-io/nats.go"
@@ -182,6 +185,36 @@ func TestIntegration_TransactionRepo(t *testing.T) {
 		})
 		return created, err
 	}
+
+	t.Run("la purga solo borra los rechazos vencidos", func(t *testing.T) {
+		now := time.Now().UTC()
+		save := func(rejectedAt time.Time) domain.TransactionID {
+			t.Helper()
+			id := domain.NewTransactionID()
+			if err := repo.SaveInvalidRejection(ctx, valueobject.InvalidTransactionRejection{
+				TransactionID:   id,
+				Rejection:       valueobject.NewRejectionFromValidation(valueobject.CodeInvalidData),
+				ValidationError: "motivo",
+				RejectedAt:      rejectedAt,
+			}); err != nil {
+				t.Fatalf("SaveInvalidRejection() error = %v", err)
+			}
+			return id
+		}
+		expired := save(now.Add(-91 * 24 * time.Hour))
+		current := save(now.Add(-89 * 24 * time.Hour))
+
+		deleted, err := repo.DeleteInvalidRejectionsBefore(ctx, now.Add(-90*24*time.Hour))
+		if err != nil || deleted != 1 {
+			t.Fatalf("DeleteInvalidRejectionsBefore() = %d, %v, want 1, nil", deleted, err)
+		}
+		if got, err := repo.FindInvalidRejection(ctx, expired); err != nil || got != nil {
+			t.Errorf("vencido: FindInvalidRejection() = %v, %v, want nil, nil", got, err)
+		}
+		if got, err := repo.FindInvalidRejection(ctx, current); err != nil || got == nil {
+			t.Errorf("vigente: FindInvalidRejection() = %v, %v, want a record", got, err)
+		}
+	})
 
 	t.Run("un rollback deshace el alta", func(t *testing.T) {
 		id := domain.NewTransactionID()
@@ -354,8 +387,62 @@ func TestIntegration_InvalidTransactionIsRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseTransactionID() error = %v", err)
 	}
-	if _, err := authpostgres.NewTransactionRepo(app.pool).FindByID(ctx, id); err == nil {
-		t.Error("la transacción inválida quedó guardada")
+	repo := authpostgres.NewTransactionRepo(app.pool)
+	if _, err := repo.FindByID(ctx, id); err == nil {
+		t.Error("la transacción inválida quedó en transactions")
+	}
+
+	// La consulta de estado la informa como rechazada, sin el dato inválido en el registro.
+	status, err := authquery.NewTransactionQueryHandler(repo).GetTransactionStatus(ctx, id)
+	if err != nil {
+		t.Fatalf("GetTransactionStatus() error = %v", err)
+	}
+	if status.State != "REJECTED" || status.RejectionCode != valueobject.CodeInvalidData || status.AmountCents != 5000 {
+		t.Errorf("status = %+v", status)
+	}
+	record, err := repo.FindInvalidRejection(ctx, id)
+	if err != nil || record == nil {
+		t.Fatalf("FindInvalidRejection() = %v, %v", record, err)
+	}
+	if !strings.Contains(record.ValidationError, "card_last4") || strings.Contains(record.ValidationError, "4111") {
+		t.Errorf("ValidationError = %q", record.ValidationError)
+	}
+	if _, err := domain.ParseTerminalID(record.TerminalID); err != nil {
+		t.Errorf("TerminalID = %q: %v", record.TerminalID, err)
+	}
+
+	// Un ID que nunca llegó sigue siendo NotFound.
+	var notFound *pkgerrors.NotFoundError
+	if _, err := authquery.NewTransactionQueryHandler(repo).GetTransactionStatus(ctx, domain.NewTransactionID()); !errors.As(err, &notFound) {
+		t.Errorf("error = %v, want NotFoundError", err)
+	}
+}
+
+// TestIntegration_InvalidTransactionsMigration aplica la migración sobre una base existente:
+// la baja, la alta, y la alta otra vez, porque tiene que ser idempotente.
+func TestIntegration_InvalidTransactionsMigration(t *testing.T) {
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, startPostgres(ctx, t))
+	if err != nil {
+		t.Fatalf("pgx.Connect() error = %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close(context.Background()) })
+
+	for _, file := range []string{"down", "up", "up"} {
+		script, err := os.ReadFile("../../migrations/pn_authorization/000004_invalid_transactions." + file + ".sql")
+		if err != nil {
+			t.Fatalf("leer migración: %v", err)
+		}
+		if _, err := conn.PgConn().Exec(ctx, string(script)).ReadAll(); err != nil {
+			t.Fatalf("aplicar %s: %v", file, err)
+		}
+	}
+	var table *string
+	if err := conn.QueryRow(ctx, `SELECT to_regclass('pn_authorization.invalid_transactions')::text`).Scan(&table); err != nil {
+		t.Fatalf("to_regclass: %v", err)
+	}
+	if table == nil {
+		t.Error("la tabla no existe después de la migración")
 	}
 }
 

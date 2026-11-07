@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
-	"github.com/juantevez/go-posnet/context/authorization/domain/service"
 	"github.com/juantevez/go-posnet/context/authorization/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	"github.com/juantevez/go-posnet/pkg/events"
@@ -188,11 +187,13 @@ func TestPublishInvalidRejected(t *testing.T) {
 	js := &fakeJetStream{}
 	id := domain.NewTransactionID()
 
-	err := newTestPublisher(js).PublishInvalidRejected(context.Background(), service.InvalidTransactionRejection{
-		TransactionID: id,
-		AmountCents:   5000,
-		Currency:      "ARS",
-		Rejection:     valueobject.NewRejectionFromValidation(valueobject.CodeInvalidData),
+	err := newTestPublisher(js).PublishInvalidRejected(context.Background(), valueobject.InvalidTransactionRejection{
+		TransactionID:   id,
+		AmountCents:     5000,
+		Currency:        "ARS",
+		Rejection:       valueobject.NewRejectionFromValidation(valueobject.CodeInvalidData),
+		ValidationError: "invalid pan: card_last4 must be exactly 4 digits",
+		RejectedAt:      time.Date(2026, 11, 6, 15, 0, 4, 0, time.UTC),
 	})
 	if err != nil {
 		t.Fatalf("PublishInvalidRejected() error = %v", err)
@@ -218,8 +219,11 @@ func TestPublishInvalidRejected(t *testing.T) {
 	if payload.IsRetryable || payload.CaptureCard {
 		t.Errorf("payload = %+v: no debe ser reintentable ni ordenar la retención", payload)
 	}
-	if payload.CardLast4 != "" || payload.AmountCents != 5000 || payload.RejectedAt == "" {
+	if payload.CardLast4 != "" || payload.AmountCents != 5000 || payload.RejectedAt != "2026-11-06T15:00:04Z" {
 		t.Errorf("payload = %+v", payload)
+	}
+	if strings.Contains(string(js.published[0].Data), "card_last4 must be") {
+		t.Error("el motivo de validación es para auditoría: no se publica")
 	}
 }
 

@@ -129,6 +129,102 @@ func TestInsertTx_RejectedTransactionArgs(t *testing.T) {
 	}
 }
 
+// ─── Rechazos por datos inválidos ───────────────────────────────────────────
+
+func TestSaveInvalidRejection(t *testing.T) {
+	pool := newMockPool(t)
+	r := valueobject.InvalidTransactionRejection{
+		TransactionID:   domain.NewTransactionID(),
+		AmountCents:     5000,
+		Currency:        "ARS",
+		CardLast4:       "1234",
+		Rejection:       valueobject.NewRejectionFromValidation(valueobject.CodeInvalidData),
+		ValidationError: "invalid card_network: unknown value",
+		RejectedAt:      time.Date(2026, 11, 6, 15, 0, 4, 0, time.UTC),
+	}
+	pool.ExpectExec(`INSERT INTO pn_authorization.invalid_transactions[\s\S]*ON CONFLICT \(transaction_id\) DO NOTHING`).
+		WithArgs(r.TransactionID.String(), "", "", int64(5000), "ARS", valueobject.CodeInvalidData, r.ValidationError, r.RejectedAt).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+
+	if err := postgres.NewTransactionRepo(pool).SaveInvalidRejection(context.Background(), r); err != nil {
+		t.Fatalf("SaveInvalidRejection() error = %v", err)
+	}
+}
+
+func TestSaveInvalidRejection_ExecError(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectExec("invalid_transactions").WithArgs(anyArgs(8)...).WillReturnError(errors.New("db down"))
+
+	err := postgres.NewTransactionRepo(pool).SaveInvalidRejection(context.Background(), valueobject.InvalidTransactionRejection{TransactionID: domain.NewTransactionID()})
+	if err == nil {
+		t.Fatal("SaveInvalidRejection() error = nil, want error")
+	}
+}
+
+func TestDeleteInvalidRejectionsBefore(t *testing.T) {
+	pool := newMockPool(t)
+	cutoff := time.Date(2026, 8, 8, 12, 0, 0, 0, time.UTC)
+	pool.ExpectExec("DELETE FROM pn_authorization.invalid_transactions WHERE rejected_at < ").
+		WithArgs(cutoff).
+		WillReturnResult(pgxmock.NewResult("DELETE", 2))
+
+	got, err := postgres.NewTransactionRepo(pool).DeleteInvalidRejectionsBefore(context.Background(), cutoff)
+	if err != nil || got != 2 {
+		t.Fatalf("DeleteInvalidRejectionsBefore() = %d, %v, want 2, nil", got, err)
+	}
+}
+
+func TestDeleteInvalidRejectionsBefore_ExecError(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectExec("DELETE FROM").WithArgs(anyArgs(1)...).WillReturnError(errors.New("db down"))
+
+	if _, err := postgres.NewTransactionRepo(pool).DeleteInvalidRejectionsBefore(context.Background(), time.Now()); err == nil {
+		t.Fatal("DeleteInvalidRejectionsBefore() error = nil, want error")
+	}
+}
+
+func TestFindInvalidRejection(t *testing.T) {
+	columns := []string{"terminal_id", "merchant_id", "amount_cents", "currency", "rejection_code", "validation_error", "rejected_at"}
+	rejectedAt := time.Date(2026, 11, 6, 15, 0, 4, 0, time.UTC)
+	id := domain.NewTransactionID()
+
+	t.Run("existe", func(t *testing.T) {
+		pool := newMockPool(t)
+		pool.ExpectQuery("FROM pn_authorization.invalid_transactions").WithArgs(id.String()).
+			WillReturnRows(pgxmock.NewRows(columns).AddRow("", "", int64(5000), "ARS", valueobject.CodeInvalidData, "motivo", rejectedAt))
+
+		got, err := postgres.NewTransactionRepo(pool).FindInvalidRejection(context.Background(), id)
+		if err != nil || got == nil {
+			t.Fatalf("FindInvalidRejection() = %v, %v", got, err)
+		}
+		if got.TransactionID != id || got.Rejection.Code() != valueobject.CodeInvalidData ||
+			got.Rejection.Source() != valueobject.SourceValidation || got.ValidationError != "motivo" {
+			t.Errorf("got = %+v", got)
+		}
+	})
+
+	t.Run("no existe", func(t *testing.T) {
+		pool := newMockPool(t)
+		pool.ExpectQuery("FROM pn_authorization.invalid_transactions").WithArgs(id.String()).
+			WillReturnRows(pgxmock.NewRows(columns))
+
+		got, err := postgres.NewTransactionRepo(pool).FindInvalidRejection(context.Background(), id)
+		if err != nil || got != nil {
+			t.Fatalf("FindInvalidRejection() = %v, %v, want nil, nil", got, err)
+		}
+	})
+
+	t.Run("error de base", func(t *testing.T) {
+		pool := newMockPool(t)
+		pool.ExpectQuery("FROM pn_authorization.invalid_transactions").WithArgs(id.String()).
+			WillReturnError(errors.New("db down"))
+
+		if _, err := postgres.NewTransactionRepo(pool).FindInvalidRejection(context.Background(), id); err == nil {
+			t.Fatal("FindInvalidRejection() error = nil, want error")
+		}
+	})
+}
+
 // ─── FindByID ───────────────────────────────────────────────────────────────
 
 func TestFindByID_Success(t *testing.T) {

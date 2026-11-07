@@ -15,7 +15,15 @@ type Config struct {
 	NATS     NATSConfig
 	OTEL     OTELConfig
 	Acquirer AcquirerConfig
+
+	// InvalidTransactionsRetention es cuánto se conserva el registro de las transacciones
+	// rechazadas por datos inválidos. 0 desactiva la purga.
+	InvalidTransactionsRetention time.Duration
 }
+
+// defaultInvalidTransactionsRetention son 90 días: ese registro sirve para soporte e incidentes
+// de integración, no para analítica histórica.
+const defaultInvalidTransactionsRetention = 90 * 24 * time.Hour
 
 type PostgresConfig struct {
 	DSN             string
@@ -81,7 +89,14 @@ func (a AcquirerConfig) TLSEnabled() bool {
 }
 
 func Load() (*Config, error) {
+	retention, err := loadInvalidTransactionsRetention()
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
+		InvalidTransactionsRetention: retention,
+
 		GRPCPort: envInt("GRPC_PORT", 9090),
 		HTTPPort: envInt("HTTP_PORT", 8080),
 
@@ -156,6 +171,24 @@ func Load() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// loadInvalidTransactionsRetention no ignora un valor inválido, como envDuration: "30d" no es
+// una duración de Go, y conservar los datos más o menos tiempo del pedido tiene que notarse.
+func loadInvalidTransactionsRetention() (time.Duration, error) {
+	const key = "INVALID_TRANSACTIONS_RETENTION"
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultInvalidTransactionsRetention, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s %q is not a valid duration: use hours, like 720h for 30 days", key, v)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("config: %s %s cannot be negative", key, d)
+	}
+	return d, nil
 }
 
 func requireEnv(key string) string {
