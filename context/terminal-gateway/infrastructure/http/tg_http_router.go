@@ -16,6 +16,7 @@ func NewRouter(
 	pool pgutil.PgxPool,
 	allowedOrigins []string,
 	auth *TerminalAuth,
+	payTokens *PayTokens,
 ) http.Handler {
 	mux := http.NewServeMux()
 
@@ -27,6 +28,7 @@ func NewRouter(
 	// Rutas del flujo QR — simulador POSNET
 	qr := NewQRHandler(sessionService, queryHandler)
 	qr.auth = auth
+	qr.payTokens = payTokens
 	qr.RegisterQRRoutes(mux)
 
 	mux.Handle("GET /metrics", observability.MetricsHandler())
@@ -64,7 +66,7 @@ func corsMiddleware(allowedOrigins []string, next http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 			}
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Terminal-ID")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Terminal-ID, X-Session-Token")
 		}
 
 		// El browser envía un preflight OPTIONS antes del POST real

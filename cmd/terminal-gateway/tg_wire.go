@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"fmt"
 	"log/slog"
@@ -169,8 +170,12 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wire: %w", err)
 	}
+	payTokens, err := payTokens(cfg)
+	if err != nil {
+		return nil, err
+	}
 	router := httpinfra.NewRouter(sessionHandler, queryHandler, pool, allowedOrigins,
-		httpinfra.NewTerminalAuth(tokens, trustedProxies))
+		httpinfra.NewTerminalAuth(tokens, trustedProxies), payTokens)
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,
@@ -399,4 +404,24 @@ func grpcTLSOptions(cfg *config.Config) ([]grpc.ServerOption, error) {
 		slog.Info("the gRPC server requires mTLS", slog.Any("allowed_clients", cfg.GRPCTLSClientNames))
 	}
 	return []grpc.ServerOption{opt}, nil
+}
+
+// payTokens arma el emisor del token de sesión. Sin PAY_TOKEN_KEY, que solo se permite en
+// desarrollo, usa una clave aleatoria: los QR dejan de valer al reiniciar, y no sirve con varias
+// instancias.
+func payTokens(cfg *config.Config) (*httpinfra.PayTokens, error) {
+	key := []byte(cfg.PayTokenKey)
+	if len(key) == 0 {
+		key = make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return nil, fmt.Errorf("wire: generate pay token key: %w", err)
+		}
+		slog.Warn("PAY_TOKEN_KEY is not set — session tokens use an ephemeral key (development only)")
+	}
+	if cfg.PayTokenRequired {
+		slog.Info("/pay and /status require the session token")
+	} else {
+		slog.Warn("/pay and /status accept requests without the session token — set PAY_TOKEN_REQUIRED=true once every client sends it")
+	}
+	return httpinfra.NewPayTokens(key, []byte(cfg.PayTokenKeyPrevious), cfg.PayTokenRequired), nil
 }

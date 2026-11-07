@@ -221,8 +221,8 @@ cliente:
 | `POST /sessions/{id}/cancel`, `POST /sessions/{id}/reversal` | `401` | Se ignora `X-Terminal-ID`. Con una sesión ajena, el caso de uso la rechaza |
 | `POST /batch-close` | `401` | `403` si `terminal_id` es otro. Sin `merchant_id`, usa el del terminal; con otro, `400` |
 
-`/api/sessions/{id}/pay` y `/api/sessions/{id}/status` son públicos: los usa el teléfono del cliente, que no tiene el
-token. `/healthz`, `/readyz` y `/metrics` también.
+`/api/sessions/{id}/pay` y `/api/sessions/{id}/status` no usan el token del terminal: los usa el teléfono del cliente. Usan
+el [token de la sesión](#token-de-la-sesión). `/healthz`, `/readyz` y `/metrics` son públicos.
 
 Los tokens están en el archivo de `TERMINAL_TOKENS_FILE`, que **solo guarda su SHA-256**. Un terminal puede tener varios,
 para rotarlos sin cortar el servicio:
@@ -252,6 +252,33 @@ fallos: un terminal mal configurado no bloquea al resto de su local mientras alg
 instancia. Detrás de un proxy, hay que declararlo en `TRUSTED_PROXIES`: si no, todos los pedidos comparten su IP. Sin esa
 variable, `X-Forwarded-For` se ignora, porque cualquiera podría declarar otra IP.
 
+### Token de la sesión
+
+`create` devuelve `pay_token`, el token de esa sesión, y lo agrega al fragmento de `qr_content`
+(`/pay/{id}#t=<token>`). El navegador no envía el fragmento al servidor web, así que el token no queda en sus logs ni en el
+`Referer`. `/pay` y `/status` lo reciben en `X-Session-Token`: así, un ID de sesión solo ya no alcanza para pagarla ni para ver
+su estado.
+
+| `X-Session-Token` | `PAY_TOKEN_REQUIRED=true` | `PAY_TOKEN_REQUIRED=false` |
+|---|---|---|
+| Válido | Sigue | Sigue |
+| Ausente | `401 SESSION_TOKEN_REQUIRED` | Sigue, para los clientes que todavía no lo envían |
+| De otra sesión o inválido | `401 INVALID_SESSION_TOKEN` | `401 INVALID_SESSION_TOKEN` |
+
+El token es un HMAC-SHA256 del ID con `PAY_TOKEN_KEY`: no se guarda, se recalcula para verificarlo, y vale mientras exista la
+sesión. Varias instancias tienen que compartir la clave. Para rotarla sin invalidar los QR ya emitidos, la anterior va en
+`PAY_TOKEN_KEY_PREVIOUS` hasta que venzan sus sesiones (5 minutos).
+
+**Fuera de `ENVIRONMENT=development`, el token se exige por defecto, y el servicio no arranca sin `PAY_TOKEN_KEY`.** En
+desarrollo no se exige por defecto, para probar localmente con clientes viejos, y sin clave se usa una aleatoria: un QR deja
+de valer si el servicio se reinicia.
+`posnet-frontend`, la colección de Postman y Locust ya lo envían, así que en Docker Compose se puede activar con
+`PAY_TOKEN_REQUIRED=true`.
+
+```bash
+openssl rand -hex 32   # una clave para PAY_TOKEN_KEY
+```
+
 ### TLS
 
 Con `HTTP_TLS_CERT` y `HTTP_TLS_KEY`, el puerto `HTTP_PORT` sirve solo HTTPS, desde TLS 1.2. Un certificado nuevo requiere
@@ -274,8 +301,8 @@ Con HTTPS hay que cambiar también lo que consulta ese puerto:
 | `GET /readyz` | Readiness; solo verifica Postgres | `200` | `503` |
 | `GET /metrics` | Métricas Prometheus | `200` | — |
 | `POST /api/sessions/create` | Crear sesión QR | `201` | `400`, `500` |
-| `POST /api/sessions/{id}/pay` | Simular el pago | `202` | `400`, `404`, `500` |
-| `GET /api/sessions/{id}/status` | Consultar estado (polling) | `200` | `400`, `404`, `500` |
+| `POST /api/sessions/{id}/pay` | Simular el pago | `202` | `400`, `401`, `404`, `500` |
+| `GET /api/sessions/{id}/status` | Consultar estado (polling) | `200` | `400`, `401`, `404`, `500` |
 | `GET /sessions/{id}` | Consulta para soporte | `200` | `400`, `404`, `500` |
 | `POST /sessions/{id}/cancel` | Cancelar | `200` | `500` |
 | `POST /sessions/{id}/reversal` | Solicitar reversa | `202` | `500` |
@@ -309,7 +336,8 @@ ejemplo (el terminal de prueba) y `currency` toma `ARS`. El STAN se genera en el
   "ttl_seconds": 299,
   "amount_cents": 150000,
   "currency": "ARS",
-  "qr_content": "http://192.168.0.2:5173/pay/7f6c0c5e-3f55-4a53-9d5b-8a1e6a4b2c10"
+  "pay_token": "Xq3...",
+  "qr_content": "http://192.168.0.2:5173/pay/7f6c0c5e-3f55-4a53-9d5b-8a1e6a4b2c10#t=Xq3..."
 }
 ```
 
@@ -372,7 +400,7 @@ respuesta usa nombres en PascalCase (`TransactionID`, `State`...), porque el str
 ```
 
 CORS solo permite los orígenes de `CORS_ALLOWED_ORIGINS`, con los métodos `GET`, `POST` y `OPTIONS` y los headers
-`Content-Type`, `Authorization` y `X-Terminal-ID`. Por defecto son los del frontend de pago: `http://localhost:5173` y el host de
+`Content-Type`, `Authorization`, `X-Terminal-ID` y `X-Session-Token`. Por defecto son los del frontend de pago: `http://localhost:5173` y el host de
 `qr_content` en el puerto 5173. CORS solo frena a un navegador: no reemplaza a la autenticación.
 
 Un `500` responde `{"error": "INTERNAL", "message": "internal error"}`, y el detalle queda en el log.
@@ -577,6 +605,9 @@ Cada comando y consulta abre un span (`command.ProcessPayment`, `query.GetSessio
 | `GRPC_TLS_CERT`, `GRPC_TLS_KEY` | Vacías | Sí; habilitan [TLS en gRPC](#mtls). Van juntas. Si no se pueden cargar, el servicio no arranca |
 | `GRPC_TLS_CLIENT_CA` | Vacía | Sí; CA de los clientes: exige mTLS. Fuera de desarrollo, hace falta junto con las dos anteriores |
 | `GRPC_TLS_CLIENT_NAMES` | `notification` | Sí; clientes aceptados en gRPC, separados por comas, por CN o SAN DNS de su certificado |
+| `PAY_TOKEN_KEY` | Vacía | Sí; firma el [token de la sesión](#token-de-la-sesión). Al menos 32 caracteres. Fuera de desarrollo es obligatoria; en desarrollo, sin ella, se usa una clave aleatoria |
+| `PAY_TOKEN_KEY_PREVIOUS` | Vacía | Sí; clave anterior, que sigue verificando durante una rotación |
+| `PAY_TOKEN_REQUIRED` | `true`, salvo en desarrollo | Sí; `/pay` y `/status` exigen el token. Un valor distinto de `true` o `false` impide arrancar |
 | `CORS_ALLOWED_ORIGINS` | Frontend de pago | Sí; orígenes separados por comas, como `https://pagos.example.com`. `*` permite cualquiera |
 | `GRPC_PORT` | `9091` | **No**: el puerto está fijo en 9091 |
 | `WS_PORT` | `8082` | **No**: no hay servidor WebSocket |
@@ -641,7 +672,6 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| `/pay` y `/status` son públicos | Cualquiera con un ID de sesión puede pagarla o ver su estado. El [API Gateway](GATEWAY.md#límite-de-pedidos) limita los pedidos por IP, pero no lo impide: hace falta un token por sesión en `qr_content`, que cambia `posnet-frontend` | `tg_qr_handler.go` |
 | El límite de intentos es por instancia | Con varias instancias detrás de un balanceador, un atacante tiene 10 intentos por minuto en cada una. Compartirlo requiere un almacenamiento común, como Redis | `tg_http_auth.go` |
 
 ### Pagos y consistencia

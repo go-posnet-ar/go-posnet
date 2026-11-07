@@ -16,7 +16,7 @@ rutas públicas y la IP real del cliente.
 | Límite de pedidos de `/pay` y `/status` | Implementado | Por IP, en memoria, por instancia |
 | TLS | Implementado | Propio o de un proxy anterior. Obligatorio fuera de desarrollo |
 | Autenticación | **No** | La hace cada servicio: el gateway reenvía `Authorization` |
-| Token por sesión en `/pay` y `/status` | **Pendiente** | Requiere cambiar Terminal Gateway y `posnet-frontend` |
+| Token por sesión en `/pay` y `/status` | Implementado en Terminal Gateway | El gateway reenvía `X-Session-Token`; lo verifica [Terminal Gateway](TERMINAL-GATEWAY.md#token-de-la-sesión) |
 
 ## 2. Ubicación y límites
 
@@ -49,8 +49,8 @@ El path no cambia: para pasar por el gateway, un cliente solo cambia el host y e
 
 | Método y ruta | Servicio | Acceso |
 |---|---|---|
-| `POST /api/sessions/{id}/pay` | Terminal Gateway | **Público**, con límite por IP |
-| `GET /api/sessions/{id}/status` | Terminal Gateway | **Público**, con límite por IP |
+| `POST /api/sessions/{id}/pay` | Terminal Gateway | Token de la sesión, con límite por IP |
+| `GET /api/sessions/{id}/status` | Terminal Gateway | Token de la sesión, con límite por IP |
 | `POST /api/sessions/create` | Terminal Gateway | Token de terminal |
 | `GET /sessions/{id}` | Terminal Gateway | Token de terminal |
 | `POST /sessions/{id}/cancel`, `POST /sessions/{id}/reversal` | Terminal Gateway | Token de terminal |
@@ -85,7 +85,7 @@ conexión siempre sale desde la IP fija. En otro despliegue, hay que declarar la
 
 ### Límite de pedidos
 
-`/pay` y `/status` no tienen credenciales, así que el gateway limita los pedidos por IP (en IPv6, por `/64`). Usa un balde de
+`/pay` y `/status` no usan el token del terminal, así que el gateway limita los pedidos por IP (en IPv6, por `/64`). Usa un balde de
 fichas que se recarga a `GATEWAY_PAY_PER_MINUTE` (20) y `GATEWAY_STATUS_PER_MINUTE` (240) por minuto, con ráfagas de ese
 tamaño. `/status` tiene un margen mayor porque el teléfono lo consulta hasta que hay resultado. Al pasarlo, responde `429` con
 `Retry-After`. Vive en memoria, por instancia.
@@ -167,7 +167,6 @@ puerto `8081` por `8000`.
 
 | Brecha | Consecuencia |
 |---|---|
-| `/pay` y `/status` siguen sin credenciales | El límite por IP frena el abuso, pero cualquiera con un ID de sesión puede pagarla o ver su estado. Requiere un token por sesión en `qr_content`, que cambia Terminal Gateway y `posnet-frontend` |
 | Los servicios siguen publicados en Docker Compose | `8081`, `8084` y los demás puertos siguen abiertos en el host, así que se puede saltear el gateway. En producción, solo el gateway debería ser accesible desde afuera |
 | Límites por instancia | Con varias instancias, cada una tiene su propio límite. Compartirlos requiere un almacenamiento común, como Redis |
 | Sin WebSocket | Cuando Terminal Gateway tenga su servidor WebSocket, el gateway va a necesitar una ruta que haga el upgrade |

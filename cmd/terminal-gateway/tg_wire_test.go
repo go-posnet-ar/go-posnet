@@ -153,3 +153,25 @@ func TestConfigureHTTPTLS(t *testing.T) {
 		}
 	})
 }
+
+func TestPayTokens(t *testing.T) {
+	t.Run("sin clave en desarrollo, usa una efímera", func(t *testing.T) {
+		cfg := &config.Config{}
+		cfg.OTEL.Environment = "development"
+		p, err := payTokens(cfg)
+		if err != nil || p == nil || p.Required() {
+			t.Fatalf("payTokens() = %v, %v, want un emisor que no exige el token", p, err)
+		}
+		if other, _ := payTokens(cfg); other.Issue("x") == p.Issue("x") {
+			t.Error("dos claves efímeras firman igual")
+		}
+	})
+	t.Run("con clave, firma siempre igual", func(t *testing.T) {
+		cfg := &config.Config{PayTokenKey: "0123456789abcdef0123456789abcdef", PayTokenRequired: true}
+		a, _ := payTokens(cfg)
+		b, _ := payTokens(cfg)
+		if a.Issue("x") != b.Issue("x") || !a.Required() {
+			t.Error("dos instancias con la misma clave tienen que emitir el mismo token")
+		}
+	})
+}

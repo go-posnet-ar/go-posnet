@@ -40,6 +40,14 @@ type Config struct {
 	// GRPCTLSClientNames son los clientes aceptados, por CN o SAN DNS de su certificado.
 	GRPCTLSClientNames []string
 
+	// PayTokenKey firma el token de sesión de /pay y /status, y PayTokenKeyPrevious lo sigue
+	// verificando durante una rotación. Fuera de desarrollo, PayTokenKey es obligatoria: varias
+	// instancias tienen que compartirla. PayTokenRequired exige el token; por defecto, solo fuera
+	// de desarrollo.
+	PayTokenKey         string
+	PayTokenKeyPrevious string
+	PayTokenRequired    bool
+
 	// TrustedProxies son los CIDR, separados por comas, cuyo X-Forwarded-For se acepta.
 	TrustedProxies string
 
@@ -147,7 +155,16 @@ func Load() (*Config, error) {
 		GRPCTLSKey:         envStr("GRPC_TLS_KEY", ""),
 		GRPCTLSClientCA:    envStr("GRPC_TLS_CLIENT_CA", ""),
 		GRPCTLSClientNames: envList("GRPC_TLS_CLIENT_NAMES"),
+
+		PayTokenKey:         envStr("PAY_TOKEN_KEY", ""),
+		PayTokenKeyPrevious: envStr("PAY_TOKEN_KEY_PREVIOUS", ""),
 	}
+
+	required, err := envBool("PAY_TOKEN_REQUIRED", cfg.OTEL.Environment != "development")
+	if err != nil {
+		return nil, err
+	}
+	cfg.PayTokenRequired = required
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -164,6 +181,14 @@ func (c *Config) validate() error {
 	}
 	if (c.GRPCTLSCert == "") != (c.GRPCTLSKey == "") {
 		return fmt.Errorf("config: GRPC_TLS_CERT and GRPC_TLS_KEY must be set together")
+	}
+	if c.OTEL.Environment != "development" && c.PayTokenKey == "" {
+		return fmt.Errorf("config: ENVIRONMENT=%s requires PAY_TOKEN_KEY: every instance must sign session tokens with the same key", c.OTEL.Environment)
+	}
+	for name, key := range map[string]string{"PAY_TOKEN_KEY": c.PayTokenKey, "PAY_TOKEN_KEY_PREVIOUS": c.PayTokenKeyPrevious} {
+		if key != "" && len(key) < minPayTokenKeyLength {
+			return fmt.Errorf("config: %s must have at least %d characters", name, minPayTokenKeyLength)
+		}
 	}
 	if len(c.GRPCTLSClientNames) == 0 {
 		// El único cliente gRPC del sistema.
@@ -195,6 +220,25 @@ func (c *Config) TrustedProxyPrefixes() ([]netip.Prefix, error) {
 		prefixes = append(prefixes, prefix.Masked())
 	}
 	return prefixes, nil
+}
+
+// minPayTokenKeyLength rechaza claves triviales: con una clave adivinable, cualquiera podría
+// firmar el token de cualquier sesión.
+const minPayTokenKeyLength = 32
+
+// envBool lee true o false. Un valor distinto es un error: exigir o no el token no puede
+// depender de un error de tipeo.
+func envBool(key string, def bool) (bool, error) {
+	switch v := os.Getenv(key); v {
+	case "":
+		return def, nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("config: %s %q must be true or false", key, v)
+	}
 }
 
 // envList lee una lista separada por comas, sin elementos vacíos.

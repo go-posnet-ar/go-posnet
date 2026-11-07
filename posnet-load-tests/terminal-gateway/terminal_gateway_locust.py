@@ -71,6 +71,13 @@ MERCHANT_ID = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
 
 # Pool compartido de sesiones conocidas (para GET /sessions/{id} y cancel/reversal)
 _known_session_ids: list[str] = []
+# Token de cada sesión: Terminal Gateway lo exige en /pay y /status con PAY_TOKEN_REQUIRED=true.
+_pay_tokens: dict[str, str] = {}
+
+
+def session_headers(session_id: str) -> dict:
+    token = _pay_tokens.get(session_id)
+    return {"X-Session-Token": token} if token else {}
 # Pool de sesiones APPROVED (para reversal)
 _approved_session_ids: list[str] = []
 
@@ -219,6 +226,7 @@ class TGHTTPUser(HttpUser):
             f"/api/sessions/{session_id}/status",
             catch_response=True,
             name="GET /api/sessions/{id}/status",
+            headers=session_headers(session_id),
         ) as resp:
             if resp.status_code == 200:
                 data = resp.json()
@@ -331,7 +339,8 @@ class TGQRFlowUser(HttpUser):
                 resp.success()
                 # Verificar que el estado es CANCELLED
                 status_resp = req_lib.get(
-                    f"{_http_host}/api/sessions/{session_id}/status", timeout=3
+                    f"{_http_host}/api/sessions/{session_id}/status", timeout=3,
+                    headers=session_headers(session_id),
                 )
                 if status_resp.status_code == 200:
                     state = status_resp.json().get("state", "")
@@ -401,6 +410,8 @@ class TGQRFlowUser(HttpUser):
             if resp.status_code == 201:
                 data = resp.json()
                 session_id = data.get("transaction_id", "")
+                if session_id and data.get("pay_token"):
+                    _pay_tokens[session_id] = data["pay_token"]
                 if session_id:
                     add_to_pool(_known_session_ids, session_id)
                     resp.success()
@@ -426,6 +437,8 @@ class TGQRFlowUser(HttpUser):
             if resp.status_code == 201:
                 data = resp.json()
                 session_id = data.get("transaction_id", "")
+                if session_id and data.get("pay_token"):
+                    _pay_tokens[session_id] = data["pay_token"]
                 if session_id:
                     resp.success()
                     events.request.fire(
@@ -451,6 +464,7 @@ class TGQRFlowUser(HttpUser):
             f"/api/sessions/{session_id}/pay",
             catch_response=True,
             name="POST /api/sessions/{id}/pay",
+            headers=session_headers(session_id),
             json={
                 "card_last4":   str(random.randint(1000, 9999)),
                 "card_network": random.choice(["VISA", "MASTERCARD", "CABAL"]),
@@ -490,7 +504,7 @@ class TGQRFlowUser(HttpUser):
 
         while time.time() < deadline:
             try:
-                resp = req_lib.get(url, timeout=3)
+                resp = req_lib.get(url, timeout=3, headers=session_headers(session_id))
                 if resp.status_code == 200:
                     data  = resp.json()
                     state = data.get("state") or data.get("State", "")

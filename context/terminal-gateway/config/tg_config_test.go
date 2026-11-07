@@ -385,6 +385,7 @@ func TestLoad_HTTPTLS(t *testing.T) {
 			t.Setenv("GRPC_TLS_CERT", "g.pem")
 			t.Setenv("GRPC_TLS_KEY", "g.key")
 			t.Setenv("GRPC_TLS_CLIENT_CA", "ca.pem")
+			t.Setenv("PAY_TOKEN_KEY", testPayTokenKey)
 			cfg, err := Load()
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Load() error = %v, wantErr %v", err, tc.wantErr)
@@ -402,6 +403,7 @@ func TestLoad_GRPCTLS(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "postgres://x")
 	t.Setenv("NATS_URL", "nats://x")
 	t.Setenv("HTTP_TLS_EXTERNAL", "true")
+	t.Setenv("PAY_TOKEN_KEY", testPayTokenKey)
 
 	cases := []struct {
 		name               string
@@ -448,5 +450,46 @@ func TestLoad_GRPCTLSClientNames(t *testing.T) {
 	}
 	if got := cfg.GRPCTLSClientNames; len(got) != 2 || got[1] != "notification-2" {
 		t.Errorf("GRPCTLSClientNames = %v", got)
+	}
+}
+
+const testPayTokenKey = "0123456789abcdef0123456789abcdef"
+
+func TestLoad_PayToken(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "postgres://x")
+	t.Setenv("NATS_URL", "nats://x")
+	t.Setenv("HTTP_TLS_EXTERNAL", "true")
+	t.Setenv("GRPC_TLS_CERT", "g.pem")
+	t.Setenv("GRPC_TLS_KEY", "g.key")
+	t.Setenv("GRPC_TLS_CLIENT_CA", "ca.pem")
+
+	cases := []struct {
+		name, env, key, previous, required string
+		wantRequired                       bool
+		wantErr                            bool
+	}{
+		{name: "desarrollo: no se exige por defecto", env: "development"},
+		{name: "producción: se exige por defecto", env: "production", key: testPayTokenKey, wantRequired: true},
+		{name: "producción sin clave", env: "production", wantErr: true},
+		{name: "desarrollo exigiéndolo", env: "development", required: "true", wantRequired: true},
+		{name: "producción sin exigirlo", env: "production", key: testPayTokenKey, required: "false"},
+		{name: "valor inválido", env: "development", required: "yes", wantErr: true},
+		{name: "clave corta", env: "development", key: "corta", wantErr: true},
+		{name: "clave anterior corta", env: "development", key: testPayTokenKey, previous: "corta", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ENVIRONMENT", tc.env)
+			t.Setenv("PAY_TOKEN_KEY", tc.key)
+			t.Setenv("PAY_TOKEN_KEY_PREVIOUS", tc.previous)
+			t.Setenv("PAY_TOKEN_REQUIRED", tc.required)
+			cfg, err := Load()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Load() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err == nil && cfg.PayTokenRequired != tc.wantRequired {
+				t.Errorf("PayTokenRequired = %v, want %v", cfg.PayTokenRequired, tc.wantRequired)
+			}
+		})
 	}
 }

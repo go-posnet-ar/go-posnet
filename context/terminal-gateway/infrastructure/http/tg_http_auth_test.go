@@ -130,7 +130,7 @@ func TestTerminalTokens_Authenticate(t *testing.T) {
 func TestRouter_TerminalEndpointsRequireToken(t *testing.T) {
 	terminal := domain.NewTerminalID()
 	router := NewRouter(&fakeSessionService{createSessionResult: mustSessionCreatedResult(t)},
-		query.NewSessionQueryHandler(&fakeSessionRepo{}), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, terminal), nil))
+		query.NewSessionQueryHandler(&fakeSessionRepo{}), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, terminal), nil), nil)
 	id := domain.NewTransactionID().String()
 
 	protected := []struct{ method, path, body string }{
@@ -178,7 +178,7 @@ func TestRouter_TerminalComesFromToken(t *testing.T) {
 	id := domain.NewTransactionID().String()
 
 	newRouter := func(svc *fakeSessionService) http.Handler {
-		return NewRouter(svc, query.NewSessionQueryHandler(&fakeSessionRepo{}), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, terminal), nil))
+		return NewRouter(svc, query.NewSessionQueryHandler(&fakeSessionRepo{}), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, terminal), nil), nil)
 	}
 
 	t.Run("create usa el terminal del token, sin comercio por defecto", func(t *testing.T) {
@@ -240,14 +240,14 @@ func TestRouter_SessionOfAnotherTerminalIsNotFound(t *testing.T) {
 	session := newSession(t)
 	repo := &fakeSessionRepo{findResult: session}
 
-	ownRouter := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(repo), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, session.TerminalID()), nil))
+	ownRouter := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(repo), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, session.TerminalID()), nil), nil)
 	rec := httptest.NewRecorder()
 	ownRouter.ServeHTTP(rec, authRequest(http.MethodGet, "/sessions/"+session.ID().String(), "", testToken))
 	if rec.Code != http.StatusOK {
 		t.Errorf("propia: status = %d, want 200", rec.Code)
 	}
 
-	otherRouter := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(repo), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, domain.NewTerminalID()), nil))
+	otherRouter := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(repo), &fakePool{}, nil, NewTerminalAuth(tokensFor(t, domain.NewTerminalID()), nil), nil)
 	rec = httptest.NewRecorder()
 	otherRouter.ServeHTTP(rec, authRequest(http.MethodGet, "/sessions/"+session.ID().String(), "", testToken))
 	if rec.Code != http.StatusNotFound {

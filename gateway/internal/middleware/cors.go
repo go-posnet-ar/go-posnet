@@ -23,7 +23,7 @@ func CORS(allowedOrigins []string, next http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
 			}
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Terminal-ID")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Terminal-ID, X-Session-Token")
 			w.Header().Set("Access-Control-Max-Age", "600")
 		}
 		// Un preflight no llega a los servicios: no tienen rutas OPTIONS.

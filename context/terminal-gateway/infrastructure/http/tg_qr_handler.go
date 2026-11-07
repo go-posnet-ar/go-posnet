@@ -24,6 +24,7 @@ type QRHandler struct {
 	sessionService port.SessionService
 	queryHandler   *query.SessionQueryHandler
 	auth           *TerminalAuth // nil = sin autenticación, solo en desarrollo
+	payTokens      *PayTokens    // nil = sin token de sesión (tests)
 }
 
 func NewQRHandler(
@@ -40,8 +41,8 @@ func NewQRHandler(
 func (h *QRHandler) RegisterQRRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/sessions/create", h.auth.requireTerminal(h.handleCreateQRSession))
 	// /pay y /status los usa el teléfono del cliente, que no tiene el token del terminal.
-	mux.HandleFunc("POST /api/sessions/{id}/pay", h.handleSimulatePay)
-	mux.HandleFunc("GET  /api/sessions/{id}/status", h.handleSessionStatus)
+	mux.HandleFunc("POST /api/sessions/{id}/pay", h.payTokens.requireSessionToken(h.handleSimulatePay))
+	mux.HandleFunc("GET  /api/sessions/{id}/status", h.payTokens.requireSessionToken(h.handleSessionStatus))
 }
 
 // POST /api/sessions/create
@@ -109,14 +110,22 @@ func (h *QRHandler) handleCreateQRSession(w http.ResponseWriter, r *http.Request
 	localIP := getLocalIP()
 	qrContent := fmt.Sprintf("http://%s:%s/pay/%s", localIP, frontendPort, result.TransactionID)
 
-	writeJSON(w, http.StatusCreated, map[string]any{
+	resp := map[string]any{
 		"transaction_id": result.TransactionID,
 		"expires_at":     result.ExpiresAt,
 		"ttl_seconds":    result.TTLSeconds,
 		"amount_cents":   req.AmountCents,
 		"currency":       req.Currency,
 		"qr_content":     qrContent,
-	})
+	}
+	if h.payTokens != nil {
+		// En el fragmento: el navegador no lo envía al servidor web, así que no queda en sus logs
+		// ni en el Referer.
+		token := h.payTokens.Issue(result.TransactionID)
+		resp["pay_token"] = token
+		resp["qr_content"] = qrContent + "#t=" + token
+	}
+	writeJSON(w, http.StatusCreated, resp)
 }
 
 // POST /api/sessions/{id}/pay

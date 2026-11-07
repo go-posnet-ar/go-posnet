@@ -17,7 +17,7 @@ import (
 )
 
 func newRouterFor(svc *fakeSessionService, repo *fakeSessionRepo, pool *fakePool) http.Handler {
-	return NewRouter(svc, query.NewSessionQueryHandler(repo), pool, nil, nil)
+	return NewRouter(svc, query.NewSessionQueryHandler(repo), pool, nil, nil, nil)
 }
 
 // panickySessionRepo simula un bug en la capa de aplicación para probar que
@@ -92,7 +92,7 @@ func TestNewRouter_ReadyzReflectsPoolFailure(t *testing.T) {
 }
 
 func TestNewRouter_RecoversFromPanicInHandler(t *testing.T) {
-	router := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(&panickySessionRepo{}), &fakePool{}, nil, nil)
+	router := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(&panickySessionRepo{}), &fakePool{}, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/sessions/00000000-0000-0000-0000-000000000000", nil)
 	rec := httptest.NewRecorder()
