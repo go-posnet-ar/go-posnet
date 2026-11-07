@@ -130,7 +130,7 @@ func (h *QRHandler) handleSimulatePay(w http.ResponseWriter, r *http.Request) {
 		CardToken   string `json:"card_token"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	// Se valida acá porque ya no hay a quién responderle: Authorization descartaría el evento.
+	// Se valida acá porque, una vez publicado el evento, el cliente ya recibió el 202.
 	if _, err := domain.ParseOptionalCardToken(req.CardToken); err != nil {
 		writeJSON(w, http.StatusBadRequest, errResp("INVALID_CARD_TOKEN", "card_token is not valid"))
 		return
@@ -143,6 +143,18 @@ func (h *QRHandler) handleSimulatePay(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.EntryMode == "" {
 		req.EntryMode = "QR"
+	}
+	// Antes de empezar el pago: la sesión sigue disponible para reintentar, y un PAN enviado por
+	// error en estos campos no llega al evento, que NATS conserva sin vencimiento. Las respuestas
+	// no repiten el valor recibido.
+	network, err := domain.ParseCardNetwork(req.CardNetwork)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("INVALID_CARD_NETWORK", "card_network is not valid"))
+		return
+	}
+	if _, err := domain.NewPAN(req.CardLast4, network); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("INVALID_CARD_LAST4", "card_last4 must be exactly 4 digits"))
+		return
 	}
 
 	// Delegar a ProcessPayment:

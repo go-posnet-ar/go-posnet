@@ -244,7 +244,11 @@ El motivo exacto solo está en `validation_error`, porque esas APIs no tienen au
 
 Notification descarta el evento si el comercio no es válido o el monto no es positivo, con un `ERROR` y
 `posnet_nats_messages_failed_total`. Terminal Gateway no depende de eso: solo necesita el `transaction_id`. En el flujo de
-`/pay` no ocurre, porque esos campos salen de la sesión y el cliente solo envía los de tarjeta.
+`/pay` no ocurre, porque esos campos salen de la sesión.
+
+Terminal Gateway ya valida los datos de tarjeta en `/pay`, así que este rechazo es una segunda barrera: se alcanza con un
+evento de otro productor, o si las reglas de los dos contextos dejan de coincidir. Para probarlo, publicar el evento directamente en
+`posnet.transaction.received.v1`.
 
 En los casos sin resultado publicado, Terminal Gateway mantiene la sesión en `PROCESSING` hasta
 que su job de limpieza la borra.

@@ -262,7 +262,16 @@ frontend (5173) está fijo en el código.
 ```
 
 Ambos campos son opcionales; sus valores por defecto son `0000` y `VISA`. También se acepta
-`entry_mode`, pero se ignora. Respuesta:
+`entry_mode`, pero se ignora.
+
+| Error | Cuándo |
+|---|---|
+| `400 INVALID_CARD_LAST4` | `card_last4` no tiene exactamente 4 dígitos |
+| `400 INVALID_CARD_NETWORK` | `card_network` no es `VISA`, `MASTERCARD`, `AMEX`, `CABAL`, `NARANJA` ni `UNKNOWN` |
+| `400 INVALID_CARD_TOKEN` | `card_token` no tiene un formato válido |
+
+Con estos errores, el pago no empieza y la sesión sigue disponible para reintentar. Se validan acá porque el evento queda
+en NATS sin vencimiento: un PAN enviado por error en estos campos no debe llegar a publicarse. Respuesta:
 
 ```json
 { "status": "processing", "transaction_id": "7f6c0c5e-3f55-4a53-9d5b-8a1e6a4b2c10" }
@@ -338,7 +347,7 @@ Payload de `transaction.received`:
 | `transaction_id`, `terminal_id`, `merchant_id` | UUID |
 | `amount_cents`, `currency` | Centavos e ISO 4217 |
 | `stan`, `entry_mode` | `entry_mode` se deriva del canal |
-| `card_last4`, `card_network` | Vienen del request de pago |
+| `card_last4`, `card_network` | Vienen del request de pago, ya validados: con un valor inválido, `/pay` responde `400` |
 | `card_token` | Identifica la tarjeta, sin ser el PAN: lo usan la blocklist y Authorization para pedir sus datos. Viene del request de pago; vacío si no llegó. Con un formato inválido, `/pay` responde `400` |
 | `emv_data_b64`, `iso8583_raw` | Hoy siempre están vacíos |
 | `received_at` | RFC3339 UTC |

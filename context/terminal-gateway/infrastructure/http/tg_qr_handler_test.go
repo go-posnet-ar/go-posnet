@@ -362,3 +362,51 @@ func TestHandleSimulatePay_CardToken(t *testing.T) {
 		})
 	}
 }
+
+func TestHandleSimulatePay_CardData(t *testing.T) {
+	const pan = "4111111111111111"
+	cases := []struct {
+		name     string
+		body     string
+		want     int
+		wantCode string
+	}{
+		{"válidos", `{"card_last4":"4242","card_network":"MASTERCARD"}`, http.StatusAccepted, ""},
+		{"red desconocida permitida", `{"card_last4":"4242","card_network":"UNKNOWN"}`, http.StatusAccepted, ""},
+		{"PAN en card_last4", `{"card_last4":"` + pan + `"}`, http.StatusBadRequest, "INVALID_CARD_LAST4"},
+		{"PAN en card_network", `{"card_network":"` + pan + `"}`, http.StatusBadRequest, "INVALID_CARD_NETWORK"},
+		{"menos de 4 dígitos", `{"card_last4":"12"}`, http.StatusBadRequest, "INVALID_CARD_LAST4"},
+		{"no numérico", `{"card_last4":"12a4"}`, http.StatusBadRequest, "INVALID_CARD_LAST4"},
+		{"red en minúscula", `{"card_network":"visa"}`, http.StatusBadRequest, "INVALID_CARD_NETWORK"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &fakeSessionService{}
+			mux := newQRTestMux(newTestQRHandler(svc, &fakeSessionRepo{}))
+			txID := domain.NewTransactionID().String()
+
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/sessions/"+txID+"/pay", strings.NewReader(tc.body)))
+
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d, body = %s", rec.Code, tc.want, rec.Body)
+			}
+			if tc.want == http.StatusAccepted {
+				if len(svc.processPaymentCalls) != 1 {
+					t.Errorf("ProcessPayment calls = %d, want 1", len(svc.processPaymentCalls))
+				}
+				return
+			}
+			// Sin empezar el pago, la sesión sigue disponible para reintentar.
+			if len(svc.processPaymentCalls) != 0 {
+				t.Error("datos inválidos no deben empezar el pago")
+			}
+			if !strings.Contains(rec.Body.String(), tc.wantCode) {
+				t.Errorf("body = %s, want code %s", rec.Body, tc.wantCode)
+			}
+			if strings.Contains(rec.Body.String(), pan) {
+				t.Errorf("body = %s: la respuesta no debe repetir el valor recibido", rec.Body)
+			}
+		})
+	}
+}
