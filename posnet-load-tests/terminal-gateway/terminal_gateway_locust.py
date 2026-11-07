@@ -77,6 +77,14 @@ _approved_session_ids: list[str] = []
 # Host HTTP del BC Terminal Gateway
 _http_host = "http://localhost:8081"
 
+# Token del terminal, si Terminal Gateway tiene TERMINAL_TOKENS_FILE. Sin archivo, la API está abierta.
+TG_TERMINAL_TOKEN = os.getenv("TG_TERMINAL_TOKEN", "")
+
+
+def _set_terminal_token(user):
+    if TG_TERMINAL_TOKEN:
+        user.client.headers["Authorization"] = f"Bearer {TG_TERMINAL_TOKEN}"
+
 # Distribución de montos realistas
 AMOUNT_RANGES = [
     (500,     5_000,    0.40),
@@ -119,6 +127,7 @@ class TGHTTPUser(HttpUser):
     wait_time = between(0.5, 2.0)
 
     def on_start(self):
+        _set_terminal_token(self)
         with self.client.get("/healthz", catch_response=True) as resp:
             if resp.status_code != 200:
                 resp.failure(f"Terminal Gateway not ready: {resp.status_code}")
@@ -262,6 +271,7 @@ class TGQRFlowUser(HttpUser):
     wait_time = between(1.0, 3.0)
 
     def on_start(self):
+        _set_terminal_token(self)
         with self.client.get("/healthz", catch_response=True) as resp:
             if resp.status_code != 200:
                 resp.failure("TG not ready")
@@ -509,6 +519,7 @@ class TGAdminUser(HttpUser):
     wait_time = between(3.0, 8.0)
 
     def on_start(self):
+        _set_terminal_token(self)
         with self.client.get("/healthz", catch_response=True) as resp:
             if resp.status_code != 200:
                 raise StopUser()

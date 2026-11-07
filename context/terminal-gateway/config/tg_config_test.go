@@ -333,3 +333,25 @@ func TestLoad_PanicsWithoutNATSURL(t *testing.T) {
 	}()
 	_, _ = Load()
 }
+
+func TestLoad_CORSAllowedOrigins(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "postgres://x")
+	t.Setenv("NATS_URL", "nats://x")
+
+	t.Setenv("CORS_ALLOWED_ORIGINS", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.CORSAllowedOrigins != nil {
+		t.Errorf("CORSAllowedOrigins = %v, want nil para usar los del frontend", cfg.CORSAllowedOrigins)
+	}
+
+	t.Setenv("CORS_ALLOWED_ORIGINS", " http://a:5173 , ,https://b ")
+	if cfg, err = Load(); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.CORSAllowedOrigins; len(got) != 2 || got[0] != "http://a:5173" || got[1] != "https://b" {
+		t.Errorf("CORSAllowedOrigins = %q", got)
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/application/port"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/entity"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/repository"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/service"
 	valueobject "github.com/juantevez/go-posnet/context/terminal-gateway/domain/valueobject"
@@ -76,9 +77,11 @@ func (h *SessionHandler) CreateSession(ctx context.Context, cmd port.CreateSessi
 	if err != nil {
 		return nil, pkgerrors.NewValidationError("invalid terminal_id")
 	}
-	merchantID, err := domain.ParseMerchantID(cmd.MerchantID)
-	if err != nil {
-		return nil, pkgerrors.NewValidationError("invalid merchant_id")
+	var merchantID domain.MerchantID
+	if cmd.MerchantID != "" {
+		if merchantID, err = domain.ParseMerchantID(cmd.MerchantID); err != nil {
+			return nil, pkgerrors.NewValidationError("invalid merchant_id")
+		}
 	}
 	currency, err := domain.ParseCurrency(cmd.Currency)
 	if err != nil {
@@ -104,6 +107,9 @@ func (h *SessionHandler) CreateSession(ctx context.Context, cmd port.CreateSessi
 	}
 	if !terminal.IsActive() {
 		return nil, pkgerrors.NewValidationError("terminal is not active")
+	}
+	if merchantID, err = merchantOfTerminal(terminal, merchantID); err != nil {
+		return nil, err
 	}
 
 	// Crear la sesión
@@ -334,6 +340,21 @@ func (h *SessionHandler) CancelSession(ctx context.Context, cmd port.CancelSessi
 	return h.sessionRepo.Save(ctx, session)
 }
 
+// merchantOfTerminal devuelve el comercio del terminal. Si el pedido trae otro, lo rechaza: si no,
+// un terminal podría operar a nombre de otro comercio. Vacío usa el del terminal.
+func merchantOfTerminal(terminal *entity.Terminal, requested domain.MerchantID) (domain.MerchantID, error) {
+	if terminal == nil {
+		return domain.MerchantID{}, pkgerrors.NewValidationError("unknown terminal")
+	}
+	if requested.IsZero() {
+		return terminal.MerchantID(), nil
+	}
+	if !requested.Equals(terminal.MerchantID()) {
+		return domain.MerchantID{}, pkgerrors.NewValidationError("merchant_id does not belong to the terminal")
+	}
+	return requested, nil
+}
+
 // RequestBatchClose publica el evento de cierre de lote a NATS.
 func (h *SessionHandler) RequestBatchClose(ctx context.Context, cmd port.RequestBatchCloseCommand) error {
 	ctx, span := observability.StartSpan(ctx, "command.RequestBatchClose")
@@ -343,9 +364,11 @@ func (h *SessionHandler) RequestBatchClose(ctx context.Context, cmd port.Request
 	if err != nil {
 		return pkgerrors.NewValidationError("invalid terminal_id")
 	}
-	merchantID, err := domain.ParseMerchantID(cmd.MerchantID)
-	if err != nil {
-		return pkgerrors.NewValidationError("invalid merchant_id")
+	var merchantID domain.MerchantID
+	if cmd.MerchantID != "" {
+		if merchantID, err = domain.ParseMerchantID(cmd.MerchantID); err != nil {
+			return pkgerrors.NewValidationError("invalid merchant_id")
+		}
 	}
 
 	// Settlement busca el lote por moneda y descarta un pedido sin una válida: se
@@ -357,6 +380,14 @@ func (h *SessionHandler) RequestBatchClose(ctx context.Context, cmd port.Request
 		if _, err := time.Parse("2006-01-02", cmd.BatchDate); err != nil {
 			return pkgerrors.NewValidationError("invalid batch_date")
 		}
+	}
+
+	terminal, err := h.terminalRepo.FindByID(ctx, terminalID)
+	if err != nil {
+		return fmt.Errorf("RequestBatchClose: find terminal: %w", err)
+	}
+	if merchantID, err = merchantOfTerminal(terminal, merchantID); err != nil {
+		return err
 	}
 
 	return h.publisher.PublishBatchCloseRequested(ctx,

@@ -16,7 +16,7 @@ todavía no existe**: hoy el flujo funciona por HTTP, con un simulador QR. El re
 | Capacidad | Estado | Detalle |
 |---|---|---|
 | Ciclo de vida de `PaymentSession` | Implementado | Crear, procesar, aprobar, rechazar y cancelar |
-| API HTTP y simulador QR | Implementado | Puerto 8081, sin autenticación |
+| API HTTP y simulador QR | Implementado | Puerto 8081. Token por terminal en las operaciones; `/pay` y `/status` son públicos |
 | Publicación de `TransactionReceived` | Implementado | Transactional Outbox |
 | Consumo de resultados de autorización | Implementado | `posnet.auth.>` |
 | Reversa y cierre de lote | Implementado | Publicación directa a NATS, sin outbox |
@@ -174,7 +174,8 @@ instrucción no llega a ningún terminal (ver [§13](#13-brechas-conocidas)).
 
 ### 5.3 Cancelación
 
-`POST /sessions/{id}/cancel` exige que `X-Terminal-ID` coincida con el terminal de la sesión. Solo se
+`POST /sessions/{id}/cancel` exige que el terminal del token coincida con el de la sesión (sin tokens, el de
+`X-Terminal-ID`). Solo se
 puede cancelar en `AWAITING_PAYMENT`; una sesión en `PROCESSING` ya no es cancelable.
 
 ### 5.4 Reversa
@@ -204,8 +205,43 @@ verán el estado `EXPIRED`.
 
 ## 6. API HTTP
 
-Puerto `HTTP_PORT` (8081 por defecto). **No hay autenticación.** Los errores tienen la forma
-`{"error": "CODIGO", "message": "..."}`.
+Puerto `HTTP_PORT` (8081 por defecto). Los errores tienen la forma `{"error": "CODIGO", "message": "..."}`.
+
+### Autenticación de terminales
+
+Las operaciones de un terminal exigen `Authorization: Bearer <token>`. El terminal sale del token, no de lo que envía el
+cliente:
+
+| Endpoint | Sin token o inválido | Con el token de otro terminal |
+|---|---|---|
+| `POST /api/sessions/create` | `401` | `403` si `terminal_id` es otro. Sin `merchant_id`, usa el del terminal; con otro, `400` |
+| `GET /sessions/{id}` | `401` | `404`, como si no existiera |
+| `POST /sessions/{id}/cancel`, `POST /sessions/{id}/reversal` | `401` | Se ignora `X-Terminal-ID`. Con una sesión ajena, el caso de uso la rechaza |
+| `POST /batch-close` | `401` | `403` si `terminal_id` es otro. Sin `merchant_id`, usa el del terminal; con otro, `400` |
+
+`/api/sessions/{id}/pay` y `/api/sessions/{id}/status` son públicos: los usa el teléfono del cliente, que no tiene el
+token. `/healthz`, `/readyz` y `/metrics` también.
+
+Los tokens están en el archivo de `TERMINAL_TOKENS_FILE`, que **solo guarda su SHA-256**. Un terminal puede tener varios,
+para rotarlos sin cortar el servicio:
+
+```json
+[
+  { "terminal_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "sha256": "<sha256 del token, en hex>" },
+  { "terminal_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890", "sha256": "<otro>", "expires_at": "2026-12-31T23:59:59Z" }
+]
+```
+
+```bash
+TOKEN=$(openssl rand -hex 32)                       # entregarlo al terminal
+printf %s "$TOKEN" | sha256sum | cut -d' ' -f1      # va en el archivo
+```
+
+Un archivo inválido o inexistente impide arrancar. Un archivo vacío (`[]`) deja todo cerrado. **Sin `TERMINAL_TOKENS_FILE`,
+la API queda abierta como antes, y el servicio solo arranca con `ENVIRONMENT=development`:** usa `X-Terminal-ID` y el
+terminal de prueba de `01-init.sql`. Así funciona hoy el Docker Compose.
+
+Los cambios en el archivo requieren reiniciar el servicio.
 
 | Método y ruta | Uso | Éxito | Errores |
 |---|---|---|---|
@@ -220,9 +256,9 @@ Puerto `HTTP_PORT` (8081 por defecto). **No hay autenticación.** Los errores ti
 | `POST /sessions/{id}/reversal` | Solicitar reversa | `202` | `500` |
 | `POST /batch-close` | Solicitar cierre de lote | `202` | `400`, `500` |
 
-En `cancel`, `reversal` y `batch-close`, cualquier fallo del caso de uso devuelve `500`, incluso un
-UUID inválido, un terminal incorrecto o una transición no permitida. Lo mismo ocurre en `create` y
-`pay`, salvo sus validaciones previas y el `404` de `pay`.
+En `cancel` y `reversal`, cualquier fallo del caso de uso devuelve `500`, incluso un UUID inválido, un terminal incorrecto
+o una transición no permitida. En `create` y `batch-close`, un error de validación es un `400` con su motivo, y el resto, un
+`500`. En `pay`, igual, salvo sus validaciones previas y el `404`.
 
 ### Crear sesión
 
@@ -310,8 +346,11 @@ respuesta usa nombres en PascalCase (`TransactionID`, `State`...), porque el str
 }
 ```
 
-CORS permite cualquier origen (`*`), con los métodos `GET`, `POST` y `OPTIONS` y los headers
-`Content-Type` y `X-Terminal-ID`.
+CORS solo permite los orígenes de `CORS_ALLOWED_ORIGINS`, con los métodos `GET`, `POST` y `OPTIONS` y los headers
+`Content-Type`, `Authorization` y `X-Terminal-ID`. Por defecto son los del frontend de pago: `http://localhost:5173` y el host de
+`qr_content` en el puerto 5173. CORS solo frena a un navegador: no reemplaza a la autenticación.
+
+Un `500` responde `{"error": "INTERNAL", "message": "internal error"}`, y el detalle queda en el log.
 
 ## 7. API gRPC
 
@@ -478,7 +517,9 @@ Cada comando y consulta abre un span (`command.ProcessPayment`, `query.GetSessio
 | `OTEL_SERVICE_VERSION` | `1.0.0` | Sí |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel-collector:4317` | Sí |
 | `ENVIRONMENT` | `development` | Sí |
-| `POSNET_HOST` | IP local detectada | Sí; define el host de `qr_content` |
+| `POSNET_HOST` | IP local detectada | Sí; define el host de `qr_content` y del origen CORS por defecto |
+| `TERMINAL_TOKENS_FILE` | Vacía | Sí; [tokens de los terminales](#autenticación-de-terminales). Vacía deja la API abierta, y solo se permite con `ENVIRONMENT=development`. Si el archivo no existe o es inválido, el servicio no arranca |
+| `CORS_ALLOWED_ORIGINS` | Frontend de pago | Sí; orígenes separados por comas, como `https://pagos.example.com`. `*` permite cualquiera |
 | `GRPC_PORT` | `9091` | **No**: el puerto está fijo en 9091 |
 | `WS_PORT` | `8082` | **No**: no hay servidor WebSocket |
 | `TLS_CERT_PATH`, `TLS_KEY_PATH`, `TLS_CA_PATH` | Vacías | **No**: nada usa esta configuración |
@@ -542,11 +583,11 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| La API HTTP no tiene autenticación y `/pay` es público | Cualquiera con acceso de red y un ID de sesión puede iniciar un pago | `tg_http_router.go`, `tg_qr_handler.go` |
-| `X-Terminal-ID` es un header que envía el cliente | Permite cancelar o revertir como otro terminal; el mTLS que debería respaldarlo no existe | `tg_http_handler.go` |
-| CORS `*` | Cualquier sitio web puede llamar a la API desde un navegador | `tg_http_router.go` |
+| `/pay` y `/status` son públicos | Cualquiera con un ID de sesión puede pagarla o ver su estado. Requiere un token por sesión en `qr_content`, que cambia `posnet-frontend` | `tg_qr_handler.go` |
+| Los tokens viajan sin TLS | La API HTTP no tiene TLS: alguien en la red puede leer un token y operar como ese terminal | `tg_wire.go` |
+| Sin límite de intentos fallidos | Nada frena a quien prueba tokens. Con 256 bits aleatorios no es viable adivinarlos, pero un token débil sí se puede | `tg_http_auth.go` |
+| Los tokens no se recargan | Revocar o rotar uno exige reiniciar el servicio | `tg_http_auth.go` |
 | gRPC sin TLS | Tráfico interno sin cifrar ni autenticar | `tg_grpc_server.go` |
-| Los `500` de `create` y `pay` devuelven `err.Error()` | Se exponen detalles internos al cliente | `tg_qr_handler.go` |
 
 ### Pagos y consistencia
 

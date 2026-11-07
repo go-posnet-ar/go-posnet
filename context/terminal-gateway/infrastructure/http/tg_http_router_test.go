@@ -17,7 +17,7 @@ import (
 )
 
 func newRouterFor(svc *fakeSessionService, repo *fakeSessionRepo, pool *fakePool) http.Handler {
-	return NewRouter(svc, query.NewSessionQueryHandler(repo), pool)
+	return NewRouter(svc, query.NewSessionQueryHandler(repo), pool, nil, nil)
 }
 
 // panickySessionRepo simula un bug en la capa de aplicación para probar que
@@ -92,7 +92,7 @@ func TestNewRouter_ReadyzReflectsPoolFailure(t *testing.T) {
 }
 
 func TestNewRouter_RecoversFromPanicInHandler(t *testing.T) {
-	router := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(&panickySessionRepo{}), &fakePool{})
+	router := NewRouter(&fakeSessionService{}, query.NewSessionQueryHandler(&panickySessionRepo{}), &fakePool{}, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/sessions/00000000-0000-0000-0000-000000000000", nil)
 	rec := httptest.NewRecorder()
@@ -132,24 +132,57 @@ func TestMetricsHandler(t *testing.T) {
 
 // ─── corsMiddleware ───────────────────────────────────────────────────────────
 
-func TestCorsMiddleware_SetsHeaders(t *testing.T) {
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-	handler := corsMiddleware(next)
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-
-	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
-		t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, "*")
+func TestCorsMiddleware_Origins(t *testing.T) {
+	const frontend = "http://192.168.0.2:5173"
+	cases := []struct {
+		name    string
+		allowed []string
+		origin  string
+		want    string
+	}{
+		{"origen permitido", []string{frontend}, frontend, frontend},
+		{"otro origen", []string{frontend}, "https://evil.example", ""},
+		{"sin Origin, como curl o Postman", []string{frontend}, "", ""},
+		{"comodín explícito", []string{"*"}, "https://cualquiera.example", "*"},
+		{"sin orígenes configurados", nil, frontend, ""},
 	}
-	if got := rec.Header().Get("Access-Control-Allow-Methods"); got != "GET, POST, OPTIONS" {
-		t.Errorf("Access-Control-Allow-Methods = %q, want %q", got, "GET, POST, OPTIONS")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var nextCalled bool
+			next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nextCalled = true
+				w.WriteHeader(http.StatusOK)
+			})
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			rec := httptest.NewRecorder()
+			corsMiddleware(tc.allowed, next).ServeHTTP(rec, req)
+
+			if got := rec.Header().Get("Access-Control-Allow-Origin"); got != tc.want {
+				t.Errorf("Access-Control-Allow-Origin = %q, want %q", got, tc.want)
+			}
+			if tc.want != "" && rec.Header().Get("Access-Control-Allow-Methods") != "GET, POST, OPTIONS" {
+				t.Errorf("Access-Control-Allow-Methods = %q", rec.Header().Get("Access-Control-Allow-Methods"))
+			}
+			if rec.Header().Get("Vary") != "Origin" {
+				t.Errorf("Vary = %q, want Origin: la respuesta depende del origen", rec.Header().Get("Vary"))
+			}
+			// CORS lo aplica el navegador: el servidor responde igual.
+			if !nextCalled || rec.Code != http.StatusOK {
+				t.Errorf("next called = %v, status = %d", nextCalled, rec.Code)
+			}
+		})
 	}
-	if rec.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
+}
+
+func TestDefaultAllowedOrigins_MatchesQRContent(t *testing.T) {
+	t.Setenv("POSNET_HOST", "192.168.0.2")
+	got := DefaultAllowedOrigins()
+	want := []string{"http://localhost:5173", "http://192.168.0.2:5173"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("DefaultAllowedOrigins() = %v, want %v", got, want)
 	}
 }
 
@@ -158,9 +191,10 @@ func TestCorsMiddleware_HandlesPreflightOptions(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		nextCalled = true
 	})
-	handler := corsMiddleware(next)
+	handler := corsMiddleware([]string{"http://localhost:5173"}, next)
 
 	req := httptest.NewRequest(http.MethodOptions, "/sessions/tx-1/cancel", nil)
+	req.Header.Set("Origin", "http://localhost:5173")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 

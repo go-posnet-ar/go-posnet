@@ -64,6 +64,7 @@ NATS_URL=nats://192.168.0.2:4222 \
 | `NATS_URL` | `nats://localhost:4222` | URL de NATS JetStream |
 | `POLL_TIMEOUT_S` | `10` | Timeout de polling (segundos) |
 | `POLL_INTERVAL_S` | `0.5` | Intervalo de polling (segundos) |
+| `TG_TERMINAL_TOKEN` | Vacía | Token del terminal para `terminal_gateway_locust.py`, si Terminal Gateway tiene `TERMINAL_TOKENS_FILE` |
 
 ## Umbrales de referencia (MVP en local)
 

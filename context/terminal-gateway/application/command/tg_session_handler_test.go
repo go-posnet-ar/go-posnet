@@ -101,11 +101,12 @@ func TestCreateSession_TerminalNotActive(t *testing.T) {
 
 func TestCreateSession_SaveError(t *testing.T) {
 	terminalID := domain.NewTerminalID()
-	terminalRepo := &fakeTerminalRepo{findResult: activeTerminal(terminalID)}
+	terminal := activeTerminal(terminalID)
+	terminalRepo := &fakeTerminalRepo{findResult: terminal}
 	sessionRepo := &fakeSessionRepo{saveErr: errors.New("connection reset")}
 	h := newHandler(nil, sessionRepo, terminalRepo, &fakeNotifier{}, &fakePublisher{})
 
-	_, err := h.CreateSession(context.Background(), validCreateSessionCmd(terminalID.String(), domain.NewMerchantID().String()))
+	_, err := h.CreateSession(context.Background(), validCreateSessionCmd(terminalID.String(), terminal.MerchantID().String()))
 	if err == nil || !strings.Contains(err.Error(), "CreateSession: save session") {
 		t.Fatalf("error = %v, want it to mention CreateSession: save session", err)
 	}
@@ -113,11 +114,12 @@ func TestCreateSession_SaveError(t *testing.T) {
 
 func TestCreateSession_NotifyErrorIsNonFatal(t *testing.T) {
 	terminalID := domain.NewTerminalID()
-	terminalRepo := &fakeTerminalRepo{findResult: activeTerminal(terminalID)}
+	terminal := activeTerminal(terminalID)
+	terminalRepo := &fakeTerminalRepo{findResult: terminal}
 	notifier := &fakeNotifier{notifySessionCreatedErr: errors.New("terminal not connected")}
 	h := newHandler(nil, &fakeSessionRepo{}, terminalRepo, notifier, &fakePublisher{})
 
-	result, err := h.CreateSession(context.Background(), validCreateSessionCmd(terminalID.String(), domain.NewMerchantID().String()))
+	result, err := h.CreateSession(context.Background(), validCreateSessionCmd(terminalID.String(), terminal.MerchantID().String()))
 	if err != nil {
 		t.Fatalf("CreateSession() error = %v, want nil (notify failure is non-fatal)", err)
 	}
@@ -128,12 +130,13 @@ func TestCreateSession_NotifyErrorIsNonFatal(t *testing.T) {
 
 func TestCreateSession_Success(t *testing.T) {
 	terminalID := domain.NewTerminalID()
-	terminalRepo := &fakeTerminalRepo{findResult: activeTerminal(terminalID)}
+	terminal := activeTerminal(terminalID)
+	terminalRepo := &fakeTerminalRepo{findResult: terminal}
 	sessionRepo := &fakeSessionRepo{}
 	notifier := &fakeNotifier{}
 	h := newHandler(nil, sessionRepo, terminalRepo, notifier, &fakePublisher{})
 
-	result, err := h.CreateSession(context.Background(), validCreateSessionCmd(terminalID.String(), domain.NewMerchantID().String()))
+	result, err := h.CreateSession(context.Background(), validCreateSessionCmd(terminalID.String(), terminal.MerchantID().String()))
 	if err != nil {
 		t.Fatalf("CreateSession() error = %v", err)
 	}
@@ -623,9 +626,10 @@ func TestRequestBatchClose_InvalidMerchantID(t *testing.T) {
 
 func TestRequestBatchClose_PublishError(t *testing.T) {
 	publisher := &fakePublisher{publishBatchCloseErr: errors.New("nats unavailable")}
-	h := newHandler(nil, &fakeSessionRepo{}, &fakeTerminalRepo{}, &fakeNotifier{}, publisher)
+	terminal := activeTerminal(domain.NewTerminalID())
+	h := newHandler(nil, &fakeSessionRepo{}, &fakeTerminalRepo{findResult: terminal}, &fakeNotifier{}, publisher)
 
-	err := h.RequestBatchClose(context.Background(), port.RequestBatchCloseCommand{TerminalID: domain.NewTerminalID().String(), MerchantID: domain.NewMerchantID().String(), Currency: "ARS"})
+	err := h.RequestBatchClose(context.Background(), port.RequestBatchCloseCommand{TerminalID: terminal.ID().String(), MerchantID: terminal.MerchantID().String(), Currency: "ARS"})
 	if err == nil || !strings.Contains(err.Error(), "nats unavailable") {
 		t.Fatalf("error = %v, want it to propagate the publish error", err)
 	}
@@ -633,10 +637,11 @@ func TestRequestBatchClose_PublishError(t *testing.T) {
 
 func TestRequestBatchClose_Success(t *testing.T) {
 	publisher := &fakePublisher{}
-	h := newHandler(nil, &fakeSessionRepo{}, &fakeTerminalRepo{}, &fakeNotifier{}, publisher)
+	terminal := activeTerminal(domain.NewTerminalID())
+	h := newHandler(nil, &fakeSessionRepo{}, &fakeTerminalRepo{findResult: terminal}, &fakeNotifier{}, publisher)
 
 	err := h.RequestBatchClose(context.Background(), port.RequestBatchCloseCommand{
-		TerminalID: domain.NewTerminalID().String(), MerchantID: domain.NewMerchantID().String(),
+		TerminalID: terminal.ID().String(), MerchantID: terminal.MerchantID().String(),
 		TerminalCount: 5, TerminalAmount: 5000, Currency: "ARS",
 	})
 	if err != nil {
@@ -758,4 +763,54 @@ func TestRequestBatchClose_InvalidCurrencyOrDate(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ─── Comercio del terminal ────────────────────────────────────────────────────
+
+// Un terminal no puede crear sesiones ni cerrar lotes a nombre de otro comercio. Sin comercio,
+// se usa el suyo.
+func TestMerchantMustBelongToTheTerminal(t *testing.T) {
+	terminal := activeTerminal(domain.NewTerminalID())
+	other := domain.NewMerchantID().String()
+
+	t.Run("create con otro comercio", func(t *testing.T) {
+		sessionRepo := &fakeSessionRepo{}
+		h := newHandler(nil, sessionRepo, &fakeTerminalRepo{findResult: terminal}, &fakeNotifier{}, &fakePublisher{})
+		_, err := h.CreateSession(context.Background(), validCreateSessionCmd(terminal.ID().String(), other))
+		var ve *pkgerrors.ValidationError
+		if !errors.As(err, &ve) {
+			t.Fatalf("error = %v, want a ValidationError", err)
+		}
+	})
+
+	t.Run("create sin comercio usa el del terminal", func(t *testing.T) {
+		h := newHandler(nil, &fakeSessionRepo{}, &fakeTerminalRepo{findResult: terminal}, &fakeNotifier{}, &fakePublisher{})
+		if _, err := h.CreateSession(context.Background(), validCreateSessionCmd(terminal.ID().String(), "")); err != nil {
+			t.Fatalf("CreateSession() error = %v", err)
+		}
+	})
+
+	t.Run("batch-close con otro comercio", func(t *testing.T) {
+		publisher := &fakePublisher{}
+		h := newHandler(nil, &fakeSessionRepo{}, &fakeTerminalRepo{findResult: terminal}, &fakeNotifier{}, publisher)
+		err := h.RequestBatchClose(context.Background(), port.RequestBatchCloseCommand{
+			TerminalID: terminal.ID().String(), MerchantID: other, Currency: "ARS",
+		})
+		var ve *pkgerrors.ValidationError
+		if !errors.As(err, &ve) || publisher.publishBatchCloseCall != 0 {
+			t.Fatalf("error = %v, publish calls = %d, want a ValidationError and no publish", err, publisher.publishBatchCloseCall)
+		}
+	})
+
+	t.Run("batch-close de un terminal inexistente", func(t *testing.T) {
+		publisher := &fakePublisher{}
+		h := newHandler(nil, &fakeSessionRepo{}, &fakeTerminalRepo{}, &fakeNotifier{}, publisher)
+		err := h.RequestBatchClose(context.Background(), port.RequestBatchCloseCommand{
+			TerminalID: domain.NewTerminalID().String(), Currency: "ARS",
+		})
+		var ve *pkgerrors.ValidationError
+		if !errors.As(err, &ve) || publisher.publishBatchCloseCall != 0 {
+			t.Fatalf("error = %v, publish calls = %d, want a ValidationError and no publish", err, publisher.publishBatchCloseCall)
+		}
+	})
 }

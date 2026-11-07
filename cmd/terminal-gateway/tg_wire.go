@@ -152,7 +152,16 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	grpcSrv := grpcserver.NewTerminalGatewayServer(nil, queryHandler) // notifier = nil hasta websocket/
 
 	// HTTP Server — healthz, readyz, metrics, operaciones REST
-	router := httpinfra.NewRouter(sessionHandler, queryHandler, pool)
+	allowedOrigins := cfg.CORSAllowedOrigins
+	if len(allowedOrigins) == 0 {
+		allowedOrigins = httpinfra.DefaultAllowedOrigins()
+	}
+	slog.Info("CORS allowed origins", slog.Any("origins", allowedOrigins))
+	tokens, err := terminalTokens(cfg)
+	if err != nil {
+		return nil, err
+	}
+	router := httpinfra.NewRouter(sessionHandler, queryHandler, pool, allowedOrigins, tokens)
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,
@@ -299,4 +308,23 @@ func (a *app) close() {
 
 		slog.Info("all resources closed")
 	})
+}
+
+// terminalTokens carga los tokens de los terminales. Sin ellos, cualquiera con acceso de red
+// opera como cualquier terminal: solo se permite en desarrollo.
+func terminalTokens(cfg *config.Config) (*httpinfra.TerminalTokens, error) {
+	tokens, err := httpinfra.LoadTerminalTokens(cfg.TerminalTokensFile)
+	if err != nil {
+		return nil, fmt.Errorf("wire: load terminal tokens: %w", err)
+	}
+	if !tokens.Configured() {
+		if cfg.OTEL.Environment != "development" {
+			return nil, fmt.Errorf("wire: TERMINAL_TOKENS_FILE is required with ENVIRONMENT=%s: without it, the terminal API is open", cfg.OTEL.Environment)
+		}
+		slog.Warn("no terminal tokens configured — the terminal API is open (development only)")
+		return nil, nil
+	}
+	slog.Info("terminal tokens loaded", slog.Int("tokens", tokens.Count()))
+	slog.Warn("the HTTP API has no TLS — terminal tokens travel unencrypted")
+	return tokens, nil
 }

@@ -1,9 +1,11 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -21,6 +23,7 @@ import (
 type QRHandler struct {
 	sessionService port.SessionService
 	queryHandler   *query.SessionQueryHandler
+	tokens         *TerminalTokens // nil = sin autenticación, solo en desarrollo
 }
 
 func NewQRHandler(
@@ -35,7 +38,8 @@ func NewQRHandler(
 
 // RegisterQRRoutes registra los endpoints en el mux existente.
 func (h *QRHandler) RegisterQRRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /api/sessions/create", h.handleCreateQRSession)
+	mux.HandleFunc("POST /api/sessions/create", h.tokens.requireTerminal(h.handleCreateQRSession))
+	// /pay y /status los usa el teléfono del cliente, que no tiene el token del terminal.
 	mux.HandleFunc("POST /api/sessions/{id}/pay", h.handleSimulatePay)
 	mux.HandleFunc("GET  /api/sessions/{id}/status", h.handleSessionStatus)
 }
@@ -56,11 +60,21 @@ func (h *QRHandler) handleCreateQRSession(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if req.TerminalID == "" {
-		req.TerminalID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-	}
-	if req.MerchantID == "" {
-		req.MerchantID = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+	if id, ok := authenticatedTerminal(ctx); ok {
+		// El comercio, si falta, lo completa CreateSession con el del terminal.
+		if req.TerminalID != "" && req.TerminalID != id.String() {
+			writeForbidden(w)
+			return
+		}
+		req.TerminalID = id.String()
+	} else {
+		// Sin tokens, solo en desarrollo: el terminal de prueba de 01-init.sql.
+		if req.TerminalID == "" {
+			req.TerminalID = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+		}
+		if req.MerchantID == "" {
+			req.MerchantID = "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+		}
 	}
 	if req.Currency == "" {
 		req.Currency = "ARS"
@@ -83,13 +97,17 @@ func (h *QRHandler) handleCreateQRSession(w http.ResponseWriter, r *http.Request
 
 	result, err := h.sessionService.CreateSession(ctx, cmd)
 	if err != nil {
-		observability.RecordError(ctx, err)
-		writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", err.Error()))
+		var invalid *pkgerrors.ValidationError
+		if errors.As(err, &invalid) {
+			writeJSON(w, http.StatusBadRequest, errResp("INVALID_REQUEST", invalid.Error()))
+			return
+		}
+		writeInternalError(ctx, w, err)
 		return
 	}
 
 	localIP := getLocalIP()
-	qrContent := fmt.Sprintf("http://%s:5173/pay/%s", localIP, result.TransactionID)
+	qrContent := fmt.Sprintf("http://%s:%s/pay/%s", localIP, frontendPort, result.TransactionID)
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"transaction_id": result.TransactionID,
@@ -177,8 +195,7 @@ func (h *QRHandler) handleSimulatePay(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusNotFound, errResp("NOT_FOUND", "session not found or expired"))
 			return
 		}
-		observability.RecordError(ctx, err)
-		writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", err.Error()))
+		writeInternalError(ctx, w, err)
 		return
 	}
 
@@ -223,6 +240,17 @@ func (h *QRHandler) handleSessionStatus(w http.ResponseWriter, r *http.Request) 
 		"ttl_seconds":      session.TTLSeconds,
 		"expires_at":       session.ExpiresAt,
 	})
+}
+
+// frontendPort es el puerto del frontend de pago, al que apunta qr_content.
+const frontendPort = "5173"
+
+// writeInternalError registra el error y responde un 500 sin su detalle, que puede exponer datos
+// internos: SQL, direcciones o nombres de tablas.
+func writeInternalError(ctx context.Context, w http.ResponseWriter, err error) {
+	observability.RecordError(ctx, err)
+	slog.ErrorContext(ctx, "request failed", slog.String("error", err.Error()))
+	writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", "internal error"))
 }
 
 func getLocalIP() string {

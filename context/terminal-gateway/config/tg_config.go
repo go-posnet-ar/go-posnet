@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -18,6 +19,14 @@ type Config struct {
 	OTEL     OTELConfig
 	TLS      TLSConfig
 	Session  SessionConfig
+
+	// TerminalTokensFile es el archivo con los tokens de los terminales. Sin él, la API de
+	// terminales queda abierta, y el servicio solo arranca con ENVIRONMENT=development.
+	TerminalTokensFile string
+
+	// CORSAllowedOrigins son los orígenes desde los que un navegador puede llamar a la API.
+	// Vacío usa los del frontend de pago.
+	CORSAllowedOrigins []string
 }
 
 type PostgresConfig struct {
@@ -108,9 +117,23 @@ func Load() (*Config, error) {
 			TTLSeconds:          envInt("SESSION_TTL_SECONDS", 300),
 			ExpiredCleanupEvery: envDuration("SESSION_CLEANUP_EVERY", 1*time.Minute),
 		},
+
+		CORSAllowedOrigins: envList("CORS_ALLOWED_ORIGINS"),
+		TerminalTokensFile: envStr("TERMINAL_TOKENS_FILE", ""),
 	}
 
 	return cfg, nil
+}
+
+// envList lee una lista separada por comas, sin elementos vacíos.
+func envList(key string) []string {
+	var items []string
+	for _, item := range strings.Split(os.Getenv(key), ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
 }
 
 func requireEnv(key string) string {

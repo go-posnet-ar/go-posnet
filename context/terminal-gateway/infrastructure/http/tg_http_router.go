@@ -14,31 +14,58 @@ func NewRouter(
 	sessionService port.SessionService,
 	queryHandler *query.SessionQueryHandler,
 	pool pgutil.PgxPool,
+	allowedOrigins []string,
+	tokens *TerminalTokens,
 ) http.Handler {
 	mux := http.NewServeMux()
 
 	// Rutas existentes
 	h := NewHandler(sessionService, queryHandler, pool)
+	h.tokens = tokens
 	h.RegisterRoutes(mux)
 
 	// Rutas del flujo QR — simulador POSNET
 	qr := NewQRHandler(sessionService, queryHandler)
+	qr.tokens = tokens
 	qr.RegisterQRRoutes(mux)
 
 	mux.Handle("GET /metrics", observability.MetricsHandler())
 
 	// CORS antes de observability para que el preflight OPTIONS no quede bloqueado
-	return corsMiddleware(observability.HTTPMiddleware(recoverMiddleware(mux)))
+	return corsMiddleware(allowedOrigins, observability.HTTPMiddleware(recoverMiddleware(mux)))
 }
 
-// corsMiddleware permite requests desde cualquier origen.
-// Necesario para que el frontend (Live Server / puerto 5500) pueda
-// llamar al backend (puerto 8081) sin ser bloqueado por el browser.
-func corsMiddleware(next http.Handler) http.Handler {
+// DefaultAllowedOrigins son los orígenes del frontend de pago: el mismo host que arma qr_content,
+// y localhost para desarrollo.
+func DefaultAllowedOrigins() []string {
+	origins := []string{"http://localhost:" + frontendPort}
+	if host := getLocalIP(); host != "localhost" {
+		origins = append(origins, "http://"+host+":"+frontendPort)
+	}
+	return origins
+}
+
+// corsMiddleware deja que un navegador llame a la API solo desde los orígenes permitidos, por
+// ejemplo el frontend de pago. "*" permite cualquiera. No reemplaza a la autenticación: un
+// cliente que no es un navegador no envía Origin, y no se lo frena.
+func corsMiddleware(allowedOrigins []string, next http.Handler) http.Handler {
+	allowed := make(map[string]bool, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		allowed[o] = true
+	}
+	anyOrigin := allowed["*"]
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Terminal-ID")
+		w.Header().Add("Vary", "Origin")
+		if origin := r.Header.Get("Origin"); origin != "" && (anyOrigin || allowed[origin]) {
+			if anyOrigin {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			}
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Terminal-ID")
+		}
 
 		// El browser envía un preflight OPTIONS antes del POST real
 		if r.Method == http.MethodOptions {

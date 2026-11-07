@@ -112,6 +112,9 @@ func TestHandleCreateQRSession_ServiceError(t *testing.T) {
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
 	}
+	if strings.Contains(rec.Body.String(), "terminal is not active") {
+		t.Errorf("body = %s: un 500 no debe exponer el error interno", rec.Body)
+	}
 }
 
 func TestHandleCreateQRSession_Success(t *testing.T) {
@@ -212,6 +215,9 @@ func TestHandleSimulatePay_ServiceError(t *testing.T) {
 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if strings.Contains(rec.Body.String(), "connection reset") {
+		t.Errorf("body = %s: un 500 no debe exponer el error interno", rec.Body)
 	}
 }
 
