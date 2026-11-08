@@ -297,6 +297,19 @@ func (r *TransactionRepo) FindUnresolved(ctx context.Context, processingBefore t
 	return r.loadByIDs(ctx, query, processingBefore, limit)
 }
 
+// FindFraudCheckExpired devuelve las transacciones que esperan el score desde antes del corte.
+// created_at es la recepción: el pedido a Fraud Detection se encola en la misma transacción.
+func (r *TransactionRepo) FindFraudCheckExpired(ctx context.Context, receivedBefore time.Time, limit int) ([]*aggregate.Transaction, error) {
+	const query = `
+		SELECT id::text
+		FROM pn_authorization.transactions
+		WHERE state = 'FRAUD_CHECKING' AND created_at < $1
+		ORDER BY created_at
+		LIMIT $2
+	`
+	return r.loadByIDs(ctx, query, receivedBefore, limit)
+}
+
 // FindPendingReversals devuelve las transacciones con un pedido de reversa sin completar.
 func (r *TransactionRepo) FindPendingReversals(ctx context.Context, requestedBefore time.Time, limit int) ([]*aggregate.Transaction, error) {
 	const query = `

@@ -536,6 +536,24 @@ func TestFindPendingReversals(t *testing.T) {
 	}
 }
 
+func TestFindFraudCheckExpired(t *testing.T) {
+	pool := newMockPool(t)
+	before := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	f := newRowFixture(t)
+	f.state = "FRAUD_CHECKING"
+	pool.ExpectQuery("state = 'FRAUD_CHECKING' AND created_at < ").WithArgs(before, 10).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(f.id))
+	pool.ExpectQuery("WHERE id = ").WithArgs(f.id).WillReturnRows(f.rows())
+
+	got, err := postgres.NewTransactionRepo(pool).FindFraudCheckExpired(context.Background(), before, 10)
+	if err != nil {
+		t.Fatalf("FindFraudCheckExpired() error = %v", err)
+	}
+	if len(got) != 1 || got[0].State() != valueobject.StateFraudChecking {
+		t.Errorf("got = %+v, want one transaction in FRAUD_CHECKING", got)
+	}
+}
+
 func TestMarkReversalRequestedTx_KeepsFirstRequest(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectBegin()

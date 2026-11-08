@@ -26,7 +26,7 @@ fraude sigue sin alcanzarse en el flujo QR con los pesos por defecto (ver
 | Adquirente por ISO 8583 sobre TCP | Implementado | `0100`, `0400` y `0800`, contra un [simulador](#iso-8583). Sin TLS |
 | Datos de la tarjeta | **Stub** | Tarjetas de prueba. No se puede usar en producción |
 | Blocklist de tarjetas | Implementado | Con `card_token` en `/pay` y un `41` del host |
-| Bypass por timeout de fraude | **Pendiente** | `BypassFraudCheck` no se invoca |
+| Timeout de fraude | Implementado | Sin score a tiempo, rechaza con `FRAUD_TIMEOUT`. Ver [§5.2](#52-decisión-de-fraude) |
 | Conciliación de `INDETERMINATE` | **Parcial** | Las revierte y rechaza. No consulta el resultado al host |
 | `ListTerminalTransactions` (gRPC) | **Pendiente** | Devuelve `Unimplemented` |
 
@@ -105,6 +105,7 @@ Redes aceptadas: `VISA`, `MASTERCARD`, `AMEX`, `CABAL`, `NARANJA` y `UNKNOWN`.
 RECEIVED ──────► FRAUD_CHECKING ──────► PROCESSING ──────► APPROVED ──► REVERSED
     │                  │                    │  │
     │ blocklist        │ fraude: REJECT     │  └─ rechazo ─► REJECTED
+    │                  │ o sin score        │
     ▼                  ▼                    │
  REJECTED           REJECTED                └─ error ────► INDETERMINATE ──► REVERSED | APPROVED | REJECTED
 ```
@@ -122,7 +123,8 @@ RECEIVED ──────► FRAUD_CHECKING ──────► PROCESSING �
 | `APPROVED`, `REJECTED`, `REVERSED` | Sí | — |
 | `INDETERMINATE` | Sí | Si no se puede guardar, sigue en `PROCESSING` y el conciliador la toma igual |
 
-Una transacción en `FRAUD_CHECKING` está esperando el score. Una en `PROCESSING`, esperando al adquirente: si sigue
+Una transacción en `FRAUD_CHECKING` está esperando el score: si sigue así más de `FRAUD_CHECK_TIMEOUT`, se rechaza. Una en
+`PROCESSING`, esperando al adquirente: si sigue
 así más de `ACQUIRER_STUCK_AFTER`, quedó trabada.
 
 Las transiciones de la Saga se guardan con `SaveIfState`, **solo si la fila sigue en el estado esperado**. De dos
@@ -134,13 +136,15 @@ respuesta tardía del adquirente no pisa lo que ya resolvió el conciliador.
 | Fuente | Código | Cuándo | Ordena retener la tarjeta |
 |---|---|---|---|
 | `FRAUD` | `FRAUD_REJECTED` | El motor devolvió `REJECT` | No |
+| `FRAUD` | `FRAUD_TIMEOUT` | Fraud Detection no respondió dentro de `FRAUD_CHECK_TIMEOUT` | No |
 | `BLOCKLIST` | `CARD_BLOCKED` | La tarjeta está en la blocklist | Sí |
 | `ACQUIRER` | ISO 8583 (`05`, `51`, etc.) | El emisor rechazó | Solo `04`, `41` y `43` |
 | `VALIDATION` | `UNKNOWN_RESPONSE` | El adquirente respondió sin código | No |
 | `VALIDATION` | `INVALID_DATA` | `transaction.received` trae datos inválidos. Se registra aparte: ver [§5.5](#55-qué-pasa-cuando-falla-cada-paso) | No |
-| `TIMEOUT` | `TIMEOUT` | Definido, pero ningún flujo lo genera | No |
+| `TIMEOUT` | `TIMEOUT` | El adquirente no respondió, y el [conciliador](#56-conciliación) la revirtió | No |
 
-Solo los códigos `91` y `96` se publican con `is_retryable=true`. La retención se decide por la
+Se publican con `is_retryable=true` los códigos `91` y `96`, y `TIMEOUT` y `FRAUD_TIMEOUT`: en estos dos, reintentar no
+cobra dos veces, porque la venta se revirtió o nunca llegó al adquirente. La retención se decide por la
 fuente: un rechazo local nunca puede ordenarla, aunque su código coincida con uno de retención.
 
 ## 5. La Saga
@@ -175,7 +179,21 @@ TG             Authorization                     Fraud Detection      Adquirente
 | `REJECT` | Rechaza con `FRAUD_REJECTED`, sin llamar al adquirente |
 
 Un score fuera de 0–100 o una decisión desconocida es un error de validación: el mensaje se descarta y
-no se publica ningún resultado.
+la transacción sigue esperando, hasta el timeout.
+
+**Sin score a tiempo, se rechaza.** Cada segundo, o cada quinto de `FRAUD_CHECK_TIMEOUT` si es menor, Authorization busca
+las transacciones en `FRAUD_CHECKING` recibidas hace más de ese timeout, 5 s por defecto, y las pasa a `REJECTED` con
+`FRAUD_TIMEOUT`, junto con su `auth.rejected` en el outbox. El cliente espera, como mucho, el timeout más un segundo.
+
+- **No se sigue sin el score:** aprobar sin evaluar el riesgo dejaría pasar justo lo que el motor frena. Con Fraud Detection
+  caído, se rechazan todas las ventas, y avisa la alerta `FraudCheckSinRespuesta`.
+- **No llama al adquirente:** no hay nada que revertir, y el rechazo es reintentable.
+- **Un score que llega después se ignora,** como cualquier otro que la transacción ya no espera. Si llega a la vez que el
+  rechazo, `SaveIfState` deja que gane uno solo.
+- **Con varias instancias,** cada una corre la búsqueda por su cuenta, y `SaveIfState` evita que dos rechacen la misma.
+
+El timeout se mide desde la recepción, así que incluye los dos saltos por NATS y el relay del outbox, unos cientos de
+milisegundos. Fraud Detection tiene su propio límite por evaluación, `ENGINE_EVAL_TIMEOUT`, que debe ser bastante menor.
 
 ### 5.3 Blocklist
 
@@ -223,7 +241,8 @@ descuenta. **Terminal Gateway no se entera:** ya respondió `202` e ignora este 
 | Error de base de datos antes de marcar el evento | `Nak` y reintento | **Sí** |
 | Falla el alta, el encolado de `fraud.check-requested` o el commit | Nada queda guardado, ni el evento marcado: `Nak` y reintento | **Sí** |
 | Otro `transaction.received` con un `transaction_id` que ya existe | Se ignora con un `WARN` y se marca el evento: la transacción original no cambia | No hace falta |
-| Fraud Detection nunca responde | Queda en `FRAUD_CHECKING`; no hay timeout | No |
+| Fraud Detection nunca responde | Pasado `FRAUD_CHECK_TIMEOUT`, se rechaza con `FRAUD_TIMEOUT` | **Sí**: la sesión pasa a rechazada |
+| Falla el rechazo por timeout de fraude | Sigue en `FRAUD_CHECKING`; la corrida siguiente lo reintenta | **Sí** |
 | Error de base de datos al aplicar el score, incluido el encolado de un rechazo por fraude | Nada queda guardado: `Nak` y reintento, sin haber llamado al adquirente | **Sí** |
 | Llega otro score de una transacción que ya no lo espera | Se ignora con un `WARN` y se confirma | No hace falta |
 | Caída durante la llamada al adquirente | Queda en `PROCESSING`; la toma el conciliador | **Sí**: la revierte y la rechaza |
@@ -519,6 +538,18 @@ psql "$POSTGRES_DSN" -f migrations/pn_authorization/000006_outbox.up.sql
 Es idempotente. `000006_outbox.down.sql` la revierte: exige volver antes a la versión anterior del servicio, y falla sin
 cambiar nada si quedan eventos sin publicar, porque borrarlos perdería resultados de ventas.
 
+### Aplicar el índice del timeout de fraude
+
+**Una base existente necesita `000007`** para que la búsqueda de transacciones sin score, que corre cada segundo, no recorra
+la tabla entera. Sin ella, el servicio arranca igual, pero cada búsqueda es más lenta.
+
+```bash
+psql "$POSTGRES_DSN" -f migrations/pn_authorization/000007_fraud_checking_index.up.sql
+```
+
+Crea el índice con `CONCURRENTLY`, como [`000005`](#aplicar-los-índices-de-historial): se aplica con el servicio en marcha y
+es idempotente, y si se interrumpe hay que borrarlo y volver a aplicarlo. `000007_fraud_checking_index.down.sql` lo borra.
+
 ### Garantías actuales
 
 - **Publicación:** *at-least-once*, por [outbox](#publicados). Cada evento se confirma junto con su cambio de estado, y
@@ -574,6 +605,7 @@ Reglas en [`deployments/docker/prometheus/rules/`](../../deployments/docker/prom
 | `SagaCompletaDetenida` | Crítica | Entran transacciones y ninguna se aprueba durante 2 min |
 | `ErrorRateAlta` | Crítica | Rechazos por encima del 10 % de las recibidas durante 5 min |
 | `AdquirenteDesconectado` | Warning | Sin conexión con el host durante 2 min: las ventas se rechazan con `91` |
+| `FraudCheckSinRespuesta` | Critical | Ventas rechazadas con `FRAUD_TIMEOUT` en los últimos 5 min, durante 1 min: Fraud Detection no responde a tiempo. `increase` no cuenta el primer rechazo desde que arrancó el servicio, así que un rechazo aislado no la dispara |
 | `TransaccionesSinResolver` | Warning | Transacciones sin resultado conocido o reversas sin completar durante 5 min: las reversas están fallando |
 | `OutboxAuthorizationTrabado` | Warning | Eventos en el outbox hace más de 1 minuto, durante 5 min: no llegan a NATS. Se publican solos al resolver la causa |
 | `LatenciaSagaAlta` | Warning | p95 de la Saga por encima de 3 s durante 5 min |
@@ -607,6 +639,7 @@ más relevantes son `acquirer error` y `outbox relay`, que informa los ciclos de
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel-collector:4317` | Sí |
 | `ENVIRONMENT` | `development` | Sí |
 | `GRPC_PORT` | `9090` | Sí. Si está ocupado, el servicio no arranca |
+| `FRAUD_CHECK_TIMEOUT` | `5s` | Sí; cuánto se espera el score de Fraud Detection antes de rechazar con `FRAUD_TIMEOUT`. Con un valor inválido o menor a `1s`, el servicio no arranca |
 | `INVALID_TRANSACTIONS_RETENTION` | `2160h` (90 días) | Sí; cuánto se conservan las [transacciones inválidas](#retención-de-transacciones-inválidas), y `0` desactiva la purga. Va en horas: con un valor como `30d`, o negativo, el servicio no arranca |
 | `ACQUIRER_RECONCILE_EVERY` | `30s` | Sí; cada cuánto corre el conciliador, y `0` lo desactiva. Docker Compose usa `2s`. Si es negativo, el servicio no arranca |
 | `ACQUIRER_STUCK_AFTER` | `2m` | Sí; Docker Compose usa `10s`. Cuánto puede seguir una transacción en `PROCESSING`. Si no supera `ACQUIRER_TIMEOUT_SECONDS`, el servicio no arranca: revertiría llamadas en curso |
@@ -701,7 +734,6 @@ Con el simulador, estas fallas solo ocurren con [los montos de prueba](#probar-l
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| No existe el bypass ni el timeout de fraude | El log dice `fraud bypass will apply` y la documentación del evento menciona 500 ms, pero `BypassFraudCheck` no se invoca. Si Fraud Detection no responde, la transacción queda trabada para siempre | `AuthorizeTransaction` |
 | Notification no consume `reversal-completed` | El contrato del evento prevé un comprobante de anulación, pero el subscriber de Notification no se suscribe, así que no se genera | `nt_nats_subscriber.go` |
 
 ### Blocklist y datos de tarjeta

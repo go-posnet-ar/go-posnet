@@ -56,12 +56,18 @@ const codeTimeout = "TIMEOUT"
 // CodeInvalidData es el código de una transacción descartada por datos inválidos.
 const CodeInvalidData = "INVALID_DATA"
 
+// CodeFraudTimeout es el código de una transacción rechazada porque Fraud Detection no
+// respondió a tiempo. No llegó al adquirente, así que no hay nada que revertir.
+const CodeFraudTimeout = "FRAUD_TIMEOUT"
+
 // retryableCodes son códigos donde tiene sentido reintentar la transacción.
 var retryableCodes = map[string]bool{
 	ISO_ISSUER_UNAVAILABLE: true,
 	ISO_SYSTEM_MALFUNCTION: true,
 	// El conciliador ya revirtió la operación: reintentar no cobra dos veces.
 	codeTimeout: true,
+	// Nunca llegó al adquirente: reintentar no cobra dos veces.
+	CodeFraudTimeout: true,
 }
 
 // isoDescriptions mapea código → descripción legible para logs y comprobantes.
@@ -88,6 +94,7 @@ var isoDescriptions = map[string]string{
 	domain.CodeCardBlocked: "Card Blocked - Pick Up",
 	codeTimeout:            "No Response From Acquirer - Reversed",
 	CodeInvalidData:        "Invalid Transaction Data",
+	CodeFraudTimeout:       "Fraud Check Unavailable",
 }
 
 // NewRejectionFromISO crea un RejectionCode a partir de un código ISO 8583.
@@ -101,6 +108,12 @@ func NewRejectionFromISO(isoCode string) (RejectionCode, error) {
 // NewRejectionFromFraud crea un RejectionCode para rechazos del motor antifraude.
 func NewRejectionFromFraud() RejectionCode {
 	return RejectionCode{code: "FRAUD_REJECTED", source: SourceFraud}
+}
+
+// NewRejectionFromFraudTimeout crea un RejectionCode para una transacción sin respuesta del
+// motor antifraude.
+func NewRejectionFromFraudTimeout() RejectionCode {
+	return RejectionCode{code: CodeFraudTimeout, source: SourceFraud}
 }
 
 // NewRejectionFromTimeout crea un RejectionCode para timeouts del adquirente.

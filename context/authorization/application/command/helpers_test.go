@@ -60,6 +60,9 @@ type fakeRepo struct {
 	markErr          error
 	pendingReversals []*aggregate.Transaction
 	pendingErr       error
+
+	fraudExpired    []*aggregate.Transaction
+	fraudExpiredErr error
 }
 
 type claimedSave struct {
@@ -111,6 +114,10 @@ func (f *fakeRepo) FindUnresolved(context.Context, time.Time, int) ([]*aggregate
 func (f *fakeRepo) MarkReversalRequestedTx(context.Context, pgx.Tx, domain.TransactionID) error {
 	f.reversalMarks++
 	return f.markErr
+}
+
+func (f *fakeRepo) FindFraudCheckExpired(context.Context, time.Time, int) ([]*aggregate.Transaction, error) {
+	return f.fraudExpired, f.fraudExpiredErr
 }
 
 func (f *fakeRepo) FindPendingReversals(context.Context, time.Time, int) ([]*aggregate.Transaction, error) {

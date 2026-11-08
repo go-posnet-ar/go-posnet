@@ -254,34 +254,34 @@ func TestTransaction_ApplyFraudDecision(t *testing.T) {
 	})
 }
 
-func TestTransaction_BypassFraudCheck(t *testing.T) {
+func TestTransaction_ExpireFraudCheck(t *testing.T) {
 	t.Run("wrong state", func(t *testing.T) {
 		tx := newValidTransaction(t)
-		if err := tx.BypassFraudCheck("engine timeout"); err == nil {
-			t.Fatal("BypassFraudCheck() error = nil, want error")
+		if err := tx.ExpireFraudCheck(); err == nil {
+			t.Fatal("ExpireFraudCheck() error = nil, want error")
 		}
 	})
 
-	t.Run("success sets neutral decision and continues", func(t *testing.T) {
+	t.Run("rejects as retryable without capturing the card", func(t *testing.T) {
 		tx := newValidTransaction(t)
 		if err := tx.StartFraudCheck(); err != nil {
 			t.Fatalf("StartFraudCheck() error = %v", err)
 		}
-		if err := tx.BypassFraudCheck("engine timeout"); err != nil {
-			t.Fatalf("BypassFraudCheck() error = %v", err)
+		if err := tx.ExpireFraudCheck(); err != nil {
+			t.Fatalf("ExpireFraudCheck() error = %v", err)
 		}
-		if tx.State() != valueobject.StateProcessing {
-			t.Errorf("State() = %v, want %v", tx.State(), valueobject.StateProcessing)
+		if tx.State() != valueobject.StateRejected {
+			t.Errorf("State() = %v, want %v", tx.State(), valueobject.StateRejected)
 		}
-		fd := tx.FraudDecision()
-		if fd.Score != 50 {
-			t.Errorf("FraudDecision().Score = %d, want 50", fd.Score)
+		rc := tx.RejectionCode()
+		if rc.Code() != valueobject.CodeFraudTimeout || rc.Source() != valueobject.SourceFraud {
+			t.Errorf("RejectionCode() = %s/%s, want %s/%s", rc.Code(), rc.Source(), valueobject.CodeFraudTimeout, valueobject.SourceFraud)
 		}
-		if fd.Decision != valueobject.FraudDecisionReview {
-			t.Errorf("FraudDecision().Decision = %v, want %v", fd.Decision, valueobject.FraudDecisionReview)
+		if !rc.IsRetryable() || rc.RequiresCardCapture() {
+			t.Errorf("IsRetryable() = %v, RequiresCardCapture() = %v, want true, false", rc.IsRetryable(), rc.RequiresCardCapture())
 		}
-		if len(fd.RulesHit) != 1 || fd.RulesHit[0] != "BYPASS:engine timeout" {
-			t.Errorf("FraudDecision().RulesHit = %v, want [BYPASS:engine timeout]", fd.RulesHit)
+		if tx.RejectedAt() == nil {
+			t.Error("RejectedAt() = nil, want the rejection time")
 		}
 	})
 }

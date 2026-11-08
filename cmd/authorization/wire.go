@@ -49,6 +49,10 @@ type app struct {
 	stopPurge        context.CancelFunc
 	purgeWG          sync.WaitGroup
 
+	fraudTimeout   time.Duration
+	stopFraudSweep context.CancelFunc
+	fraudSweepWG   sync.WaitGroup
+
 	closeOnce sync.Once
 
 	grpcPort int
@@ -182,6 +186,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		callTimeout:    acquirerTimeout,
 
 		invalidRetention: cfg.InvalidTransactionsRetention,
+		fraudTimeout:     cfg.FraudCheckTimeout,
 
 		outboxRelay:   outboxRelay,
 		grpcPort:      cfg.GRPCPort,
@@ -292,6 +297,17 @@ func (a *app) start(ctx context.Context) error {
 		slog.Warn("reconciler disabled — unresolved transactions will not be reversed")
 	}
 
+	if a.fraudTimeout > 0 {
+		sweepCtx, stop := context.WithCancel(ctx)
+		a.stopFraudSweep = stop
+		a.fraudSweepWG.Add(1)
+		go func() {
+			defer a.fraudSweepWG.Done()
+			a.runFraudTimeouts(sweepCtx)
+		}()
+		slog.Info("fraud check timeout active", slog.Duration("timeout", a.fraudTimeout), slog.Duration("every", fraudSweepEvery(a.fraudTimeout)))
+	}
+
 	if a.invalidRetention > 0 {
 		purgeCtx, stop := context.WithCancel(ctx)
 		a.stopPurge = stop
@@ -331,6 +347,41 @@ func (a *app) runInvalidPurge(ctx context.Context) {
 
 	run()
 	ticker := time.NewTicker(invalidPurgeEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
+}
+
+// fraudSweepEvery es cada cuánto se buscan transacciones sin score: un quinto del timeout, para
+// que el rechazo no llegue mucho después, y como mucho un segundo.
+func fraudSweepEvery(timeout time.Duration) time.Duration {
+	return min(timeout/5, time.Second)
+}
+
+// runFraudTimeouts rechaza periódicamente las transacciones sin score de Fraud Detection. También
+// corre al arrancar: las que quedaron esperando durante una caída ya vencieron.
+func (a *app) runFraudTimeouts(ctx context.Context) {
+	run := func() {
+		expired, failed, err := a.authHandler.ExpireFraudChecks(ctx, time.Now(), a.fraudTimeout)
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.Error("fraud check timeout run failed", slog.String("error", err.Error()))
+			}
+			return
+		}
+		if expired > 0 || failed > 0 {
+			slog.Info("fraud check timeout run finished", slog.Int("expired", expired), slog.Int("failed", failed))
+		}
+	}
+
+	run()
+	ticker := time.NewTicker(fraudSweepEvery(a.fraudTimeout))
 	defer ticker.Stop()
 	for {
 		select {
@@ -389,6 +440,10 @@ func (a *app) closeResources() {
 	if a.stopPurge != nil {
 		a.stopPurge()
 		a.purgeWG.Wait()
+	}
+	if a.stopFraudSweep != nil {
+		a.stopFraudSweep()
+		a.fraudSweepWG.Wait()
 	}
 
 	if a.httpSrv != nil {

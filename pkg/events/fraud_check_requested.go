@@ -7,8 +7,8 @@ package events
 //
 // Authorization publica este evento antes de llamar al adquirente.
 // Fraud Detection responde con FraudScoreCalculatedPayload.
-// Si Fraud Detection no responde en 500ms, Authorization aplica
-// un bypass con score neutral (50 / REVIEW) y continúa la Saga.
+// Si Fraud Detection no responde dentro de FRAUD_CHECK_TIMEOUT (5 s por
+// defecto), Authorization rechaza la transacción con FRAUD_TIMEOUT.
 type FraudCheckRequestedPayload struct {
 	TransactionID string `json:"transaction_id"`
 	TerminalID    string `json:"terminal_id"`

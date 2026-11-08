@@ -56,6 +56,10 @@ type TransactionRepository interface {
 	// PROCESSING desde antes de processingBefore, de la más antigua a la más nueva.
 	FindUnresolved(ctx context.Context, processingBefore time.Time, limit int) ([]*aggregate.Transaction, error)
 
+	// FindFraudCheckExpired devuelve las transacciones en FRAUD_CHECKING recibidas antes de
+	// receivedBefore, de la más antigua a la más nueva.
+	FindFraudCheckExpired(ctx context.Context, receivedBefore time.Time, limit int) ([]*aggregate.Transaction, error)
+
 	// MarkReversalRequestedTx guarda el pedido de reversa dentro de dbTx. Si ya había uno,
 	// conserva su fecha.
 	MarkReversalRequestedTx(ctx context.Context, dbTx pgx.Tx, id domain.TransactionID) error

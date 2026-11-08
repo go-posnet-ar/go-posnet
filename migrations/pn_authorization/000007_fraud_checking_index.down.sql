@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS pn_authorization.idx_auth_txn_fraud_checking;

@@ -51,6 +51,9 @@ CREATE INDEX IF NOT EXISTS idx_auth_txn_reversal_pending
 CREATE INDEX IF NOT EXISTS idx_auth_txn_unresolved
     ON pn_authorization.transactions (created_at)
     WHERE state IN ('PROCESSING', 'INDETERMINATE');
+CREATE INDEX IF NOT EXISTS idx_auth_txn_fraud_checking
+    ON pn_authorization.transactions (created_at)
+    WHERE state = 'FRAUD_CHECKING';
 
 CREATE INDEX IF NOT EXISTS idx_auth_txn_card_token
     ON pn_authorization.transactions(card_token)

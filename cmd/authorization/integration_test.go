@@ -420,6 +420,112 @@ func TestIntegration_InvalidTransactionIsRejected(t *testing.T) {
 	}
 }
 
+// TestIntegration_FraudCheckTimeout recibe una transacción sin Fraud Detection levantado: el pedido
+// de score sale por el outbox, nadie responde y, pasado el timeout, se rechaza con FRAUD_TIMEOUT.
+func TestIntegration_FraudCheckTimeout(t *testing.T) {
+	ctx := context.Background()
+	natsURL := startNATS(ctx, t)
+	cfg := &config.Config{
+		GRPCPort: freePort(t),
+		HTTPPort: freePort(t),
+		Postgres: config.PostgresConfig{
+			DSN:             startPostgres(ctx, t),
+			MaxConns:        5,
+			MinConns:        1,
+			MaxConnLifetime: 30 * time.Minute,
+			MaxConnIdleTime: 5 * time.Minute,
+		},
+		NATS:              config.NATSConfig{URL: natsURL, MaxReconnect: -1, ReconnectWait: 2 * time.Second},
+		FraudCheckTimeout: time.Second,
+	}
+	app, err := wire(ctx, cfg)
+	if err != nil {
+		t.Fatalf("wire() error = %v", err)
+	}
+	if err := app.start(ctx); err != nil {
+		app.close()
+		t.Fatalf("start() error = %v", err)
+	}
+	t.Cleanup(app.close)
+
+	conn, err := natsclient.Connect(natsURL)
+	if err != nil {
+		t.Fatalf("conectar a NATS: %v", err)
+	}
+	t.Cleanup(conn.Close)
+	requested, err := conn.SubscribeSync(events.SubjectFraudCheckRequested)
+	if err != nil {
+		t.Fatalf("suscribir a %s: %v", events.SubjectFraudCheckRequested, err)
+	}
+	rejected, err := conn.SubscribeSync(events.SubjectAuthRejected)
+	if err != nil {
+		t.Fatalf("suscribir a %s: %v", events.SubjectAuthRejected, err)
+	}
+	js, err := conn.JetStream()
+	if err != nil {
+		t.Fatalf("JetStream() error = %v", err)
+	}
+
+	txID := domain.NewTransactionID().String()
+	envelope, err := events.Wrap(events.SubjectTransactionReceived, txID, "Transaction", txID, "", events.TransactionReceivedPayload{
+		TransactionID: txID,
+		TerminalID:    domain.NewTerminalID().String(),
+		MerchantID:    domain.NewMerchantID().String(),
+		AmountCents:   5000,
+		Currency:      "ARS",
+		STAN:          1,
+		EntryMode:     "CHIP",
+		CardLast4:     "0000",
+		CardNetwork:   "VISA",
+	})
+	if err != nil {
+		t.Fatalf("Wrap() error = %v", err)
+	}
+	data, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	sent := time.Now()
+	if _, err := js.Publish(events.SubjectTransactionReceived, data); err != nil {
+		t.Fatalf("publicar transaction.received: %v", err)
+	}
+
+	if _, err := requested.NextMsg(10 * time.Second); err != nil {
+		t.Fatalf("esperar fraud.check-requested: %v", err)
+	}
+	msg, err := rejected.NextMsg(10 * time.Second)
+	if err != nil {
+		t.Fatalf("esperar auth.rejected: %v", err)
+	}
+	if elapsed := time.Since(sent); elapsed < cfg.FraudCheckTimeout {
+		t.Errorf("rechazada a los %s, antes del timeout de %s", elapsed, cfg.FraudCheckTimeout)
+	}
+	got, err := events.UnmarshalEnvelope(msg.Data)
+	if err != nil {
+		t.Fatalf("UnmarshalEnvelope() error = %v", err)
+	}
+	payload, err := events.Unwrap[events.AuthorizationRejectedPayload](got)
+	if err != nil {
+		t.Fatalf("Unwrap() error = %v", err)
+	}
+	if payload.TransactionID != txID || payload.RejectionCode != valueobject.CodeFraudTimeout ||
+		payload.Source != string(valueobject.SourceFraud) || !payload.IsRetryable || payload.CaptureCard {
+		t.Errorf("rechazo = %+v, want %s de %s, reintentable y sin retener la tarjeta", payload, valueobject.CodeFraudTimeout, valueobject.SourceFraud)
+	}
+
+	id, err := domain.ParseTransactionID(txID)
+	if err != nil {
+		t.Fatalf("ParseTransactionID() error = %v", err)
+	}
+	tx, err := authpostgres.NewTransactionRepo(app.pool).FindByID(ctx, id)
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if tx.State() != valueobject.StateRejected {
+		t.Errorf("State() = %s, want REJECTED", tx.State())
+	}
+}
+
 // TestIntegration_InvalidTransactionsMigration aplica la migración sobre una base existente:
 // la baja, la alta, y la alta otra vez, porque tiene que ser idempotente.
 func TestIntegration_InvalidTransactionsMigration(t *testing.T) {

@@ -138,16 +138,13 @@ func (t *Transaction) ApplyFraudDecision(fd valueobject.FraudDecision) error {
 	return t.transition(valueobject.StateProcessing)
 }
 
-// BypassFraudCheck registra que el fraud check fue omitido (timeout del motor).
-// Permite continuar la transacción con un score neutral de auditoría.
-func (t *Transaction) BypassFraudCheck(reason string) error {
+// ExpireFraudCheck rechaza la transacción porque Fraud Detection no respondió a tiempo. No se
+// sigue sin el score: aprobar sin evaluar el riesgo dejaría pasar justo lo que el motor frena.
+func (t *Transaction) ExpireFraudCheck() error {
 	if t.state != valueobject.StateFraudChecking {
-		return fmt.Errorf("transaction: cannot bypass fraud check in state %s", t.state)
+		return fmt.Errorf("transaction: cannot expire fraud check in state %s", t.state)
 	}
-	// Score neutral — la transacción continúa pero queda marcada para revisión
-	neutralDecision, _ := valueobject.NewFraudDecision(50, valueobject.FraudDecisionReview, []string{"BYPASS:" + reason})
-	t.fraudDecision = neutralDecision
-	return t.transition(valueobject.StateProcessing)
+	return t.reject(valueobject.NewRejectionFromFraudTimeout())
 }
 
 // Approve transiciona a APPROVED con el código de autorización del emisor.

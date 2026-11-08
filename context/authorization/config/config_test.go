@@ -17,7 +17,7 @@ var optionalEnvKeys = []string{
 	"NATS_NKEY_PATH", "NATS_TLS_CERT", "NATS_TLS_KEY", "NATS_TLS_CA",
 	"OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION", "OTEL_EXPORTER_OTLP_ENDPOINT", "ENVIRONMENT",
 	"ACQUIRER_HOST", "ACQUIRER_PORT", "ACQUIRER_TLS_CERT", "ACQUIRER_TLS_KEY", "ACQUIRER_TLS_CA",
-	"ACQUIRER_TIMEOUT_SECONDS", "INVALID_TRANSACTIONS_RETENTION",
+	"ACQUIRER_TIMEOUT_SECONDS", "INVALID_TRANSACTIONS_RETENTION", "FRAUD_CHECK_TIMEOUT",
 }
 
 func clearOptionalEnv(t *testing.T) {
@@ -421,5 +421,42 @@ func TestLoad_AcquirerMode(t *testing.T) {
 	t.Setenv("ENVIRONMENT", "production")
 	if _, err := Load(); err == nil {
 		t.Error("Load() error = nil with test cards in production")
+	}
+}
+
+func TestLoad_FraudCheckTimeout(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "postgres://x")
+	t.Setenv("NATS_URL", "nats://x")
+
+	tests := []struct {
+		value   string
+		want    time.Duration
+		wantErr bool
+	}{
+		{value: "", want: 5 * time.Second},
+		{value: "10s", want: 10 * time.Second},
+		{value: "1s", want: time.Second},
+		{value: "500ms", wantErr: true},
+		{value: "0", wantErr: true},
+		{value: "5", wantErr: true},
+		{value: "-5s", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("FRAUD_CHECK_TIMEOUT", tc.value)
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("Load() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.FraudCheckTimeout != tc.want {
+				t.Errorf("FraudCheckTimeout = %v, want %v", cfg.FraudCheckTimeout, tc.want)
+			}
+		})
 	}
 }

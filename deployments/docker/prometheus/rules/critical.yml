@@ -27,6 +27,18 @@ groups:
           summary: "Error rate > 10% en Authorization"
           description: "rejected/received > 0.1 por 5m ({{ $value | humanizePercentage }}). Posible fraude masivo o bug de validación."
 
+      # Fraud Detection no responde a tiempo: Authorization rechaza esas ventas con FRAUD_TIMEOUT.
+      # Con el motor caído, se rechazan todas. Investigar: Fraud Detection, su consumidor de
+      # fraud.check-requested y NATS.
+      - alert: FraudCheckSinRespuesta
+        expr: sum(increase(posnet_transactions_rejected_total{rejection_code="FRAUD_TIMEOUT"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: 'Unas {{ printf "%.0f" $value }} ventas rechazadas sin score de fraude en 5 minutos'
+          description: "Fraud Detection no respondió dentro de FRAUD_CHECK_TIMEOUT y Authorization las rechazó con FRAUD_TIMEOUT. Revisar Fraud Detection, su consumidor de fraud.check-requested y NATS."
+
       # Pool de Postgres agotado: casi todas las conexiones prestadas.
       # Causa probable: queries lentas o conexiones leakeadas.
       - alert: PoolPostgresAgotado

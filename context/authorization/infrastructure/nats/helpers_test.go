@@ -118,6 +118,10 @@ func (f *fakeRepo) MarkReversalRequestedTx(context.Context, pgx.Tx, domain.Trans
 	return nil
 }
 
+func (f *fakeRepo) FindFraudCheckExpired(context.Context, time.Time, int) ([]*aggregate.Transaction, error) {
+	return nil, nil
+}
+
 func (f *fakeRepo) FindPendingReversals(context.Context, time.Time, int) ([]*aggregate.Transaction, error) {
 	return nil, nil
 }

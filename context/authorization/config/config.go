@@ -19,7 +19,15 @@ type Config struct {
 	// InvalidTransactionsRetention es cuánto se conserva el registro de las transacciones
 	// rechazadas por datos inválidos. 0 desactiva la purga.
 	InvalidTransactionsRetention time.Duration
+
+	// FraudCheckTimeout es cuánto se espera el score de Fraud Detection, desde que llega la
+	// transacción. Después, se rechaza con FRAUD_TIMEOUT.
+	FraudCheckTimeout time.Duration
 }
+
+// defaultFraudCheckTimeout deja margen para los dos saltos por NATS y los relays de outbox, que
+// suman unos cientos de milisegundos, más la evaluación, sin hacer esperar al cliente de más.
+const defaultFraudCheckTimeout = 5 * time.Second
 
 // defaultInvalidTransactionsRetention son 90 días: ese registro sirve para soporte e incidentes
 // de integración, no para analítica histórica.
@@ -93,9 +101,14 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	fraudTimeout, err := loadFraudCheckTimeout()
+	if err != nil {
+		return nil, err
+	}
 
 	cfg := &Config{
 		InvalidTransactionsRetention: retention,
+		FraudCheckTimeout:            fraudTimeout,
 
 		GRPCPort: envInt("GRPC_PORT", 9090),
 		HTTPPort: envInt("HTTP_PORT", 8080),
@@ -187,6 +200,24 @@ func loadInvalidTransactionsRetention() (time.Duration, error) {
 	}
 	if d < 0 {
 		return 0, fmt.Errorf("config: %s %s cannot be negative", key, d)
+	}
+	return d, nil
+}
+
+// loadFraudCheckTimeout no ignora un valor inválido: sin un timeout, una transacción sin score
+// quedaría esperando para siempre.
+func loadFraudCheckTimeout() (time.Duration, error) {
+	const key = "FRAUD_CHECK_TIMEOUT"
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultFraudCheckTimeout, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s %q is not a valid duration, like 5s", key, v)
+	}
+	if d < time.Second {
+		return 0, fmt.Errorf("config: %s %s must be at least 1s: the score crosses NATS twice", key, d)
 	}
 	return d, nil
 }
