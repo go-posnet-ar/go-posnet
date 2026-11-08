@@ -555,9 +555,10 @@ func TestCancelSession_NotAuthorized(t *testing.T) {
 		TransactionID: domain.NewTransactionID().String(),
 		TerminalID:    otherTerminal.String(),
 	})
-	var ve *pkgerrors.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("error type = %T, want *pkgerrors.ValidationError (otro terminal no debe poder cancelar)", err)
+	// Se informa como inexistente, para no confirmar que la sesión existe.
+	var nf *pkgerrors.NotFoundError
+	if !errors.As(err, &nf) {
+		t.Fatalf("error type = %T, want *pkgerrors.NotFoundError (otro terminal no debe poder cancelar)", err)
 	}
 	if sessionRepo.saveCallCount != 0 {
 		t.Errorf("Save call count = %d, want 0", sessionRepo.saveCallCount)
@@ -696,9 +697,10 @@ func TestRequestReversal_NotAuthorized(t *testing.T) {
 		OriginalTransactionID: domain.NewTransactionID().String(),
 		TerminalID:            otherTerminal.String(),
 	})
-	var ve *pkgerrors.ValidationError
-	if !errors.As(err, &ve) {
-		t.Fatalf("error type = %T, want *pkgerrors.ValidationError (otro terminal no debe poder pedir la anulación)", err)
+	// Se informa como inexistente, para no confirmar que la sesión existe.
+	var nf *pkgerrors.NotFoundError
+	if !errors.As(err, &nf) {
+		t.Fatalf("error type = %T, want *pkgerrors.NotFoundError (otro terminal no debe poder pedir la anulación)", err)
 	}
 	if publisher.publishReversalCalls != 0 {
 		t.Errorf("PublishReversalRequested calls = %d, want 0", publisher.publishReversalCalls)

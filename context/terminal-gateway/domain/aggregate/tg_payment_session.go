@@ -2,6 +2,7 @@
 package aggregate
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -165,9 +166,12 @@ func (s *PaymentSession) TTLRemaining() time.Duration {
 	return remaining
 }
 
+// ErrInvalidTransition indica que la sesión no admite la operación en su estado actual.
+var ErrInvalidTransition = errors.New("invalid transition")
+
 func (s *PaymentSession) transition(next valueobject.SessionState) error {
 	if !s.state.CanTransitionTo(next) {
-		return fmt.Errorf("payment_session %s: invalid transition %s → %s", s.id, s.state, next)
+		return fmt.Errorf("payment_session %s: %w %s → %s", s.id, ErrInvalidTransition, s.state, next)
 	}
 	s.state = next
 	return nil

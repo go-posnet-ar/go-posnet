@@ -185,7 +185,8 @@ puede cancelar en `AWAITING_PAYMENT`; una sesión en `PROCESSING` ya no es cance
 ### 5.4 Reversa
 
 `POST /sessions/{id}/reversal` verifica el terminal y publica `reversal-requested`, tomando monto y
-código de autorización de la sesión original. La sesión no cambia de estado, porque no existe un
+código de autorización de la sesión original. El terminal va en `X-Terminal-ID` como UUID, o sale del token: `TRM-0001`, el
+código del terminal de prueba, es un `400`. La sesión no cambia de estado, porque no existe un
 estado `REVERSED`. TG ignora el evento `reversal-completed`: lo confirma con `Ack` y deja un `WARN`.
 
 ### 5.5 Cierre de lote
@@ -227,7 +228,7 @@ cliente:
 |---|---|---|
 | `POST /api/sessions/create` | `401` | `403` si `terminal_id` es otro. Sin `merchant_id`, usa el del terminal; con otro, `400` |
 | `GET /sessions/{id}` | `401` | `404`, como si no existiera |
-| `POST /sessions/{id}/cancel`, `POST /sessions/{id}/reversal` | `401` | Se ignora `X-Terminal-ID`. Con una sesión ajena, el caso de uso la rechaza |
+| `POST /sessions/{id}/cancel`, `POST /sessions/{id}/reversal` | `401` | Se ignora `X-Terminal-ID`. Con una sesión ajena, `404`, como si no existiera |
 | `POST /batch-close` | `401` | `403` si `terminal_id` es otro. Sin `merchant_id`, usa el del terminal; con otro, `400` |
 
 `/api/sessions/{id}/pay` y `/api/sessions/{id}/status` no usan el token del terminal: los usa el teléfono del cliente. Usan
@@ -313,13 +314,14 @@ Con HTTPS hay que cambiar también lo que consulta ese puerto:
 | `POST /api/sessions/{id}/pay` | Simular el pago | `202` | `400`, `401`, `404`, `500` |
 | `GET /api/sessions/{id}/status` | Consultar estado (polling) | `200` | `400`, `401`, `404`, `500` |
 | `GET /sessions/{id}` | Consulta para soporte | `200` | `400`, `404`, `500` |
-| `POST /sessions/{id}/cancel` | Cancelar | `200` | `500` |
-| `POST /sessions/{id}/reversal` | Solicitar reversa | `202` | `500` |
+| `POST /sessions/{id}/cancel` | Cancelar | `200` | `400`, `404`, `409`, `500` |
+| `POST /sessions/{id}/reversal` | Solicitar reversa | `202` | `400`, `404`, `500` |
 | `POST /batch-close` | Solicitar cierre de lote | `202` | `400`, `500` |
 
-En `cancel` y `reversal`, cualquier fallo del caso de uso devuelve `500`, incluso un UUID inválido, un terminal incorrecto
-o una transición no permitida. En `create` y `batch-close`, un error de validación es un `400` con su motivo, y el resto, un
-`500`. En `pay`, igual, salvo sus validaciones previas y el `404`.
+En `cancel` y `reversal`, un ID de sesión o de terminal que no es un UUID es un `400` con su motivo, y una sesión inexistente
+o de otro terminal, un `404`. Cancelar una sesión que ya no está en `AWAITING_PAYMENT` es un `409` con `INVALID_STATE`. En
+`create` y `batch-close`, un error de validación es un `400` con su motivo. En `pay`, igual, salvo sus validaciones previas
+y el `404`. El resto es un `500`, con un `ERROR` en el log.
 
 ### Crear sesión
 
@@ -749,5 +751,5 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | El Relay no propaga el trace context | La traza se corta entre TG y Authorization en `transaction.received` | `pkg/outbox/outbox.go` |
 | Variables de configuración sin efecto | Cambiarlas no tiene ningún resultado (ver [§12](#12-configuración-y-ejecución)) | `tg_wire.go`, `tg_payment_session.go` |
 | Sin migraciones reales e índices faltantes | Los cambios de schema no se aplican a bases existentes, y `01-init.sql` y `tg_schema.sql` difieren | `pkg/pgutil/migrate.go` |
-| Errores de negocio devueltos como `500` | Falsean las métricas de error y dificultan el manejo en el cliente | `tg_http_handler.go`, `tg_qr_handler.go` |
+| Errores de negocio devueltos como `500` | Pagar una sesión vencida y un `batch-close` con moneda o fecha inválidas responden `500`. Falsean las métricas de error y dificultan el manejo en el cliente. `cancel` y `reversal` ya los distinguen | `tg_qr_handler.go`, `tg_http_handler.go` |
 | `/readyz` no verifica NATS | Una instancia sin NATS sigue recibiendo tráfico; los pagos quedan acumulados en el outbox | `tg_http_handler.go` |

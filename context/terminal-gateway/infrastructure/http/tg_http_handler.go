@@ -2,6 +2,7 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/juantevez/go-posnet/context/terminal-gateway/application/port"
 	"github.com/juantevez/go-posnet/context/terminal-gateway/application/query"
+	"github.com/juantevez/go-posnet/context/terminal-gateway/domain/aggregate"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
 	"github.com/juantevez/go-posnet/pkg/observability"
@@ -105,9 +107,7 @@ func (h *Handler) handleCancelSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.sessionService.CancelSession(ctx, cmd); err != nil {
-		observability.RecordError(ctx, err)
-		slog.ErrorContext(ctx, "cancel session failed", slog.String("error", err.Error()))
-		writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", "cancel failed"))
+		writeSessionCommandError(ctx, w, err, "cancel failed")
 		return
 	}
 
@@ -127,8 +127,7 @@ func (h *Handler) handleRequestReversal(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if err := h.sessionService.RequestReversal(ctx, cmd); err != nil {
-		observability.RecordError(ctx, err)
-		writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", "reversal request failed"))
+		writeSessionCommandError(ctx, w, err, "reversal request failed")
 		return
 	}
 
@@ -182,6 +181,26 @@ func (h *Handler) handleBatchClose(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "batch_close_requested"})
+}
+
+// writeSessionCommandError responde el error de cancel o reversal: 400 si el pedido es
+// inválido, 404 si la sesión no existe o es de otro terminal, 409 si su estado no lo admite y
+// 500, con un ERROR en el log, en cualquier otro caso.
+func writeSessionCommandError(ctx context.Context, w http.ResponseWriter, err error, internalMsg string) {
+	var invalid *pkgerrors.ValidationError
+	var notFound *pkgerrors.NotFoundError
+	switch {
+	case errors.As(err, &invalid):
+		writeJSON(w, http.StatusBadRequest, errResp("INVALID_REQUEST", invalid.Error()))
+	case errors.As(err, &notFound):
+		writeJSON(w, http.StatusNotFound, errResp("NOT_FOUND", "session not found"))
+	case errors.Is(err, aggregate.ErrInvalidTransition):
+		writeJSON(w, http.StatusConflict, errResp("INVALID_STATE", "the session does not allow this operation in its current state"))
+	default:
+		observability.RecordError(ctx, err)
+		slog.ErrorContext(ctx, "request failed", slog.String("error", err.Error()))
+		writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", internalMsg))
+	}
 }
 
 // requestTerminal devuelve el terminal que hace el pedido: el del token o, sin tokens

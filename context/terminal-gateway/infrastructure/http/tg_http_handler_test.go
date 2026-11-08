@@ -3,6 +3,7 @@ package http
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -210,22 +211,9 @@ func TestHandleCancelSession_Success(t *testing.T) {
 }
 
 func TestHandleCancelSession_ServiceError(t *testing.T) {
-	// El handler mapea cualquier error del servicio a 500, incluyendo
-	// errores de validación/autorización — no distingue por tipo.
-	svc := &fakeSessionService{cancelSessionErr: pkgerrors.NewValidationError("terminal is not authorized to cancel this session")}
-	mux := newTestMux(newTestHandler(svc, &fakeSessionRepo{}, &fakePool{}))
-
-	req := httptest.NewRequest(http.MethodPost, "/sessions/tx-1/cancel", nil)
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
-	}
-	body := decodeJSON(t, rec.Body.Bytes())
-	if body["error"] != "INTERNAL" {
-		t.Errorf("body[error] = %v, want %q", body["error"], "INTERNAL")
-	}
+	testSessionCommandErrors(t, "cancel", func(err error) *fakeSessionService {
+		return &fakeSessionService{cancelSessionErr: err}
+	})
 }
 
 // ─── POST /sessions/{id}/reversal ───────────────────────────────────────────────
@@ -258,15 +246,42 @@ func TestHandleRequestReversal_Success(t *testing.T) {
 }
 
 func TestHandleRequestReversal_ServiceError(t *testing.T) {
-	svc := &fakeSessionService{requestReversalErr: errors.New("nats unavailable")}
-	mux := newTestMux(newTestHandler(svc, &fakeSessionRepo{}, &fakePool{}))
+	testSessionCommandErrors(t, "reversal", func(err error) *fakeSessionService {
+		return &fakeSessionService{requestReversalErr: err}
+	})
+}
 
-	req := httptest.NewRequest(http.MethodPost, "/sessions/tx-1/reversal", nil)
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
+// testSessionCommandErrors verifica cómo responden cancel y reversal a cada error del caso de
+// uso. Un terminal que no es un UUID, como TRM-0001, es un 400 y no un 500.
+func testSessionCommandErrors(t *testing.T, action string, newService func(error) *fakeSessionService) {
+	t.Helper()
+	cases := []struct {
+		name     string
+		err      error
+		wantCode int
+		wantErr  string
+	}{
+		{"invalid terminal", pkgerrors.NewValidationError("invalid terminal_id"), http.StatusBadRequest, "INVALID_REQUEST"},
+		{"missing or foreign session", pkgerrors.NewNotFoundError("PaymentSession", "tx-1"), http.StatusNotFound, "NOT_FOUND"},
+		{"state does not allow it", fmt.Errorf("CancelSession: cancel: %w", aggregate.ErrInvalidTransition), http.StatusConflict, "INVALID_STATE"},
+		{"infrastructure", errors.New("nats unavailable"), http.StatusInternalServerError, "INTERNAL"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mux := newTestMux(newTestHandler(newService(tc.err), &fakeSessionRepo{}, &fakePool{}))
 
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+			req := httptest.NewRequest(http.MethodPost, "/sessions/tx-1/"+action, nil)
+			req.Header.Set("X-Terminal-ID", "TRM-0001")
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantCode)
+			}
+			if body := decodeJSON(t, rec.Body.Bytes()); body["error"] != tc.wantErr {
+				t.Errorf("body[error] = %v, want %q", body["error"], tc.wantErr)
+			}
+		})
 	}
 }
 

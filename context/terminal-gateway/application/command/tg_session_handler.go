@@ -367,8 +367,9 @@ func (h *SessionHandler) CancelSession(ctx context.Context, cmd port.CancelSessi
 	if err != nil {
 		return fmt.Errorf("CancelSession: find session: %w", err)
 	}
+	// La sesión de otro terminal se informa como inexistente, igual que en GET /sessions/{id}.
 	if !session.TerminalID().Equals(terminalID) {
-		return pkgerrors.NewValidationError("terminal is not authorized to cancel this session")
+		return pkgerrors.NewNotFoundError("PaymentSession", txID.String())
 	}
 
 	if err := session.Cancel(); err != nil {
@@ -453,8 +454,9 @@ func (h *SessionHandler) RequestReversal(ctx context.Context, cmd port.RequestRe
 	if err != nil {
 		return fmt.Errorf("RequestReversal: find original session: %w", err)
 	}
+	// La sesión de otro terminal se informa como inexistente, igual que en GET /sessions/{id}.
 	if !session.TerminalID().Equals(terminalID) {
-		return pkgerrors.NewValidationError("terminal is not authorized to reverse this transaction")
+		return pkgerrors.NewNotFoundError("PaymentSession", origTxID.String())
 	}
 
 	return h.publisher.PublishReversalRequested(ctx, origTxID, session)
