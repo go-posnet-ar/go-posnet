@@ -10,7 +10,6 @@ import (
 	"testing"
 
 	natsclient "github.com/nats-io/nats.go"
-	"github.com/pashagolub/pgxmock/v4"
 
 	"github.com/juantevez/go-posnet/context/fraud-detection/application/command"
 	"github.com/juantevez/go-posnet/pkg/domain"
@@ -110,9 +109,6 @@ func TestHandleFraudCheckRequested_UnwrapError(t *testing.T) {
 
 func TestHandleFraudCheckRequested_Success(t *testing.T) {
 	pool := newMockPool(t)
-	pool.ExpectQuery("SELECT 1 FROM " + idempotencySchema + ".processed_events").
-		WithArgs(pgxmock.AnyArg()).
-		WillReturnRows(pgxmock.NewRows([]string{"?column?"}))
 	expectClaimed(pool, 1)
 
 	repo := &fakeFraudCaseRepo{}
@@ -142,6 +138,24 @@ func TestHandleFraudCheckRequested_Success(t *testing.T) {
 	}
 	if pub.publishCalls != 1 {
 		t.Errorf("PublishFraudScoreCalculated calls = %d, want 1", pub.publishCalls)
+	}
+}
+
+// El subscriber pasa el correlation_id del envelope: con el transaction_id del payload ilegible,
+// la transacción del envelope recibe el rechazo.
+func TestHandleFraudCheckRequested_PassesTheEnvelopeCorrelationID(t *testing.T) {
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+	repo := &fakeFraudCaseRepo{}
+	h := command.NewEvaluateTransactionHandler(repo, newEngine(t), &fakeDomainPublisher{}, natsutil.NewIdempotencyStore(pool, idempotencySchema), pool)
+	s := NewSubscriber(&fakeJetStream{}, h)
+
+	txID := domain.NewTransactionID().String()
+	payload := events.FraudCheckRequestedPayload{TransactionID: "not-a-uuid", AmountCents: 5000}
+	s.handleFraudCheckRequested(newEnvelopeMsg(t, events.SubjectFraudCheckRequested, txID, payload))
+
+	if len(repo.savedCases) != 1 || repo.savedCases[0].TransactionID().String() != txID {
+		t.Fatalf("saved = %d cases, want 1 for the envelope transaction %s", len(repo.savedCases), txID)
 	}
 }
 

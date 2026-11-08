@@ -26,13 +26,31 @@ type fakeFraudCaseRepo struct {
 	savedCases []*aggregate.FraudCase
 	findResult *aggregate.FraudCase
 	findErr    error
+
+	// existing es el caso que ya tiene la transacción, para FindByTransactionIDTx.
+	existing  *aggregate.FraudCase
+	findTxErr error
+	// raced simula otro pedido de la misma transacción que guarda primero: Save no inserta y,
+	// desde entonces, FindByTransactionIDTx devuelve raced.
+	raced *aggregate.FraudCase
 }
 
 var _ repository.FraudCaseRepository = (*fakeFraudCaseRepo)(nil)
 
-func (f *fakeFraudCaseRepo) Save(_ context.Context, _ pgx.Tx, fc *aggregate.FraudCase) error {
+func (f *fakeFraudCaseRepo) Save(_ context.Context, _ pgx.Tx, fc *aggregate.FraudCase) (bool, error) {
+	if f.saveErr != nil {
+		return false, f.saveErr
+	}
+	if f.raced != nil {
+		f.existing = f.raced
+		return false, nil
+	}
 	f.savedCases = append(f.savedCases, fc)
-	return f.saveErr
+	return true, nil
+}
+
+func (f *fakeFraudCaseRepo) FindByTransactionIDTx(context.Context, pgx.Tx, domain.TransactionID) (*aggregate.FraudCase, error) {
+	return f.existing, f.findTxErr
 }
 
 func (f *fakeFraudCaseRepo) FindByTransactionID(_ context.Context, _ domain.TransactionID) (*aggregate.FraudCase, error) {

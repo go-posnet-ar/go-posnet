@@ -53,7 +53,7 @@ func uuidOrNil(s string) string {
 
 // Save inserta el caso con dbTx: confirma o se deshace junto con la marca de idempotencia y el
 // score en el outbox.
-func (r *FraudCaseRepo) Save(ctx context.Context, dbTx pgx.Tx, fc *aggregate.FraudCase) error {
+func (r *FraudCaseRepo) Save(ctx context.Context, dbTx pgx.Tx, fc *aggregate.FraudCase) (bool, error) {
 	rulesHit, _ := json.Marshal(fc.Score().RulesHit())
 
 	type evalRow struct {
@@ -81,7 +81,7 @@ func (r *FraudCaseRepo) Save(ctx context.Context, dbTx pgx.Tx, fc *aggregate.Fra
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 		ON CONFLICT (transaction_id) DO NOTHING
 	`
-	_, err := dbTx.Exec(ctx, q,
+	tag, err := dbTx.Exec(ctx, q,
 		fc.ID(), fc.TransactionID().String(),
 		uuidOrNil(fc.TerminalID().String()), uuidOrNil(fc.MerchantID().String()),
 		fc.AmountCents(), fc.Currency(), fc.CardNetwork(), fc.EntryMode(), fc.OccurredAt(),
@@ -90,23 +90,37 @@ func (r *FraudCaseRepo) Save(ctx context.Context, dbTx pgx.Tx, fc *aggregate.Fra
 		fc.EvaluatedAt(),
 	)
 	if err != nil {
-		return fmt.Errorf("FraudCaseRepo.Save: %w", err)
+		return false, fmt.Errorf("FraudCaseRepo.Save: %w", err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
-func (r *FraudCaseRepo) FindByTransactionID(
+// rowQuerier es lo que comparten el pool y una pgx.Tx para leer una fila.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+func (r *FraudCaseRepo) FindByTransactionID(ctx context.Context, txID domain.TransactionID) (*aggregate.FraudCase, error) {
+	return findByTransactionID(ctx, r.pool, txID)
+}
+
+func (r *FraudCaseRepo) FindByTransactionIDTx(ctx context.Context, dbTx pgx.Tx, txID domain.TransactionID) (*aggregate.FraudCase, error) {
+	return findByTransactionID(ctx, dbTx, txID)
+}
+
+func findByTransactionID(
 	ctx context.Context,
+	q rowQuerier,
 	txID domain.TransactionID,
 ) (*aggregate.FraudCase, error) {
-	const q = `
+	const query = `
 		SELECT id, transaction_id,
 		       terminal_id, merchant_id, amount_cents, currency, card_network, entry_mode, occurred_at,
 		       score, decision, rules_hit, evaluations, evaluated_at
 		FROM fraud_detection.fraud_cases
 		WHERE transaction_id = $1
 	`
-	row := r.pool.QueryRow(ctx, q, txID.String())
+	row := q.QueryRow(ctx, query, txID.String())
 
 	var (
 		id, txIDStr                      string

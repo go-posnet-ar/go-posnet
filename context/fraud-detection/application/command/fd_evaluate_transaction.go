@@ -60,6 +60,7 @@ const (
 	outcomeEvaluated     outcome = "evaluated"      // Lo calculó el motor
 	outcomeEngineFailure outcome = "engine_failure" // El motor falló: score neutral, REVIEW
 	outcomeInvalidEvent  outcome = "invalid_event"  // El pedido no se puede evaluar: REJECT
+	outcomeStored        outcome = "stored"         // La transacción ya tenía caso: se repite su score
 )
 
 // Largos de las columnas de fraud_cases. Un valor más largo haría fallar el INSERT en cada
@@ -73,15 +74,18 @@ const (
 // EvaluateTransaction es el caso de uso principal del BC Fraud Detection.
 //
 // Flujo:
-//  1. Parsear el transaction_id: sin él no hay a quién responder, y el evento se descarta
-//  2. Verificar idempotencia: un evento ya procesado se descarta sin evaluar
-//  3. Validar el resto del pedido: si no se puede evaluar, el caso es REJECT con score 100
-//  4. Ejecutar el motor de reglas; si falla, el caso queda con score neutral, REVIEW
-//  5. En una transacción: marcar el evento como procesado, guardar el caso y encolar
-//     FraudScoreCalculated en el outbox. El relay lo publica a NATS para Authorization
+//  1. Resolver el transaction_id: el del payload o, si es ilegible, el correlation_id del
+//     envelope. Sin ninguno no hay a quién responder, y el evento se descarta
+//  2. En una transacción:
+//     a. Marcar el evento como procesado. Si ya lo estaba, se descarta sin evaluar. Una entrega
+//     simultánea del mismo evento espera en la clave única hasta que esta confirme
+//     b. Si la transacción ya tiene un caso, por otro pedido, se responde con su score
+//     c. Si no, evaluar: REJECT si el pedido no se puede evaluar, el score del motor, o el
+//     neutral si el motor falla. Guardar el caso
+//     d. Encolar FraudScoreCalculated en el outbox. El relay lo publica a NATS para Authorization
 //
-// La verificación del paso 2 evita repetir el motor en una reentrega. Dos entregas simultáneas
-// del mismo evento pueden evaluar las dos, pero la marca del paso 5 deja pasar una sola.
+// La evaluación corre dentro de la transacción: retiene una conexión hasta EvalTimeout. El
+// subscriber procesa un mensaje a la vez, así que es una por instancia.
 func (h *EvaluateTransactionHandler) EvaluateTransaction(
 	ctx context.Context,
 	cmd port.EvaluateTransactionCommand,
@@ -97,46 +101,62 @@ func (h *EvaluateTransactionHandler) EvaluateTransaction(
 
 	// ── 1. transaction_id ────────────────────────────────────────────────────
 	txID, err := domain.ParseTransactionID(cmd.TransactionID)
+	fromEnvelope := false
 	if err != nil {
-		log.Error("fraud check request without a valid transaction_id — dropped, there is no one to answer",
-			slog.String("error", err.Error()))
-		h.metrics.RecordUnevaluated(ctx, "unanswerable")
-		return pkgerrors.NewValidationError("invalid transaction_id: " + err.Error())
+		envID, envErr := domain.ParseTransactionID(cmd.CorrelationID)
+		if envErr != nil {
+			log.Error("fraud check request without a valid transaction_id — dropped, there is no one to answer",
+				slog.String("error", err.Error()), slog.String("correlation_id", cmd.CorrelationID))
+			h.metrics.RecordUnevaluated(ctx, "unanswerable")
+			return pkgerrors.NewValidationError("invalid transaction_id: " + err.Error())
+		}
+		txID, fromEnvelope = envID, true
+		log = log.With(slog.String("correlation_id", cmd.CorrelationID))
 	}
 
-	// ── 2. Idempotencia ─────────────────────────────────────────────────────
-	processed, err := h.idempotency.IsAlreadyProcessed(ctx, cmd.EventID)
-	if err != nil {
-		observability.RecordError(ctx, err)
-		return fmt.Errorf("EvaluateTransaction: check idempotency: %w", err)
-	}
-	if processed {
-		log.Info("fraud check event already processed — skipping")
-		return nil
-	}
-
-	// ── 3 y 4. Evaluar ──────────────────────────────────────────────────────
-	fc, result, err := h.evaluate(ctx, log, txID, cmd)
-	if err != nil {
-		observability.RecordError(ctx, err)
-		return fmt.Errorf("EvaluateTransaction: %w", err)
-	}
-
-	// ── 5. Marcar, guardar y encolar (atómico) ───────────────────────────────
-	var enqueued bool
+	// ── 2. Marcar, evaluar, guardar y encolar (atómico) ──────────────────────
+	var (
+		fc       *aggregate.FraudCase
+		result   outcome
+		enqueued bool
+	)
 	err = pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
+		enqueued = false
 		inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
 		if err != nil {
 			return err
 		}
 		if !inserted {
-			// Otra entrega del mismo evento confirmó primero.
 			log.Info("fraud check event already processed — skipping")
 			return nil
 		}
-		if err := h.fraudCaseRepo.Save(ctx, tx, fc); err != nil {
+
+		fc, err = h.fraudCaseRepo.FindByTransactionIDTx(ctx, tx, txID)
+		if err != nil {
 			return err
 		}
+		if fc != nil {
+			result = outcomeStored
+		} else {
+			if fc, result, err = h.evaluate(ctx, log, txID, cmd, fromEnvelope); err != nil {
+				return err
+			}
+			saved, err := h.fraudCaseRepo.Save(ctx, tx, fc)
+			if err != nil {
+				return err
+			}
+			if !saved {
+				// Otro pedido de la misma transacción guardó primero: se responde con su score.
+				if fc, err = h.fraudCaseRepo.FindByTransactionIDTx(ctx, tx, txID); err != nil {
+					return err
+				}
+				if fc == nil {
+					return fmt.Errorf("fraud case for %s neither inserted nor found", txID)
+				}
+				result = outcomeStored
+			}
+		}
+
 		if err := h.publisher.PublishFraudScoreCalculated(ctx, tx, fc); err != nil {
 			return err
 		}
@@ -151,7 +171,13 @@ func (h *EvaluateTransactionHandler) EvaluateTransaction(
 		return nil
 	}
 
-	// Las métricas, después de confirmar: una reentrega no las duplica.
+	if result == outcomeStored {
+		log.Warn("transaction already has a fraud case — answering with the stored score",
+			slog.String("decision", fc.Score().Decision().String()))
+		return nil
+	}
+
+	// Las métricas, después de confirmar: un reintento no las duplica.
 	h.metrics.RecordEvaluation(ctx,
 		fc.Score().Decision().String(),
 		fc.Score().Score(),
@@ -176,6 +202,7 @@ func (h *EvaluateTransactionHandler) evaluate(
 	log *slog.Logger,
 	txID domain.TransactionID,
 	cmd port.EvaluateTransactionCommand,
+	fromEnvelope bool,
 ) (*aggregate.FraudCase, outcome, error) {
 	occurredAt, err := time.Parse(time.RFC3339, cmd.OccurredAt)
 	if err != nil {
@@ -183,6 +210,10 @@ func (h *EvaluateTransactionHandler) evaluate(
 	}
 
 	fc, problems := newFraudCase(txID, cmd, occurredAt)
+	if fromEnvelope {
+		// El transaction_id vino del envelope: el del payload era ilegible.
+		fc, problems = nil, append([]string{"invalid transaction_id in the payload"}, problems...)
+	}
 	if fc == nil {
 		reason := strings.Join(problems, "; ")
 		log.Warn("fraud check request cannot be evaluated — rejecting", slog.String("reason", reason))

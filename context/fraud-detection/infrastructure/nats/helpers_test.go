@@ -68,9 +68,13 @@ type fakeFraudCaseRepo struct {
 
 var _ repository.FraudCaseRepository = (*fakeFraudCaseRepo)(nil)
 
-func (f *fakeFraudCaseRepo) Save(_ context.Context, _ pgx.Tx, fc *aggregate.FraudCase) error {
+func (f *fakeFraudCaseRepo) Save(_ context.Context, _ pgx.Tx, fc *aggregate.FraudCase) (bool, error) {
 	f.savedCases = append(f.savedCases, fc)
-	return f.saveErr
+	return f.saveErr == nil, f.saveErr
+}
+
+func (f *fakeFraudCaseRepo) FindByTransactionIDTx(context.Context, pgx.Tx, domain.TransactionID) (*aggregate.FraudCase, error) {
+	return nil, nil
 }
 
 func (f *fakeFraudCaseRepo) FindByTransactionID(_ context.Context, _ domain.TransactionID) (*aggregate.FraudCase, error) {

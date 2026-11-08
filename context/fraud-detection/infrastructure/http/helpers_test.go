@@ -25,8 +25,12 @@ type fakeFraudCaseRepo struct {
 
 var _ repository.FraudCaseRepository = (*fakeFraudCaseRepo)(nil)
 
-func (f *fakeFraudCaseRepo) Save(context.Context, pgx.Tx, *aggregate.FraudCase) error {
-	return f.saveErr
+func (f *fakeFraudCaseRepo) Save(context.Context, pgx.Tx, *aggregate.FraudCase) (bool, error) {
+	return f.saveErr == nil, f.saveErr
+}
+
+func (f *fakeFraudCaseRepo) FindByTransactionIDTx(context.Context, pgx.Tx, domain.TransactionID) (*aggregate.FraudCase, error) {
+	return nil, nil
 }
 
 func (f *fakeFraudCaseRepo) FindByTransactionID(context.Context, domain.TransactionID) (*aggregate.FraudCase, error) {
@@ -39,7 +43,13 @@ type panickyFraudCaseRepo struct{}
 
 var _ repository.FraudCaseRepository = (*panickyFraudCaseRepo)(nil)
 
-func (p *panickyFraudCaseRepo) Save(context.Context, pgx.Tx, *aggregate.FraudCase) error { return nil }
+func (p *panickyFraudCaseRepo) Save(context.Context, pgx.Tx, *aggregate.FraudCase) (bool, error) {
+	return true, nil
+}
+
+func (p *panickyFraudCaseRepo) FindByTransactionIDTx(context.Context, pgx.Tx, domain.TransactionID) (*aggregate.FraudCase, error) {
+	panic("boom")
+}
 
 func (p *panickyFraudCaseRepo) FindByTransactionID(context.Context, domain.TransactionID) (*aggregate.FraudCase, error) {
 	panic("boom")

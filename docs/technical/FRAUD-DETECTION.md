@@ -148,8 +148,10 @@ sintética que explica el motivo en `GET /fraud-cases/{id}`, y se responden a Au
 - **Sin reglas, control apagado:** desactivar todas las reglas apaga el motor, en lugar de mandar
   todo a `REVIEW`. Queda un `WARN` al arrancar y en cada recarga del caché, y la alerta
   `FraudSinReglasActivas`.
-- **Sin `transaction_id` no hay respuesta:** no hay a quién responder. Se descarta con `Term`, un log y
-  `unevaluated_total{reason="unanswerable"}`; Authorization rechaza la venta con `FRAUD_TIMEOUT`.
+- **`transaction_id` ilegible en el payload:** se usa el `correlation_id` del envelope, que
+  Authorization llena con el mismo ID, y el pedido se rechaza como `INVALID_EVENT`. Solo si tampoco
+  ese es un UUID no hay a quién responder: se descarta con `Term`, un log y
+  `unevaluated_total{reason="unanswerable"}`. Authorization no genera esos eventos.
 
 ### 4.5 Alcance real de `REJECT`
 
@@ -176,7 +178,8 @@ NATS con `MAGSTRIPE`, cargando rechazos a mano o subiendo los pesos.
 Authorization        Fraud Detection                     Postgres
      │ check-requested     │                                 │
      ├────────────────────►│ lee el transaction_id           │
-     │                     │ ¿evento ya procesado? ─────────►│
+     │                     │ TX: marca evento procesado ────►│
+     │                     │ ¿la transacción ya tiene caso? ►│
      │                     │ valida el resto del pedido      │
      │                     │ crea FraudCase                  │
      │                     │ ── inicio de EvalTimeout ──     │
@@ -184,9 +187,8 @@ Authorization        Fraud Detection                     Postgres
      │                     │ 4 consultas de historial ──────►│
      │                     │ evalúa reglas en goroutines     │
      │                     │ ── fin de EvalTimeout ──        │
-     │                     │ TX: marca evento procesado,     │
-     │                     │     guarda FraudCase y encola   │
-     │                     │     el score en el outbox ─────►│
+     │                     │ guarda FraudCase y encola       │
+     │                     │ el score en el outbox; COMMIT ─►│
      │                     │ relay (cada 200 ms) ◄───────────│
      │ score-calculated    │                                 │
      │◄────────────────────┤                                 │
@@ -196,19 +198,28 @@ El presupuesto de tiempo (`ENGINE_EVAL_TIMEOUT`, 200 ms por defecto) cubre la ca
 historial. Las reglas en sí no hacen I/O: la evaluación en goroutines es prácticamente instantánea. El
 relay del outbox agrega hasta 200 ms más.
 
-La idempotencia se verifica antes de evaluar, así que una reentrega no repite las consultas ni las
-métricas. La marca en `processed_events` se vuelve a intentar en la transacción final: si dos entregas
-del mismo evento llegan juntas, las dos evalúan, pero solo una guarda y encola.
+Todo pasa en una transacción que empieza marcando el evento en `processed_events`:
+
+- **Reentrega de un evento ya procesado:** la marca no inserta y se descarta sin evaluar.
+- **Dos entregas simultáneas del mismo evento:** la segunda espera en la clave única hasta que la
+  primera confirma, y entonces se descarta. Si la primera falla, la segunda evalúa.
+- **Otro pedido de una transacción que ya tiene caso:** se responde con el score guardado, sin
+  evaluar. Si dos pedidos de la misma transacción evalúan a la vez, el que pierde el `INSERT` responde
+  con el caso del otro: el score publicado siempre coincide con el guardado.
+
+La evaluación corre dentro de la transacción y retiene una conexión hasta `ENGINE_EVAL_TIMEOUT`. El
+subscriber procesa un mensaje a la vez, así que es una por instancia, más las 4 del historial.
 
 ### Qué pasa cuando falla cada paso
 
 | Fallo | Resultado | Decisión | ¿Queda registro? |
 |---|---|---|---|
-| `transaction_id` inválido | `Term`; no hay a quién responder. Authorization rechaza con `FRAUD_TIMEOUT` | — | Log y métrica |
+| `transaction_id` ilegible en el payload | Se usa el `correlation_id` del envelope y se rechaza | `REJECT` | Caso, log y métrica |
+| Ni el payload ni el envelope traen un `transaction_id` | `Term`; no hay a quién responder | — | Log y métrica |
 | Terminal o comercio inválidos, monto no positivo o campo demasiado largo | Se responde un rechazo | `REJECT` | Caso, log y métrica |
 | No se pueden cargar las reglas | Score neutral | `REVIEW` | Caso, log y métrica |
 | No hay reglas activas | Control apagado | `APPROVE` | Caso, `WARN` y gauge |
-| Falla la verificación de idempotencia | `Nak` y reintento | Se recalcula | Log |
+| La transacción ya tiene caso | Se responde con el score guardado | La guardada | `WARN` |
 | Fallan **todas** las consultas de historial | Continúa con historial en cero | Solo por `RULE-005` | Ningún log |
 | Fallan **algunas** consultas de historial | Esas reglas no se activan | Score subestimado | Ningún log |
 | Se agota `EvalTimeout` durante el historial | Igual que los dos casos anteriores | Score subestimado | Solo `posnet_fraud_engine_timeouts_total` |
@@ -352,7 +363,7 @@ instancias pueden correr el relay a la vez (`FOR UPDATE SKIP LOCKED`).
 | Situación | Acción | Efecto |
 |---|---|---|
 | Envelope o payload inválido | `Term` | No se reintenta |
-| `ValidationError` o `ConflictError` | `Term` | No se reintenta. Hoy solo un `transaction_id` inválido |
+| `ValidationError` o `ConflictError` | `Term` | No se reintenta. Hoy solo un pedido sin `transaction_id` legible |
 | Cualquier otro error | `Nak` | Reentrega inmediata, sin backoff |
 
 Un mensaje que agota las entregas no pasa a una DLQ. Para recuperarlo, seguir el runbook
@@ -396,10 +407,11 @@ dejan de activarse sin ningún error.
 
 - **Atomicidad:** la marca en `processed_events`, el caso y el score en el outbox se confirman o se
   deshacen juntos, en una transacción `READ COMMITTED`.
-- **Idempotencia:** una reentrega de un evento ya procesado se descarta antes de evaluar. `ON CONFLICT
-  DO NOTHING` evita un segundo caso para la misma transacción.
-- **Respuesta:** todo pedido con `transaction_id` recibe un score, *at-least-once*. Si no llega antes de
-  `FRAUD_CHECK_TIMEOUT`, Authorization rechaza con `FRAUD_TIMEOUT` e ignora el score tardío.
+- **Idempotencia:** cada evento se evalúa una vez, aunque llegue repetido o en paralelo. Cada
+  transacción tiene un solo caso, y todo score publicado para ella es el de ese caso.
+- **Respuesta:** todo pedido con un `transaction_id` legible, en el payload o en el envelope, recibe un
+  score, *at-least-once*. Si no llega antes de `FRAUD_CHECK_TIMEOUT`, Authorization rechaza con
+  `FRAUD_TIMEOUT` e ignora el score tardío.
 
 ### Apagado
 
@@ -526,11 +538,9 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 ### Confiabilidad de la Saga
 
-| Brecha | Consecuencia | Dónde |
-|---|---|---|
-| Un pedido sin `transaction_id` válido no recibe respuesta | No hay a quién responder: Authorization rechaza con `FRAUD_TIMEOUT` al vencer su plazo. Queda log, métrica y la alerta `FraudSinEvaluar` | `EvaluateTransaction` |
-| Un segundo pedido de la misma transacción, con otro `event_id`, publica otro score | El caso guardado es el primero (`ON CONFLICT DO NOTHING`), pero el score nuevo se publica igual. Authorization no manda dos pedidos, y si llegara ignora el segundo fuera de `FRAUD_CHECKING` | `FraudCaseRepo.Save` |
-| Dos entregas simultáneas del mismo evento evalúan las dos | Solo una guarda y encola, pero las consultas de historial y la duración del motor se registran dos veces. Requiere una reentrega dentro del procesamiento, poco probable con `AckWait` de 30 s | `EvaluateTransaction` |
+No quedan brechas abiertas. Las garantías están en [§10](#garantías-actuales); el único pedido sin
+respuesta es uno sin `transaction_id` legible ni en el payload ni en el envelope, que Authorization no
+genera.
 
 ### Seguridad y administración
 

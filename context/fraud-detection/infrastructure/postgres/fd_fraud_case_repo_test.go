@@ -39,8 +39,40 @@ func TestFraudCaseRepo_Save_Success(t *testing.T) {
 	pool.ExpectRollback()
 
 	repo := postgres.NewFraudCaseRepo(pool)
-	if err := repo.Save(context.Background(), beginTx(t, pool), newFraudCase(t, domain.NewTransactionID())); err != nil {
-		t.Fatalf("Save() error = %v", err)
+	inserted, err := repo.Save(context.Background(), beginTx(t, pool), newFraudCase(t, domain.NewTransactionID()))
+	if err != nil || !inserted {
+		t.Fatalf("Save() = %v, %v, want true, nil", inserted, err)
+	}
+}
+
+// Si la transacción ya tiene un caso, ON CONFLICT no inserta: Save lo informa.
+func TestFraudCaseRepo_Save_ExistingCase(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectBegin()
+	pool.ExpectExec("INSERT INTO fraud_detection.fraud_cases").
+		WithArgs(anyArgs(14)...).
+		WillReturnResult(pgxmock.NewResult("INSERT", 0))
+	pool.ExpectRollback()
+
+	inserted, err := postgres.NewFraudCaseRepo(pool).Save(context.Background(), beginTx(t, pool), newFraudCase(t, domain.NewTransactionID()))
+	if err != nil || inserted {
+		t.Fatalf("Save() = %v, %v, want false, nil", inserted, err)
+	}
+}
+
+// FindByTransactionIDTx lee con la transacción, no con el pool.
+func TestFraudCaseRepo_FindByTransactionIDTx(t *testing.T) {
+	pool := newMockPool(t)
+	txID := domain.NewTransactionID()
+	pool.ExpectBegin()
+	pool.ExpectQuery("FROM fraud_detection.fraud_cases").
+		WithArgs(txID.String()).
+		WillReturnRows(fraudCaseRow(t, txID.String()))
+	pool.ExpectRollback()
+
+	fc, err := postgres.NewFraudCaseRepo(pool).FindByTransactionIDTx(context.Background(), beginTx(t, pool), txID)
+	if err != nil || fc == nil || !fc.TransactionID().Equals(txID) {
+		t.Fatalf("FindByTransactionIDTx() = %v, %v, want the case of %s", fc, err, txID)
 	}
 }
 
@@ -53,7 +85,7 @@ func TestFraudCaseRepo_Save_ExecError(t *testing.T) {
 	pool.ExpectRollback()
 
 	repo := postgres.NewFraudCaseRepo(pool)
-	err := repo.Save(context.Background(), beginTx(t, pool), newFraudCase(t, domain.NewTransactionID()))
+	_, err := repo.Save(context.Background(), beginTx(t, pool), newFraudCase(t, domain.NewTransactionID()))
 	if err == nil || !strings.Contains(err.Error(), "FraudCaseRepo.Save") {
 		t.Fatalf("error = %v, want it to contain %q", err, "FraudCaseRepo.Save")
 	}
@@ -82,7 +114,7 @@ func TestFraudCaseRepo_Save_SerializesRulesHitAndEvaluations(t *testing.T) {
 	pool.ExpectRollback()
 
 	repo := postgres.NewFraudCaseRepo(pool)
-	if err := repo.Save(context.Background(), beginTx(t, pool), fc); err != nil {
+	if _, err := repo.Save(context.Background(), beginTx(t, pool), fc); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 }
@@ -112,7 +144,7 @@ func TestFraudCaseRepo_Save_InvalidEventUsesNilUUIDs(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectRollback()
 
-	if err := postgres.NewFraudCaseRepo(pool).Save(context.Background(), beginTx(t, pool), fc); err != nil {
+	if _, err := postgres.NewFraudCaseRepo(pool).Save(context.Background(), beginTx(t, pool), fc); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 }

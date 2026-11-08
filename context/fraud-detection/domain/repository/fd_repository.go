@@ -14,8 +14,12 @@ import (
 // FraudCaseRepository persiste y recupera FraudCases.
 type FraudCaseRepository interface {
 	// Save persiste un FraudCase nuevo dentro de dbTx, la misma transacción que marca el evento
-	// como procesado y encola el score. Si la transacción ya tiene un caso, no hace nada.
-	Save(ctx context.Context, dbTx pgx.Tx, fc *aggregate.FraudCase) error
+	// como procesado y encola el score. Si la transacción ya tiene un caso, no hace nada y
+	// devuelve false.
+	Save(ctx context.Context, dbTx pgx.Tx, fc *aggregate.FraudCase) (inserted bool, err error)
+
+	// FindByTransactionIDTx es FindByTransactionID dentro de dbTx.
+	FindByTransactionIDTx(ctx context.Context, dbTx pgx.Tx, txID domain.TransactionID) (*aggregate.FraudCase, error)
 
 	// FindByTransactionID recupera el FraudCase de una transacción.
 	// Retorna nil si no existe — una transacción puede no haber sido evaluada.

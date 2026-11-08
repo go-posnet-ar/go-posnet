@@ -35,17 +35,3 @@ func expectClaimed(pool pgxmock.PgxPoolIface, rowsAffected int64) {
 	pool.ExpectCommit()
 	pool.ExpectRollback()
 }
-
-// expectNotProcessed simula la verificación previa de idempotencia de un evento nuevo.
-func expectNotProcessed(pool pgxmock.PgxPoolIface) {
-	pool.ExpectQuery("SELECT 1 FROM " + idempotencySchema + ".processed_events").
-		WithArgs(pgxmock.AnyArg()).
-		WillReturnRows(pgxmock.NewRows([]string{"?column?"}))
-}
-
-// expectAlreadyProcessed simula la verificación previa de un evento ya procesado.
-func expectAlreadyProcessed(pool pgxmock.PgxPoolIface) {
-	pool.ExpectQuery("SELECT 1 FROM " + idempotencySchema + ".processed_events").
-		WithArgs(pgxmock.AnyArg()).
-		WillReturnRows(pgxmock.NewRows([]string{"?column?"}).AddRow(1))
-}

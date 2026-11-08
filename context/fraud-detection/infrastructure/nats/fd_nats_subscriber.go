@@ -84,6 +84,7 @@ func (s *FD_Subscriber) handleFraudCheckRequested(msg *natsclient.Msg) {
 
 	cmd := port.EvaluateTransactionCommand{
 		EventID:       envelope.EventID,
+		CorrelationID: envelope.CorrelationID,
 		TransactionID: payload.TransactionID,
 		TerminalID:    payload.TerminalID,
 		MerchantID:    payload.MerchantID,

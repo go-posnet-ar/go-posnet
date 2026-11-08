@@ -28,6 +28,7 @@ type AdminService interface {
 // EvaluateTransactionCommand contiene los datos del evento FraudCheckRequested.
 type EvaluateTransactionCommand struct {
 	EventID       string // UUID del evento NATS — clave de idempotencia
+	CorrelationID string // correlation_id del envelope: el TransactionID, por si el payload trae uno ilegible
 	TransactionID string
 	TerminalID    string
 	MerchantID    string
