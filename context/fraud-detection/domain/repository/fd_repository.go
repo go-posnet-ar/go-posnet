@@ -4,6 +4,8 @@ package repository
 import (
 	"context"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/juantevez/go-posnet/context/fraud-detection/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/fraud-detection/domain/entity"
 	"github.com/juantevez/go-posnet/pkg/domain"
@@ -11,8 +13,9 @@ import (
 
 // FraudCaseRepository persiste y recupera FraudCases.
 type FraudCaseRepository interface {
-	// Save persiste un FraudCase nuevo.
-	Save(ctx context.Context, fc *aggregate.FraudCase) error
+	// Save persiste un FraudCase nuevo dentro de dbTx, la misma transacción que marca el evento
+	// como procesado y encola el score. Si la transacción ya tiene un caso, no hace nada.
+	Save(ctx context.Context, dbTx pgx.Tx, fc *aggregate.FraudCase) error
 
 	// FindByTransactionID recupera el FraudCase de una transacción.
 	// Retorna nil si no existe — una transacción puede no haber sido evaluada.

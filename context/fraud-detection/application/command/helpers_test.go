@@ -2,6 +2,8 @@ package command_test
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5"
 	"testing"
 	"time"
 
@@ -28,7 +30,7 @@ type fakeFraudCaseRepo struct {
 
 var _ repository.FraudCaseRepository = (*fakeFraudCaseRepo)(nil)
 
-func (f *fakeFraudCaseRepo) Save(_ context.Context, fc *aggregate.FraudCase) error {
+func (f *fakeFraudCaseRepo) Save(_ context.Context, _ pgx.Tx, fc *aggregate.FraudCase) error {
 	f.savedCases = append(f.savedCases, fc)
 	return f.saveErr
 }
@@ -42,6 +44,7 @@ func (f *fakeFraudCaseRepo) FindByTransactionID(_ context.Context, _ domain.Tran
 type fakeRuleRepo struct {
 	rules      []*entity.FraudRule
 	findErr    error
+	findCalls  int
 	saveErr    error
 	savedRules []*entity.FraudRule
 }
@@ -49,6 +52,7 @@ type fakeRuleRepo struct {
 var _ repository.FraudRuleRepository = (*fakeRuleRepo)(nil)
 
 func (f *fakeRuleRepo) FindAllActive(context.Context) ([]*entity.FraudRule, error) {
+	f.findCalls++
 	return f.rules, f.findErr
 }
 
@@ -91,7 +95,7 @@ type fakePublisher struct {
 
 var _ service.EventPublisher = (*fakePublisher)(nil)
 
-func (f *fakePublisher) PublishFraudScoreCalculated(_ context.Context, fc *aggregate.FraudCase) error {
+func (f *fakePublisher) PublishFraudScoreCalculated(_ context.Context, _ pgx.Tx, fc *aggregate.FraudCase) error {
 	f.publishCalls++
 	f.lastFraudCase = fc
 	return f.publishErr

@@ -2,6 +2,8 @@ package nats
 
 import (
 	"context"
+
+	"github.com/jackc/pgx/v5"
 	"testing"
 	"time"
 
@@ -66,7 +68,7 @@ type fakeFraudCaseRepo struct {
 
 var _ repository.FraudCaseRepository = (*fakeFraudCaseRepo)(nil)
 
-func (f *fakeFraudCaseRepo) Save(_ context.Context, fc *aggregate.FraudCase) error {
+func (f *fakeFraudCaseRepo) Save(_ context.Context, _ pgx.Tx, fc *aggregate.FraudCase) error {
 	f.savedCases = append(f.savedCases, fc)
 	return f.saveErr
 }
@@ -117,7 +119,7 @@ type fakeDomainPublisher struct {
 
 var _ service.EventPublisher = (*fakeDomainPublisher)(nil)
 
-func (f *fakeDomainPublisher) PublishFraudScoreCalculated(context.Context, *aggregate.FraudCase) error {
+func (f *fakeDomainPublisher) PublishFraudScoreCalculated(context.Context, pgx.Tx, *aggregate.FraudCase) error {
 	f.publishCalls++
 	return nil
 }

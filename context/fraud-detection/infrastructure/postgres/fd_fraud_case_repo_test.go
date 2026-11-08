@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/pashagolub/pgxmock/v4"
 
+	"github.com/juantevez/go-posnet/context/fraud-detection/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/fraud-detection/domain/valueobject"
 	"github.com/juantevez/go-posnet/context/fraud-detection/infrastructure/postgres"
 	"github.com/juantevez/go-posnet/pkg/domain"
@@ -17,26 +18,42 @@ import (
 
 // ─── Save ───────────────────────────────────────────────────────────────────
 
+// beginTx abre una transacción del pool mock. Las expectations de la transacción se declaran
+// antes: ExpectBegin, lo que ejecuta, y ExpectRollback.
+func beginTx(t *testing.T, pool pgxmock.PgxPoolIface) pgx.Tx {
+	t.Helper()
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	return tx
+}
+
 func TestFraudCaseRepo_Save_Success(t *testing.T) {
 	pool := newMockPool(t)
+	pool.ExpectBegin()
 	pool.ExpectExec("INSERT INTO fraud_detection.fraud_cases").
 		WithArgs(anyArgs(14)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectRollback()
 
 	repo := postgres.NewFraudCaseRepo(pool)
-	if err := repo.Save(context.Background(), newFraudCase(t, domain.NewTransactionID())); err != nil {
+	if err := repo.Save(context.Background(), beginTx(t, pool), newFraudCase(t, domain.NewTransactionID())); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 }
 
 func TestFraudCaseRepo_Save_ExecError(t *testing.T) {
 	pool := newMockPool(t)
+	pool.ExpectBegin()
 	pool.ExpectExec("INSERT INTO fraud_detection.fraud_cases").
 		WithArgs(anyArgs(14)...).
 		WillReturnError(errors.New("connection reset"))
+	pool.ExpectRollback()
 
 	repo := postgres.NewFraudCaseRepo(pool)
-	err := repo.Save(context.Background(), newFraudCase(t, domain.NewTransactionID()))
+	err := repo.Save(context.Background(), beginTx(t, pool), newFraudCase(t, domain.NewTransactionID()))
 	if err == nil || !strings.Contains(err.Error(), "FraudCaseRepo.Save") {
 		t.Fatalf("error = %v, want it to contain %q", err, "FraudCaseRepo.Save")
 	}
@@ -52,6 +69,7 @@ func TestFraudCaseRepo_Save_SerializesRulesHitAndEvaluations(t *testing.T) {
 		{"rule_id": "RULE-001", "activated": true, "score_contribution": 30, "reason": "high velocity"},
 	}
 
+	pool.ExpectBegin()
 	pool.ExpectExec("INSERT INTO fraud_detection.fraud_cases").
 		WithArgs(
 			fc.ID(), fc.TransactionID().String(),
@@ -61,12 +79,84 @@ func TestFraudCaseRepo_Save_SerializesRulesHitAndEvaluations(t *testing.T) {
 			fc.EvaluatedAt(),
 		).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectRollback()
 
 	repo := postgres.NewFraudCaseRepo(pool)
-	if err := repo.Save(context.Background(), fc); err != nil {
+	if err := repo.Save(context.Background(), beginTx(t, pool), fc); err != nil {
 		t.Fatalf("Save() error = %v", err)
 	}
 }
+
+// El caso de un pedido inválido puede no tener terminal ni comercio: se guardan como UUID nulo.
+func TestFraudCaseRepo_Save_InvalidEventUsesNilUUIDs(t *testing.T) {
+	pool := newMockPool(t)
+	fc, err := aggregate.NewInvalidEventCase(aggregate.InvalidEventParams{
+		TransactionID: domain.NewTransactionID(),
+		OccurredAt:    time.Now().UTC(),
+		Reason:        "invalid terminal_id; invalid merchant_id",
+	})
+	if err != nil {
+		t.Fatalf("NewInvalidEventCase() error = %v", err)
+	}
+	const nilUUID = "00000000-0000-0000-0000-000000000000"
+
+	pool.ExpectBegin()
+	pool.ExpectExec("INSERT INTO fraud_detection.fraud_cases").
+		WithArgs(
+			fc.ID(), fc.TransactionID().String(),
+			nilUUID, nilUUID, int64(0), "", "", "", fc.OccurredAt(),
+			100, "REJECT",
+			pgxmock.AnyArg(), pgxmock.AnyArg(),
+			fc.EvaluatedAt(),
+		).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectRollback()
+
+	if err := postgres.NewFraudCaseRepo(pool).Save(context.Background(), beginTx(t, pool), fc); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+}
+
+// ─── CountOutboxStuck / MissingSchema ────────────────────────────────────────
+
+func TestFraudCaseRepo_CountOutboxStuck(t *testing.T) {
+	pool := newMockPool(t)
+	before := time.Now()
+	pool.ExpectQuery("SELECT COUNT\\(\\*\\) FROM fraud_detection.outbox").
+		WithArgs(before).
+		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(int64(3)))
+
+	n, err := postgres.NewFraudCaseRepo(pool).CountOutboxStuck(context.Background(), before)
+	if err != nil || n != 3 {
+		t.Fatalf("CountOutboxStuck() = %d, %v, want 3, nil", n, err)
+	}
+}
+
+func TestFraudCaseRepo_MissingSchema(t *testing.T) {
+	tests := []struct {
+		name  string
+		found *string
+		want  int
+	}{
+		{"outbox present", ptr("fraud_detection.outbox"), 0},
+		{"outbox missing", nil, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newMockPool(t)
+			pool.ExpectQuery("SELECT to_regclass").
+				WithArgs("fraud_detection.outbox").
+				WillReturnRows(pgxmock.NewRows([]string{"to_regclass"}).AddRow(tc.found))
+
+			missing, err := postgres.NewFraudCaseRepo(pool).MissingSchema(context.Background())
+			if err != nil || len(missing) != tc.want {
+				t.Fatalf("MissingSchema() = %v, %v, want %d missing", missing, err, tc.want)
+			}
+		})
+	}
+}
+
+func ptr(s string) *string { return &s }
 
 // ─── FindByTransactionID ─────────────────────────────────────────────────────
 

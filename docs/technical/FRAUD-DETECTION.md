@@ -13,13 +13,15 @@ decisión y devuelve el resultado. No llama al adquirente: la Saga continúa en 
 El motor funciona, pero tiene tres limitaciones que conviene conocer antes de confiar en él:
 
 - **Los umbrales no son configurables**, aunque la API y las variables de entorno sugieran lo contrario.
-- **Ante fallas de infraestructura, deja pasar las transacciones**, a veces sin dejar rastro.
+- **Ante fallas de infraestructura, deja pasar las transacciones.** Si falla el motor, queda el caso
+  con `REVIEW` y una métrica; si falla el historial, no queda rastro.
 - **El flujo QR no puede llegar a `REJECT`** con los pesos por defecto (ver [§4.5](#45-alcance-real-de-reject)).
 
 | Capacidad | Estado | Detalle |
 |---|---|---|
 | Evaluación de 5 reglas y cálculo del score | Implementado | Lógica en memoria, tras cargar el historial |
-| Registro de casos (`FraudCase`) | Implementado | Excepto cuando falla el motor |
+| Registro de casos (`FraudCase`) | Implementado | También los scores neutrales y los pedidos inválidos |
+| Respuesta garantizada a Authorization | Implementado | Outbox en la transacción del caso; ver [§9](#9-eventos-nats) |
 | Consulta de casos y reglas | Implementado | HTTP, sin autenticación |
 | Cambio del peso de una regla sin redespliegue | Implementado | `PUT /rules/{id}/threshold` |
 | Cambio del umbral de una regla | **No tiene efecto** | Se guarda, pero las reglas no lo leen |
@@ -55,14 +57,14 @@ Las consecuencias de estos pendientes están en [§12](#12-brechas-conocidas).
 |---|---|
 | [`cmd/fraud-detection/fd_main.go`](../../cmd/fraud-detection/fd_main.go) | Arranque y apagado |
 | [`cmd/fraud-detection/fd_wire.go`](../../cmd/fraud-detection/fd_wire.go) | Wiring de dependencias |
-| [`domain/aggregate/`](../../context/fraud-detection/domain/aggregate/) | `FraudCase` y score neutral |
+| [`domain/aggregate/`](../../context/fraud-detection/domain/aggregate/) | `FraudCase`, score neutral, pedidos inválidos y sin reglas |
 | [`domain/entity/`](../../context/fraud-detection/domain/entity/) | `FraudRule` |
 | [`domain/service/`](../../context/fraud-detection/domain/service/) | `RuleEngine`: el motor y las reglas |
 | [`domain/valueobject/`](../../context/fraud-detection/domain/valueobject/) | `FraudScore`, `FraudDecision`, `RuleEvaluation` |
 | [`domain/repository/`](../../context/fraud-detection/domain/repository/) | Puertos de casos, reglas e historial |
 | [`application/command/`](../../context/fraud-detection/application/command/) | Evaluación, administración y métricas |
 | [`application/query/`](../../context/fraud-detection/application/query/) | Consulta de casos y reglas |
-| [`infrastructure/nats/`](../../context/fraud-detection/infrastructure/nats/) | Publisher y subscriber |
+| [`infrastructure/nats/`](../../context/fraud-detection/infrastructure/nats/) | Publisher (al outbox) y subscriber |
 | [`infrastructure/postgres/`](../../context/fraud-detection/infrastructure/postgres/) | Repositorios y caché de reglas |
 | [`infrastructure/http/`](../../context/fraud-detection/infrastructure/http/) | Health checks, consulta y administración |
 | [`infrastructure/grpc/server/`](../../context/fraud-detection/infrastructure/grpc/server/) | Servidor sin servicios |
@@ -82,8 +84,8 @@ Representa el análisis de una transacción. Se evalúa una sola vez y no tiene 
 | `id` | UUID propio del caso |
 | `transactionID` | Correlación con la transacción; único en la tabla |
 | `terminalID`, `merchantID` | Terminal y comercio |
-| `amountCents`, `currency` | Monto; debe ser positivo |
-| `cardNetwork`, `entryMode` | Datos de la tarjeta; no se validan contra un catálogo |
+| `amountCents`, `currency` | Monto, que debe ser positivo, y moneda de hasta 3 caracteres |
+| `cardNetwork`, `entryMode` | Datos de la tarjeta; hasta 20 caracteres, sin validar contra un catálogo |
 | `occurredAt` | Fecha de la transacción; si no se puede interpretar, se usa la actual |
 | `evaluations` | Resultado de cada regla |
 | `score` | Score, decisión y reglas activadas |
@@ -127,11 +129,27 @@ El score es la suma de los pesos activados, con un máximo de 100. Los límites 
 | 50–69 | `REVIEW` | Continúa hacia el adquirente; no hay revisión posterior |
 | 70–100 | `REJECT` | Rechaza con `FRAUD_REJECTED` |
 
-### 4.4 Score neutral
+### 4.4 Scores que no salen de las reglas
 
-Si el motor falla por completo, se publica un score de 50 (`REVIEW`) con la regla `BYPASS` en
-`rules_hit`, para que la transacción siga su curso. Es una decisión de *fail-open*: se prioriza que el
-pago continúe por encima del control de fraude.
+Tres casos tienen un score fijo. Los tres se guardan como cualquier otro caso, con una evaluación
+sintética que explica el motivo en `GET /fraud-cases/{id}`, y se responden a Authorization:
+
+| Caso | Evaluación | Score | Decisión | Métrica |
+|---|---|---|---|---|
+| El motor falla: no se pueden cargar las reglas | `BYPASS`, activada | 50 | `REVIEW` | `unevaluated_total{reason="engine_failure"}` |
+| El pedido no se puede evaluar: terminal o comercio que no son UUID, monto no positivo, o un campo más largo que su columna | `INVALID_EVENT`, activada, con los campos que fallaron | 100 | `REJECT` | `unevaluated_total{reason="invalid_event"}` |
+| No hay reglas activas | `NO_ACTIVE_RULES`, no activada | 0 | `APPROVE` | `posnet_fraud_active_rules` en 0 |
+
+- **Motor caído, *fail-open*:** se prioriza que el pago continúe por encima del control de fraude.
+- **Pedido inválido, *fail-closed*:** Authorization lo rechaza al instante con `FRAUD_REJECTED`. Sin
+  respuesta, esperaría su timeout y rechazaría con `FRAUD_TIMEOUT`, que invita a reintentar algo que
+  no se va a arreglar. El caso guarda solo los campos válidos: un terminal o comercio ilegible queda
+  como UUID nulo.
+- **Sin reglas, control apagado:** desactivar todas las reglas apaga el motor, en lugar de mandar
+  todo a `REVIEW`. Queda un `WARN` al arrancar y en cada recarga del caché, y la alerta
+  `FraudSinReglasActivas`.
+- **Sin `transaction_id` no hay respuesta:** no hay a quién responder. Se descarta con `Term`, un log y
+  `unevaluated_total{reason="unanswerable"}`; Authorization rechaza la venta con `FRAUD_TIMEOUT`.
 
 ### 4.5 Alcance real de `REJECT`
 
@@ -157,34 +175,46 @@ NATS con `MAGSTRIPE`, cargando rechazos a mano o subiendo los pesos.
 ```
 Authorization        Fraud Detection                     Postgres
      │ check-requested     │                                 │
-     ├────────────────────►│ valida IDs y monto              │
+     ├────────────────────►│ lee el transaction_id           │
+     │                     │ ¿evento ya procesado? ─────────►│
+     │                     │ valida el resto del pedido      │
      │                     │ crea FraudCase                  │
      │                     │ ── inicio de EvalTimeout ──     │
      │                     │ carga reglas (caché)            │
      │                     │ 4 consultas de historial ──────►│
      │                     │ evalúa reglas en goroutines     │
      │                     │ ── fin de EvalTimeout ──        │
-     │                     │ TX: marca evento procesado      │
-     │                     │ guarda FraudCase ──────────────►│
+     │                     │ TX: marca evento procesado,     │
+     │                     │     guarda FraudCase y encola   │
+     │                     │     el score en el outbox ─────►│
+     │                     │ relay (cada 200 ms) ◄───────────│
      │ score-calculated    │                                 │
      │◄────────────────────┤                                 │
 ```
 
 El presupuesto de tiempo (`ENGINE_EVAL_TIMEOUT`, 200 ms por defecto) cubre la carga de reglas y el
-historial. Las reglas en sí no hacen I/O: la evaluación en goroutines es prácticamente instantánea.
+historial. Las reglas en sí no hacen I/O: la evaluación en goroutines es prácticamente instantánea. El
+relay del outbox agrega hasta 200 ms más.
+
+La idempotencia se verifica antes de evaluar, así que una reentrega no repite las consultas ni las
+métricas. La marca en `processed_events` se vuelve a intentar en la transacción final: si dos entregas
+del mismo evento llegan juntas, las dos evalúan, pero solo una guarda y encola.
 
 ### Qué pasa cuando falla cada paso
 
 | Fallo | Resultado | Decisión | ¿Queda registro? |
 |---|---|---|---|
-| IDs inválidos o monto no positivo | `Term`; no se publica nada, y Authorization queda esperando | — | Log |
-| No se pueden cargar las reglas, o no hay ninguna activa | Score neutral, sin guardar el caso | `REVIEW` | Log; sin caso ni métrica de evaluación |
+| `transaction_id` inválido | `Term`; no hay a quién responder. Authorization rechaza con `FRAUD_TIMEOUT` | — | Log y métrica |
+| Terminal o comercio inválidos, monto no positivo o campo demasiado largo | Se responde un rechazo | `REJECT` | Caso, log y métrica |
+| No se pueden cargar las reglas | Score neutral | `REVIEW` | Caso, log y métrica |
+| No hay reglas activas | Control apagado | `APPROVE` | Caso, `WARN` y gauge |
+| Falla la verificación de idempotencia | `Nak` y reintento | Se recalcula | Log |
 | Fallan **todas** las consultas de historial | Continúa con historial en cero | Solo por `RULE-005` | Ningún log |
 | Fallan **algunas** consultas de historial | Esas reglas no se activan | Score subestimado | Ningún log |
 | Se agota `EvalTimeout` durante el historial | Igual que los dos casos anteriores | Score subestimado | Solo `posnet_fraud_engine_timeouts_total` |
-| Error al guardar el caso | `Nak` y reintento | Se recalcula | Log |
-| Falla la publicación del score | Se registra y se confirma; Authorization no recibe nada | — | Caso guardado y log |
-| Caída entre el guardado y la publicación | La reentrega se descarta como duplicado; Authorization no recibe nada | — | Caso guardado |
+| Error al guardar el caso o al encolar el score | Se deshace todo, también la marca; `Nak` y reintento | Se recalcula | Log |
+| NATS caído al publicar | El score espera en el outbox y sale cuando vuelve. Si tarda más que `FRAUD_CHECK_TIMEOUT`, Authorization ya rechazó y lo ignora | — | Caso, `posnet_fraud_outbox_stuck` |
+| Caída después de confirmar | El relay publica el score al arrancar; la reentrega se descarta como duplicado | — | Caso guardado |
 
 **El caso más importante es el historial:** una base de datos lenta o caída no produce un error
 visible. Las reglas de historial simplemente no se activan y la transacción figura como un `APPROVE`
@@ -303,23 +333,26 @@ Todos los eventos usan el envelope de [`pkg/events/envelope.go`](../../pkg/event
 
 ### Publicado
 
-`posnet.fraud.score-calculated.v1`, en `POSNET_FRAUD`, consumido por Authorization. Se publica
-directamente, sin outbox.
+`posnet.fraud.score-calculated.v1`, en `POSNET_FRAUD`, consumido por Authorization. Se escribe en
+`fraud_detection.outbox` en la misma transacción que guarda el caso, y el relay de
+[`pkg/outbox`](../../pkg/outbox/outbox.go) lo publica cada 200 ms, en lotes de hasta 100, con el
+`event_id` como `Nats-Msg-Id`: si lo publica dos veces, JetStream descarta la segunda. Varias
+instancias pueden correr el relay a la vez (`FOR UPDATE SKIP LOCKED`).
 
 | Campo | Notas |
 |---|---|
 | `transaction_id` | Correlación |
 | `score` | 0–100 |
 | `decision` | `APPROVE`, `REVIEW` o `REJECT` |
-| `rules_hit` | IDs de las reglas activadas, o `BYPASS` |
-| `evaluated_at` | RFC3339 UTC |
+| `rules_hit` | IDs de las reglas activadas, `BYPASS` o `INVALID_EVENT` |
+| `evaluated_at` | RFC3339 UTC; momento de la evaluación, no de la publicación |
 
 ### Tratamiento de errores
 
 | Situación | Acción | Efecto |
 |---|---|---|
 | Envelope o payload inválido | `Term` | No se reintenta |
-| `ValidationError` o `ConflictError` | `Term` | No se reintenta |
+| `ValidationError` o `ConflictError` | `Term` | No se reintenta. Hoy solo un `transaction_id` inválido |
 | Cualquier otro error | `Nak` | Reentrega inmediata, sin backoff |
 
 Un mensaje que agota las entregas no pasa a una DLQ. Para recuperarlo, seguir el runbook
@@ -327,16 +360,26 @@ Un mensaje que agota las entregas no pasa a una DLQ. Para recuperarlo, seguir el
 
 ## 10. Persistencia
 
-Schema `fraud_detection`. **La fuente real es
+Schema `fraud_detection`. **Una base nueva sale de
 [`01-init.sql`](../../deployments/docker/docker-entrypoint-initdb.d/01-init.sql):** `pgutil.Migrate` no
-hace nada, `migrations/fraud-detection/` está vacío y
-[`fd_schema.sql`](../../context/fraud-detection/infrastructure/postgres/fd_schema.sql) no se ejecuta.
+hace nada y [`fd_schema.sql`](../../context/fraud-detection/infrastructure/postgres/fd_schema.sql) no
+se ejecuta. A una base existente hay que aplicarle a mano las migraciones de
+[`migrations/fraud-detection/`](../../migrations/fraud-detection/):
+
+| Migración | Contenido | Sin ella |
+|---|---|---|
+| `000001_outbox` | Tabla `outbox` e índice por `created_at` | El servicio no arranca: lo verifica antes de consumir |
+
+```bash
+psql "$POSTGRES_DSN" -f migrations/fraud-detection/000001_outbox.up.sql
+```
 
 | Tabla | Propósito | Claves e índices |
 |---|---|---|
 | `fraud_cases` | Casos evaluados | PK `id`; `transaction_id` único |
 | `fraud_rules` | Catálogo de reglas | PK `id`; cargado con las 5 reglas |
 | `processed_events` | Idempotencia | PK `event_id` |
+| `outbox` | Scores por publicar | PK `id`; índice por `created_at` |
 
 Diferencia entre ambos archivos: `fd_schema.sql` define dos índices sobre `fraud_cases`
 (`idx_fd_cases_terminal` e `idx_fd_cases_decision`) que `01-init.sql` no crea.
@@ -351,16 +394,19 @@ dejan de activarse sin ningún error.
 
 ### Garantías actuales
 
-- **Idempotencia:** el evento se marca en `processed_events` después de evaluar. Una reentrega vuelve a
-  ejecutar el motor y a registrar las métricas, y recién después se descarta. `ON CONFLICT DO NOTHING`
-  evita un segundo caso para la misma transacción.
-- **Publicación:** sin outbox. Si se pierde el score, la transacción queda trabada en Authorization, que
-  no tiene timeout ni bypass.
+- **Atomicidad:** la marca en `processed_events`, el caso y el score en el outbox se confirman o se
+  deshacen juntos, en una transacción `READ COMMITTED`.
+- **Idempotencia:** una reentrega de un evento ya procesado se descarta antes de evaluar. `ON CONFLICT
+  DO NOTHING` evita un segundo caso para la misma transacción.
+- **Respuesta:** todo pedido con `transaction_id` recibe un score, *at-least-once*. Si no llega antes de
+  `FRAUD_CHECK_TIMEOUT`, Authorization rechaza con `FRAUD_TIMEOUT` e ignora el score tardío.
 
 ### Apagado
 
-Ante `SIGINT` o `SIGTERM`: detiene HTTP (hasta 10 s), drena y cierra NATS, y cierra el pool de Postgres.
-El servidor gRPC no se detiene de forma ordenada.
+Ante `SIGINT` o `SIGTERM`: detiene HTTP (hasta 10 s), drena NATS, que espera a los handlers en curso,
+detiene el relay y cierra el pool de Postgres. Mientras dura el drenaje, el relay sigue publicando; lo
+que no llegue a salir queda en el outbox para el próximo arranque. El servidor gRPC no se detiene de
+forma ordenada.
 
 ## 11. Observabilidad y operación
 
@@ -368,7 +414,10 @@ El servidor gRPC no se detiene de forma ordenada.
 
 | Métrica | Tipo | Labels | Significado |
 |---|---|---|---|
-| `posnet_fraud_evaluations_total` | Counter | `decision` | Evaluaciones completas; excluye los scores neutrales |
+| `posnet_fraud_evaluations_total` | Counter | `decision` | Scores encolados, también los fijos de [§4.4](#44-scores-que-no-salen-de-las-reglas); no cuenta reentregas |
+| `posnet_fraud_unevaluated_total` | Counter | `reason` | Scores que no salieron de las reglas: `engine_failure`, `invalid_event` o `unanswerable` |
+| `posnet_fraud_outbox_stuck` | Gauge | — | Scores en el outbox desde hace más de un minuto |
+| `posnet_fraud_active_rules` | Gauge | — | Reglas activas; en 0, todo se aprueba |
 | `posnet_fraud_score_histogram` | Histogram | — | Distribución de scores |
 | `posnet_fraud_engine_duration_seconds` | Histogram | — | Duración del motor |
 | `posnet_fraud_rule_hits_total` | Counter | `rule` | Activaciones por regla |
@@ -376,9 +425,9 @@ El servidor gRPC no se detiene de forma ordenada.
 | `posnet_fraud_rules_cache_hits_total` | Counter | — | Lecturas de reglas desde la caché |
 | `posnet_fraud_rules_cache_misses_total` | Counter | — | Lecturas de reglas desde Postgres |
 
-Como los scores neutrales y las fallas de historial no se distinguen en estas métricas, **una tasa alta
-de `APPROVE` puede ocultar un motor degradado**. El indicador disponible es
-`posnet_fraud_engine_timeouts_total`, y solo cubre los timeouts.
+Los scores neutrales se ven en `posnet_fraud_unevaluated_total`, pero las fallas de historial no se
+distinguen: **una tasa alta de `APPROVE` puede ocultar un historial degradado**. El indicador disponible
+es `posnet_fraud_engine_timeouts_total`, y solo cubre los timeouts.
 
 ### Alertas y dashboards
 
@@ -388,6 +437,9 @@ Reglas en [`warning.yml`](../../deployments/docker/prometheus/rules/warning.yml)
 |---|---|---|
 | `EvalTimeoutsFraud` | Warning | Más de 0,01 timeouts/s durante 5 min |
 | `CacheRulesLow` | Warning | Hit ratio de la caché por debajo del 90 % durante 10 min |
+| `OutboxFraudTrabado` | Warning | Scores en el outbox hace más de un minuto, durante 5 min |
+| `FraudSinReglasActivas` | Warning | Ninguna regla activa durante 5 min |
+| `FraudSinEvaluar` | Warning | Algún score que no salió de las reglas en 5 min, por `reason` |
 
 `CacheRulesLow` también puede activarse con poco tráfico, porque con menos de 10 lecturas por período
 de caché el hit ratio no llega al 90 %.
@@ -414,7 +466,7 @@ de caché el hit ratio no llega al 90 %.
 | `ENGINE_SCORE_THRESHOLD_REJECT` | `70` | **No**: solo se valida y se registra en el log |
 | `ENGINE_SCORE_THRESHOLD_REVIEW` | `50` | **No**: solo se valida y se registra en el log |
 | `GRPC_PORT` | `9092` | **No**: el puerto está fijo en 9092 |
-| `MIGRATIONS_DIR` | `migrations/fraud-detection` | **No**: `Migrate` no hace nada |
+| `MIGRATIONS_DIR` | `migrations/fraud-detection` | **No**: `Migrate` no hace nada; las migraciones se aplican a mano |
 
 Si `REVIEW` es mayor o igual que `REJECT`, el servicio no arranca, aunque esos valores no se usen.
 
@@ -476,12 +528,9 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| El score se publica sin outbox | Si falla o el proceso cae, Authorization queda en `FRAUD_CHECKING`. El log dice `authorization will apply bypass`, pero ese mecanismo no existe | `EvaluateTransaction` |
-| Un evento inválido no recibe respuesta | Se descarta sin publicar un score, y Authorization queda esperando | `EvaluateTransaction` |
-| El score neutral no se guarda ni marca el evento | No queda caso auditable: `GET /fraud-cases` devuelve `404`, y una reentrega puede publicar un segundo score con otro `event_id` | `EvaluateTransaction` |
-| Sin reglas activas, todo es `REVIEW` | Desactivar todas las reglas no apaga el motor: cada transacción pasa con score neutral | `RuleEngine.Evaluate` |
-| El motor corre antes de la idempotencia | Una reentrega repite las consultas y duplica las métricas de evaluación. El comentario del handler describe el orden inverso | `EvaluateTransaction` |
-| `Save` queda fuera de la transacción | Usa el pool en lugar de `tx`. Hoy es inocuo gracias a `ON CONFLICT DO NOTHING`, pero contradice el comentario de que es atómico | `EvaluateTransaction` |
+| Un pedido sin `transaction_id` válido no recibe respuesta | No hay a quién responder: Authorization rechaza con `FRAUD_TIMEOUT` al vencer su plazo. Queda log, métrica y la alerta `FraudSinEvaluar` | `EvaluateTransaction` |
+| Un segundo pedido de la misma transacción, con otro `event_id`, publica otro score | El caso guardado es el primero (`ON CONFLICT DO NOTHING`), pero el score nuevo se publica igual. Authorization no manda dos pedidos, y si llegara ignora el segundo fuera de `FRAUD_CHECKING` | `FraudCaseRepo.Save` |
+| Dos entregas simultáneas del mismo evento evalúan las dos | Solo una guarda y encola, pero las consultas de historial y la duración del motor se registran dos veces. Requiere una reentrega dentro del procesamiento, poco probable con `AckWait` de 30 s | `EvaluateTransaction` |
 
 ### Seguridad y administración
 

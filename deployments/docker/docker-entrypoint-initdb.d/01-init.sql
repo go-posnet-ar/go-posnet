@@ -188,6 +188,14 @@ CREATE TABLE IF NOT EXISTS fraud_detection.processed_events (
     event_id     UUID        PRIMARY KEY,
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE TABLE IF NOT EXISTS fraud_detection.outbox (
+    id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    subject    TEXT        NOT NULL,
+    event_id   TEXT        NOT NULL,
+    payload    BYTEA       NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_fd_outbox_created_at ON fraud_detection.outbox (created_at);
 
 -- settlement
 CREATE TABLE IF NOT EXISTS settlement.settlement_batches (

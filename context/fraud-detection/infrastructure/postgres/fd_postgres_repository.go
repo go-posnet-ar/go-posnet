@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -39,7 +40,20 @@ func NewFraudCaseRepo(pool pgxPool) *FraudCaseRepo {
 	return &FraudCaseRepo{pool: pool}
 }
 
-func (r *FraudCaseRepo) Save(ctx context.Context, fc *aggregate.FraudCase) error {
+// nilUUID reemplaza un terminal_id o merchant_id ilegible en el caso de un pedido inválido: las
+// columnas son UUID NOT NULL.
+const nilUUID = "00000000-0000-0000-0000-000000000000"
+
+func uuidOrNil(s string) string {
+	if s == "" {
+		return nilUUID
+	}
+	return s
+}
+
+// Save inserta el caso con dbTx: confirma o se deshace junto con la marca de idempotencia y el
+// score en el outbox.
+func (r *FraudCaseRepo) Save(ctx context.Context, dbTx pgx.Tx, fc *aggregate.FraudCase) error {
 	rulesHit, _ := json.Marshal(fc.Score().RulesHit())
 
 	type evalRow struct {
@@ -67,9 +81,9 @@ func (r *FraudCaseRepo) Save(ctx context.Context, fc *aggregate.FraudCase) error
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 		ON CONFLICT (transaction_id) DO NOTHING
 	`
-	_, err := r.pool.Exec(ctx, q,
+	_, err := dbTx.Exec(ctx, q,
 		fc.ID(), fc.TransactionID().String(),
-		fc.TerminalID().String(), fc.MerchantID().String(),
+		uuidOrNil(fc.TerminalID().String()), uuidOrNil(fc.MerchantID().String()),
 		fc.AmountCents(), fc.Currency(), fc.CardNetwork(), fc.EntryMode(), fc.OccurredAt(),
 		fc.Score().Score(), fc.Score().Decision().String(),
 		rulesHit, evalsJSON,
@@ -232,7 +246,8 @@ func (r *FraudRuleRepo) loadFromDB(ctx context.Context) ([]*entity.FraudRule, er
 	}
 	defer rows.Close()
 
-	var rules []*entity.FraudRule
+	// Vacío y no nil: sin reglas activas, el cache igual se usa hasta su TTL.
+	rules := []*entity.FraudRule{}
 	for rows.Next() {
 		var id, name, description string
 		var scoreWeight int
@@ -245,7 +260,56 @@ func (r *FraudRuleRepo) loadFromDB(ctx context.Context) ([]*entity.FraudRule, er
 		}
 		rules = append(rules, entity.ReconstituteFraudRule(id, name, description, scoreWeight, thresholdValue, isActive, updatedAt))
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("FraudRuleRepo: rows: %w", err)
+	}
+	if len(rules) == 0 {
+		slog.WarnContext(ctx, "no active fraud rules — every transaction is approved with score 0")
+	}
 	return rules, nil
+}
+
+// ActiveCount devuelve la cantidad de reglas activas, del cache si está vigente. Lo usa el gauge
+// posnet_fraud_active_rules: no cuenta como hit del cache.
+func (r *FraudRuleRepo) ActiveCount(ctx context.Context) (int, error) {
+	r.mu.RLock()
+	if r.cached != nil && time.Since(r.cachedAt) < r.cacheTTL {
+		n := len(r.cached)
+		r.mu.RUnlock()
+		return n, nil
+	}
+	r.mu.RUnlock()
+	rules, err := r.FindAllActive(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return len(rules), nil
+}
+
+// CountOutboxStuck cuenta los scores que esperan en el outbox desde antes de before.
+func (r *FraudCaseRepo) CountOutboxStuck(ctx context.Context, before time.Time) (int64, error) {
+	var n int64
+	err := r.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM fraud_detection.outbox WHERE created_at < $1`, before).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("FraudCaseRepo.CountOutboxStuck: %w", err)
+	}
+	return n, nil
+}
+
+// MissingSchema devuelve las tablas que el servicio necesita y la base no tiene.
+func (r *FraudCaseRepo) MissingSchema(ctx context.Context) ([]string, error) {
+	var missing []string
+	for _, table := range []string{"fraud_detection.outbox"} {
+		var found *string
+		if err := r.pool.QueryRow(ctx, `SELECT to_regclass($1)::text`, table).Scan(&found); err != nil {
+			return nil, fmt.Errorf("FraudCaseRepo.MissingSchema: %w", err)
+		}
+		if found == nil {
+			missing = append(missing, table)
+		}
+	}
+	return missing, nil
 }
 
 func (r *FraudRuleRepo) Save(ctx context.Context, rule *entity.FraudRule) error {

@@ -74,6 +74,38 @@ groups:
           summary: "Timeouts del motor de fraude elevados"
           description: "rate(fraud_engine_timeouts[5m]) > 0.01 por 5m. Regla con I/O lento (historyRepo)."
 
+      # Scores de fraude sin salir a NATS: no se pierden, pero Authorization rechaza esas ventas
+      # con FRAUD_TIMEOUT mientras tanto. Investigar: conexión a NATS y logs "outbox relay".
+      - alert: OutboxFraudTrabado
+        expr: max(posnet_fraud_outbox_stuck) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} scores trabados en el outbox de Fraud Detection"
+          description: "Los scores no llegan a NATS. Se publicarán solos cuando se resuelva la causa, pero Authorization ya rechazó esas ventas con FRAUD_TIMEOUT. Revisar NATS y los logs 'outbox relay'."
+
+      # Control de fraude apagado: sin reglas activas, todo se aprueba con score 0.
+      - alert: FraudSinReglasActivas
+        expr: max(posnet_fraud_active_rules) == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fraud Detection no tiene reglas activas"
+          description: "Todas las ventas se aprueban con score 0. Si no fue intencional, reactivar las reglas en fraud_detection.fraud_rules."
+
+      # Pedidos cuyo score no salió del motor. engine_failure: la venta pasa con REVIEW neutral.
+      # invalid_event: se rechaza con REJECT. unanswerable: sin transaction_id, no se responde.
+      - alert: FraudSinEvaluar
+        expr: sum by (reason) (increase(posnet_fraud_unevaluated_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: 'Unos {{ printf "%.0f" $value }} pedidos de fraude sin evaluar en 5 minutos ({{ $labels.reason }})'
+          description: "engine_failure: el motor falla y las ventas pasan sin control (logs 'rule engine failed'). invalid_event o unanswerable: Authorization manda pedidos que no se pueden evaluar (logs 'cannot be evaluated' o 'without a valid transaction_id')."
+
       # Lotes en disputa: el cierre no coincide con el terminal y no se envían.
       # Investigar: docs/runbooks/batch-close-failure.md, Escenario A.
       - alert: LotesEnDisputa

@@ -7,50 +7,76 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/pashagolub/pgxmock/v4"
+
+	"github.com/juantevez/go-posnet/context/fraud-detection/domain/aggregate"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	"github.com/juantevez/go-posnet/pkg/events"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
+	"github.com/juantevez/go-posnet/pkg/outbox"
 )
 
-func newTestPublisher(js *fakeJetStream) *EventPublisher {
-	return NewEventPublisher(natsutil.NewPublisher(js))
+func newTestPublisher() *EventPublisher {
+	return NewEventPublisher(natsutil.NewPublisher(nil), outbox.NewStore(idempotencySchema))
 }
 
-func TestPublishFraudScoreCalculated_Success(t *testing.T) {
-	js := &fakeJetStream{ackSeq: 7}
-	p := newTestPublisher(js)
-	txID := domain.NewTransactionID()
-	fc := newEvaluatedFraudCase(t, txID)
+// bytesArg captura el payload que se escribe en el outbox.
+type bytesArg struct{ got *[]byte }
 
-	// Margen de 1s en cada punta: EvaluatedAt se formatea con time.RFC3339
-	// (sin fracción de segundo), así que el valor parseado puede truncar por
-	// debajo del "before" capturado con precisión de nanosegundos.
-	before := time.Now().UTC().Add(-time.Second)
-	if err := p.PublishFraudScoreCalculated(context.Background(), fc); err != nil {
+func (a bytesArg) Match(v any) bool {
+	b, ok := v.([]byte)
+	if ok {
+		*a.got = b
+	}
+	return ok
+}
+
+// enqueue publica fc con un pool mock y devuelve el envelope escrito en el outbox. Nada sale
+// a NATS: lo publica el relay.
+func enqueue(t *testing.T, fc *aggregate.FraudCase) events.DomainEvent {
+	t.Helper()
+	pool := newMockPool(t)
+	var data []byte
+	pool.ExpectBegin()
+	pool.ExpectExec("INSERT INTO "+idempotencySchema+".outbox").
+		WithArgs(events.SubjectFraudScoreCalculated, pgxmock.AnyArg(), bytesArg{got: &data}).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectRollback()
+
+	tx := beginTx(t, pool)
+	if err := newTestPublisher().PublishFraudScoreCalculated(context.Background(), tx, fc); err != nil {
 		t.Fatalf("PublishFraudScoreCalculated() error = %v", err)
 	}
-	after := time.Now().UTC().Add(time.Second)
-
-	if len(js.published) != 1 {
-		t.Fatalf("published messages = %d, want 1", len(js.published))
-	}
-	msg := js.published[0]
-	if msg.Subject != events.SubjectFraudScoreCalculated {
-		t.Errorf("Subject = %q, want %q", msg.Subject, events.SubjectFraudScoreCalculated)
-	}
-
-	envelope, err := events.UnmarshalEnvelope(msg.Data)
+	envelope, err := events.UnmarshalEnvelope(data)
 	if err != nil {
 		t.Fatalf("UnmarshalEnvelope() error = %v", err)
 	}
+	return envelope
+}
+
+func beginTx(t *testing.T, pool pgxmock.PgxPoolIface) pgx.Tx {
+	t.Helper()
+	tx, err := pool.Begin(context.Background())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	return tx
+}
+
+func TestPublishFraudScoreCalculated_EnqueuesInTheOutbox(t *testing.T) {
+	txID := domain.NewTransactionID()
+	fc := newEvaluatedFraudCase(t, txID)
+	evaluatedAt := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	fc = withEvaluatedAt(t, fc, evaluatedAt)
+
+	envelope := enqueue(t, fc)
 	if envelope.EventType != events.SubjectFraudScoreCalculated {
 		t.Errorf("EventType = %q, want %q", envelope.EventType, events.SubjectFraudScoreCalculated)
 	}
-	if envelope.AggregateType != "FraudCase" {
-		t.Errorf("AggregateType = %q, want %q", envelope.AggregateType, "FraudCase")
-	}
-	if envelope.AggregateID != txID.String() {
-		t.Errorf("AggregateID = %q, want %q", envelope.AggregateID, txID.String())
+	if envelope.AggregateType != "FraudCase" || envelope.AggregateID != txID.String() {
+		t.Errorf("aggregate = %s %s, want FraudCase %s", envelope.AggregateType, envelope.AggregateID, txID)
 	}
 
 	payload, err := events.Unwrap[events.FraudScoreCalculatedPayload](envelope)
@@ -60,60 +86,58 @@ func TestPublishFraudScoreCalculated_Success(t *testing.T) {
 	if payload.TransactionID != txID.String() {
 		t.Errorf("TransactionID = %q, want %q", payload.TransactionID, txID.String())
 	}
-	if payload.Score != fc.Score().Score() {
-		t.Errorf("Score = %d, want %d", payload.Score, fc.Score().Score())
-	}
-	if payload.Decision != fc.Score().Decision().String() {
-		t.Errorf("Decision = %q, want %q", payload.Decision, fc.Score().Decision().String())
+	if payload.Score != fc.Score().Score() || payload.Decision != fc.Score().Decision().String() {
+		t.Errorf("score = %d %s, want %d %s", payload.Score, payload.Decision, fc.Score().Score(), fc.Score().Decision())
 	}
 	if len(payload.RulesHit) != 1 || payload.RulesHit[0] != "RULE-001" {
 		t.Errorf("RulesHit = %v, want [RULE-001]", payload.RulesHit)
 	}
-
-	evaluatedAt, err := time.Parse(time.RFC3339, payload.EvaluatedAt)
-	if err != nil {
-		t.Fatalf("EvaluatedAt %q is not RFC3339: %v", payload.EvaluatedAt, err)
-	}
-	if evaluatedAt.Before(before) || evaluatedAt.After(after) {
-		t.Errorf("EvaluatedAt = %v, want between %v and %v", evaluatedAt, before, after)
+	// El momento de la evaluación, no el de la publicación.
+	if payload.EvaluatedAt != evaluatedAt.Format(time.RFC3339) {
+		t.Errorf("EvaluatedAt = %q, want %q", payload.EvaluatedAt, evaluatedAt.Format(time.RFC3339))
 	}
 }
 
 func TestPublishFraudScoreCalculated_EmptyRulesHit(t *testing.T) {
-	js := &fakeJetStream{}
-	p := newTestPublisher(js)
-	fc := newApprovedFraudCase(t, domain.NewTransactionID()) // score 0, sin reglas activadas
+	envelope := enqueue(t, newApprovedFraudCase(t, domain.NewTransactionID())) // score 0, sin reglas
 
-	if err := p.PublishFraudScoreCalculated(context.Background(), fc); err != nil {
-		t.Fatalf("PublishFraudScoreCalculated() error = %v", err)
-	}
-	if len(js.published) != 1 {
-		t.Fatalf("published messages = %d, want 1", len(js.published))
-	}
-
-	envelope, err := events.UnmarshalEnvelope(js.published[0].Data)
-	if err != nil {
-		t.Fatalf("UnmarshalEnvelope() error = %v", err)
-	}
 	payload, err := events.Unwrap[events.FraudScoreCalculatedPayload](envelope)
 	if err != nil {
 		t.Fatalf("Unwrap() error = %v", err)
 	}
-	if payload.Score != 0 {
-		t.Errorf("Score = %d, want 0", payload.Score)
-	}
-	if len(payload.RulesHit) != 0 {
-		t.Errorf("RulesHit = %v, want empty", payload.RulesHit)
+	if payload.Score != 0 || len(payload.RulesHit) != 0 {
+		t.Errorf("payload = %+v, want score 0 and no rules hit", payload)
 	}
 }
 
-func TestPublishFraudScoreCalculated_PublishError(t *testing.T) {
-	js := &fakeJetStream{publishErr: errors.New("nats unavailable")}
-	p := newTestPublisher(js)
-	fc := newEvaluatedFraudCase(t, domain.NewTransactionID())
+func TestPublishFraudScoreCalculated_EnqueueError(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectBegin()
+	pool.ExpectExec("INSERT INTO "+idempotencySchema+".outbox").
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnError(errors.New("connection reset"))
+	pool.ExpectRollback()
 
-	err := p.PublishFraudScoreCalculated(context.Background(), fc)
-	if err == nil || !strings.Contains(err.Error(), "publish FraudScoreCalculated") {
-		t.Fatalf("error = %v, want it to contain %q", err, "publish FraudScoreCalculated")
+	err := newTestPublisher().PublishFraudScoreCalculated(context.Background(), beginTx(t, pool), newEvaluatedFraudCase(t, domain.NewTransactionID()))
+	if err == nil || !strings.Contains(err.Error(), "enqueue FraudScoreCalculated") {
+		t.Fatalf("error = %v, want it to contain %q", err, "enqueue FraudScoreCalculated")
 	}
+}
+
+// withEvaluatedAt reconstruye fc con la fecha de evaluación at.
+func withEvaluatedAt(t *testing.T, fc *aggregate.FraudCase, at time.Time) *aggregate.FraudCase {
+	t.Helper()
+	return aggregate.Reconstitute(aggregate.ReconstituteParams{
+		ID:            fc.ID(),
+		TransactionID: fc.TransactionID(),
+		TerminalID:    fc.TerminalID(),
+		MerchantID:    fc.MerchantID(),
+		AmountCents:   fc.AmountCents(),
+		Currency:      fc.Currency(),
+		CardNetwork:   fc.CardNetwork(),
+		EntryMode:     fc.EntryMode(),
+		OccurredAt:    fc.OccurredAt(),
+		Score:         fc.Score(),
+		EvaluatedAt:   &at,
+	})
 }

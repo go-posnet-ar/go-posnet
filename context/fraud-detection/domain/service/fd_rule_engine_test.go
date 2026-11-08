@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juantevez/go-posnet/context/fraud-detection/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/fraud-detection/domain/entity"
+	"github.com/juantevez/go-posnet/context/fraud-detection/domain/valueobject"
 )
 
 func TestEvaluate_Success(t *testing.T) {
@@ -51,13 +53,20 @@ func TestEvaluate_LoadRulesError(t *testing.T) {
 	}
 }
 
-func TestEvaluate_NoActiveRules(t *testing.T) {
+// Sin reglas activas el control está apagado: aprueba con score 0, y el caso lo registra.
+func TestEvaluate_NoActiveRules_Approves(t *testing.T) {
 	re := NewRuleEngine(&fakeRuleRepo{rules: nil}, &fakeHistRepo{}, time.Second)
 	fc := newFraudCase(t, 5000, "CHIP")
 
-	err := re.Evaluate(context.Background(), fc)
-	if err == nil || !strings.Contains(err.Error(), "no active rules found") {
-		t.Fatalf("error = %v, want it to contain %q", err, "no active rules found")
+	if err := re.Evaluate(context.Background(), fc); err != nil {
+		t.Fatalf("Evaluate() error = %v, want nil", err)
+	}
+	if fc.Score().Score() != 0 || fc.Score().Decision() != valueobject.DecisionApprove {
+		t.Errorf("score = %d %s, want 0 APPROVE", fc.Score().Score(), fc.Score().Decision())
+	}
+	evals := fc.Evaluations()
+	if len(evals) != 1 || evals[0].RuleID() != aggregate.RuleNoActiveRules || evals[0].Activated() {
+		t.Errorf("evaluations = %+v, want one non-activated %s", evals, aggregate.RuleNoActiveRules)
 	}
 }
 

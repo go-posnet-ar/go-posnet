@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	natsclient "github.com/nats-io/nats.go"
+	"github.com/pashagolub/pgxmock/v4"
 
 	"github.com/juantevez/go-posnet/context/fraud-detection/application/command"
 	"github.com/juantevez/go-posnet/pkg/domain"
@@ -109,11 +110,14 @@ func TestHandleFraudCheckRequested_UnwrapError(t *testing.T) {
 
 func TestHandleFraudCheckRequested_Success(t *testing.T) {
 	pool := newMockPool(t)
+	pool.ExpectQuery("SELECT 1 FROM " + idempotencySchema + ".processed_events").
+		WithArgs(pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows([]string{"?column?"}))
 	expectClaimed(pool, 1)
 
 	repo := &fakeFraudCaseRepo{}
 	pub := &fakeDomainPublisher{}
-	h := command.NewEvaluateTransactionHandler(repo, newEngine(t), pub, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool)
+	h := command.NewEvaluateTransactionHandler(repo, newEngine(t), pub, natsutil.NewIdempotencyStore(pool, idempotencySchema), pool)
 	s := NewSubscriber(&fakeJetStream{}, h)
 
 	payload := events.FraudCheckRequestedPayload{

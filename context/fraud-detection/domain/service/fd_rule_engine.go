@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/juantevez/go-posnet/context/fraud-detection/domain/aggregate"
@@ -67,6 +68,7 @@ func NewRuleEngine(
 // Evaluate ejecuta todas las reglas activas sobre el FraudCase en paralelo.
 // Aplica las evaluaciones al aggregate y retorna el score final.
 // Timeout total configurable — si alguna regla no responde, se omite con score 0.
+// Sin reglas activas, aprueba con score 0 y la evaluación NO_ACTIVE_RULES.
 func (re *RuleEngine) Evaluate(ctx context.Context, fc *aggregate.FraudCase) error {
 	// Timeout propio del motor — independiente del contexto padre
 	ctx, cancel := context.WithTimeout(ctx, re.engineTimeout)
@@ -78,7 +80,9 @@ func (re *RuleEngine) Evaluate(ctx context.Context, fc *aggregate.FraudCase) err
 		return fmt.Errorf("rule_engine: load active rules: %w", err)
 	}
 	if len(rules) == 0 {
-		return fmt.Errorf("rule_engine: no active rules found")
+		// Sin reglas activas el control de fraude está apagado: score 0, APPROVE. No es una
+		// falla del motor, que daría un score neutral.
+		return fc.ApplyNoActiveRules()
 	}
 
 	// Construir el contexto de historial una sola vez (queries en paralelo)
@@ -261,9 +265,9 @@ func (re *RuleEngine) registerEvalFns() {
 
 // EventPublisher es el puerto de salida hacia NATS JetStream.
 type EventPublisher interface {
-	// PublishFraudScoreCalculated publica el resultado al stream POSNET_FRAUD.
-	// Consumido por: Authorization BC.
-	PublishFraudScoreCalculated(ctx context.Context, fc *aggregate.FraudCase) error
+	// PublishFraudScoreCalculated encola el resultado en el outbox, dentro de dbTx: sale a
+	// POSNET_FRAUD solo si la transacción confirma. Consumido por: Authorization BC.
+	PublishFraudScoreCalculated(ctx context.Context, dbTx pgx.Tx, fc *aggregate.FraudCase) error
 }
 
 // ParseTerminalID re-exporta para uso en el motor sin imports adicionales.

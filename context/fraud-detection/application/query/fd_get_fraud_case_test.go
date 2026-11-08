@@ -2,7 +2,9 @@ package query_test
 
 import (
 	"context"
+
 	"errors"
+	"github.com/jackc/pgx/v5"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +27,7 @@ type fakeFraudCaseRepo struct {
 
 var _ repository.FraudCaseRepository = (*fakeFraudCaseRepo)(nil)
 
-func (f *fakeFraudCaseRepo) Save(context.Context, *aggregate.FraudCase) error { return nil }
+func (f *fakeFraudCaseRepo) Save(context.Context, pgx.Tx, *aggregate.FraudCase) error { return nil }
 
 func (f *fakeFraudCaseRepo) FindByTransactionID(context.Context, domain.TransactionID) (*aggregate.FraudCase, error) {
 	return f.findResult, f.findErr

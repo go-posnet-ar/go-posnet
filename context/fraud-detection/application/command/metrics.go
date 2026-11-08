@@ -19,6 +19,7 @@ import (
 //	posnet_fraud_score_histogram   → posnet_fraud_score_histogram
 //	posnet_fraud_engine_duration   → posnet_fraud_engine_duration_seconds
 //	posnet_fraud_rule_hits         → posnet_fraud_rule_hits_total{rule}
+//	posnet_fraud_unevaluated       → posnet_fraud_unevaluated_total{reason}
 //
 // El label "bc" lo inyecta Prometheus como target label (prometheus.yml).
 type Metrics struct {
@@ -26,6 +27,7 @@ type Metrics struct {
 	score          metric.Int64Histogram
 	engineDuration metric.Float64Histogram
 	ruleHits       metric.Int64Counter
+	unevaluated    metric.Int64Counter
 }
 
 var (
@@ -62,11 +64,18 @@ func NewMetrics() (*Metrics, error) {
 		return nil, err
 	}
 
+	unevaluated, err := m.Int64Counter("posnet_fraud_unevaluated",
+		metric.WithDescription("Pedidos sin score del motor, por reason: engine_failure (REVIEW neutral), invalid_event (REJECT) o unanswerable (sin transaction_id, sin respuesta)."))
+	if err != nil {
+		return nil, err
+	}
+
 	return &Metrics{
 		evaluations:    evaluations,
 		score:          score,
 		engineDuration: engineDuration,
 		ruleHits:       ruleHits,
+		unevaluated:    unevaluated,
 	}, nil
 }
 
@@ -89,4 +98,12 @@ func (m *Metrics) RecordEngineDuration(ctx context.Context, d time.Duration) {
 		return
 	}
 	m.engineDuration.Record(ctx, d.Seconds())
+}
+
+// RecordUnevaluated cuenta un pedido cuyo score no salió del motor. Nil-safe.
+func (m *Metrics) RecordUnevaluated(ctx context.Context, reason string) {
+	if m == nil {
+		return
+	}
+	m.unevaluated.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 }

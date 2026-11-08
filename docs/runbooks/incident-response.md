@@ -89,6 +89,9 @@ verificar NATS por separado.
 | `CircuitoAdquirenteAbierto` | El host adquirente y los logs `acquirer circuit`. **Las ventas se rechazan con `91` mientras dure:** el cliente puede reintentar. Se cierra solo cuando una llamada de prueba recibe respuesta |
 | `FraudCheckSinRespuesta` | Fraud Detection: que esté levantado, su consumidor de `fraud.check-requested` y `posnet_fraud_engine_duration_seconds`. **Las ventas se rechazan mientras dure,** con `FRAUD_TIMEOUT`: el cliente puede reintentar |
 | `OutboxAuthorizationTrabado` | NATS y el log `outbox relay`. **No se pierde nada:** los resultados de las ventas salen solos al resolver la causa; mientras tanto, los cajeros esperan |
+| `OutboxFraudTrabado` | NATS y el log `outbox relay` de Fraud Detection. Los scores salen solos al resolver la causa, pero **Authorization ya rechazó esas ventas** con `FRAUD_TIMEOUT`: también salta `FraudCheckSinRespuesta`. Los scores tardíos se ignoran |
+| `FraudSinReglasActivas` | `SELECT id, is_active FROM fraud_detection.fraud_rules`. **Todas las ventas se aprueban con score 0** mientras dure. Si no fue intencional, reactivar las reglas: el cache las toma en `ENGINE_RULES_CACHE_TTL` |
+| `FraudSinEvaluar` | Según `reason`. `engine_failure`: el log `rule engine failed` de Fraud Detection; **las ventas pasan con `REVIEW` sin control.** `invalid_event` o `unanswerable`: Authorization manda pedidos inválidos; el caso guardado (`GET /fraud-cases/{id}`) dice qué campo falló |
 | `OutboxSettlementTrabado` | NATS y el log `outbox relay`. **No se pierde nada:** los eventos de Settlement salen solos al resolver la causa |
 | `EventoSettlementPerdido` | **Falta una venta, una reversa o un cierre en Settlement.** Buscá `deliveries exhausted` en los logs y seguí [Reprocesamiento](nats-dlq-reprocess.md) |
 | `LotesEnDisputa` | [Escenario A](batch-close-failure.md#escenario-a--lote-en-disputed) |
