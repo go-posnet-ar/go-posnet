@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -30,6 +31,8 @@ type app struct {
 	subscriber *natsinfra.FD_Subscriber
 	grpcSrv    *grpcserver.FraudDetectionServer
 	httpSrv    *http.Server
+
+	closeOnce sync.Once
 }
 
 // wire construye el grafo de dependencias completo del BC Fraud Detection.
@@ -184,7 +187,13 @@ func (a *app) start(ctx context.Context) error {
 }
 
 // close libera todos los recursos en orden inverso al de creación.
+// close libera los recursos. Es idempotente: run lo llama al apagar y también en un defer, por
+// si el arranque falla.
 func (a *app) close() {
+	a.closeOnce.Do(a.closeResources)
+}
+
+func (a *app) closeResources() {
 	slog.Info("closing resources")
 
 	if a.httpSrv != nil {

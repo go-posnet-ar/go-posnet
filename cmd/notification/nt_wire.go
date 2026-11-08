@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -34,6 +35,8 @@ type app struct {
 	notifRepo     *pginfra.NotificationRepo
 	notifyHandler *command.NotifyHandler
 	retryCfg      config.RetryConfig
+
+	closeOnce sync.Once
 }
 
 // wire construye el grafo de dependencias completo del BC Notification.
@@ -246,7 +249,13 @@ func (a *app) runRetryJob(ctx context.Context) {
 }
 
 // close libera todos los recursos en orden inverso al de creación.
+// close libera los recursos. Es idempotente: run lo llama al apagar y también en un defer, por
+// si el arranque falla.
 func (a *app) close() {
+	a.closeOnce.Do(a.closeResources)
+}
+
+func (a *app) closeResources() {
 	slog.Info("closing resources")
 
 	if a.httpSrv != nil {

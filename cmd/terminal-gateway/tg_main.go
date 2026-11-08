@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/juantevez/go-posnet/context/terminal-gateway/config"
 	"github.com/juantevez/go-posnet/pkg/observability"
@@ -34,8 +35,10 @@ func run() error {
 	log := slog.Default().With(slog.String("service", cfg.OTEL.ServiceName))
 
 	// ── 3. Contexto raíz con cancelación ──────────────────────────────────────
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Se cancela con SIGINT o SIGTERM, también si llegan durante el arranque: así una señal
+	// temprana no mata el proceso sin cerrar lo que ya se abrió.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	// ── 4. Tracer OpenTelemetry ────────────────────────────────────────────────
 	shutdownTracer, err := observability.InitTracer(ctx, observability.TracerConfig{
@@ -47,14 +50,15 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("init tracer: %w", err)
 	}
-	defer func() { _ = shutdownTracer(ctx) }()
+	// Último en cerrarse: exporta también los spans del apagado.
+	defer shutdownTelemetry("tracer", shutdownTracer)
 
 	// ── 5. Meter Prometheus ────────────────────────────────────────────────────
 	shutdownMeter, err := observability.InitMeter(ctx, cfg.OTEL.ServiceName)
 	if err != nil {
 		return fmt.Errorf("init meter: %w", err)
 	}
-	defer func() { _ = shutdownMeter(ctx) }()
+	defer shutdownTelemetry("meter", shutdownMeter)
 
 	log.Info("starting terminal-gateway BC",
 		slog.String("version", cfg.OTEL.ServiceVersion),
@@ -66,11 +70,13 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("wire dependencies: %w", err)
 	}
-	// Defer de seguridad: si algo falla más abajo (ej. app.start devuelve
-	// error) y retornamos antes de llegar al shutdown explícito, igual se
-	// liberan los recursos. app.close() es idempotente (sync.Once), así que
-	// no hay problema si además se llama explícitamente más abajo.
-	defer app.close()
+	// Si el arranque falla, cancela el contexto antes de cerrar: close espera a los jobs que lo
+	// escuchan, y sin cancelarlo se quedaría esperando. close es idempotente: en el camino
+	// normal se llama abajo.
+	defer func() {
+		stop()
+		app.close()
+	}()
 
 	// ── 7. Arrancar servicios ──────────────────────────────────────────────────
 	if err := app.start(ctx); err != nil {
@@ -84,13 +90,12 @@ func run() error {
 	)
 
 	// ── 8. Graceful shutdown ───────────────────────────────────────────────────
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
+	<-ctx.Done()
+	// Restaura el comportamiento por defecto: si el cierre se demora, una segunda señal termina
+	// el proceso sin esperar.
+	stop()
 
 	log.Info("shutdown signal received — stopping services")
-	cancel() // avisa a outboxRelay y al cleaner (vía ctx.Done()) que deben parar
-
 	// Llamada explícita y bloqueante: espera a que gRPC/HTTP dejen de aceptar
 	// trabajo nuevo, a que los jobs de background salgan de su loop, y recién
 	// ahí cierra NATS y el pool de Postgres. El defer de arriba queda como
@@ -99,4 +104,17 @@ func run() error {
 
 	log.Info("terminal-gateway BC stopped cleanly")
 	return nil
+}
+
+// telemetryShutdownTimeout limita lo que se espera para exportar los últimos spans y métricas.
+const telemetryShutdownTimeout = 5 * time.Second
+
+// shutdownTelemetry cierra el tracer o el meter con un contexto propio: el raíz ya está
+// cancelado, y con él el exportador descarta lo que quedó en cola en lugar de enviarlo.
+func shutdownTelemetry(name string, shutdown func(context.Context) error) {
+	ctx, cancel := context.WithTimeout(context.Background(), telemetryShutdownTimeout)
+	defer cancel()
+	if err := shutdown(ctx); err != nil {
+		slog.Warn("telemetry shutdown failed", slog.String("component", name), slog.String("error", err.Error()))
+	}
 }

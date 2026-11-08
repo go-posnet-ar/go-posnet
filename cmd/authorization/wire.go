@@ -47,6 +47,8 @@ type app struct {
 	invalidRetention time.Duration
 	stopPurge        context.CancelFunc
 	purgeWG          sync.WaitGroup
+
+	closeOnce sync.Once
 }
 
 // wire construye el grafo de dependencias completo del BC Authorization.
@@ -313,7 +315,13 @@ func (a *app) runReconciler(ctx context.Context) {
 }
 
 // close libera todos los recursos en orden inverso al de creación.
+// close libera los recursos. Es idempotente: run lo llama al apagar y también en un defer, por
+// si el arranque falla.
 func (a *app) close() {
+	a.closeOnce.Do(a.closeResources)
+}
+
+func (a *app) closeResources() {
 	slog.Info("closing resources")
 
 	// Antes de cerrar la base: una reversa interrumpida sigue en INDETERMINATE y se retoma.
