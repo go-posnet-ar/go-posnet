@@ -183,12 +183,14 @@ func TestApplyFraudScore_RejectByFraud_SaveError(t *testing.T) {
 	}
 }
 
-func TestApplyFraudScore_RejectByFraud_PublishErrorIsNonFatal(t *testing.T) {
+// El rechazo por fraude se encola en la transacción del score: si falla, no queda ni el estado
+// ni el evento marcado, y la reentrega lo reintenta.
+func TestApplyFraudScore_RejectByFraud_EnqueueErrorRollsBack(t *testing.T) {
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedThenRollback(pool)
 
 	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t)}
-	publisher := &fakePublisher{rejectedErr: errors.New("nats unavailable")}
+	publisher := &fakePublisher{rejectedErr: errors.New("outbox insert failed")}
 	h := command.NewAuthorizationHandler(
 		repo, &fakeAcquirer{}, publisher,
 		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
@@ -198,17 +200,16 @@ func TestApplyFraudScore_RejectByFraud_PublishErrorIsNonFatal(t *testing.T) {
 	cmd.Decision = valueobject.FraudDecisionReject
 	cmd.Score = 90
 
-	if err := h.ApplyFraudScore(context.Background(), cmd); err != nil {
-		t.Fatalf("ApplyFraudScore() error = %v, want nil (publish failure must not fail the saga)", err)
-	}
-	if len(repo.claimed) != 1 || repo.claimed[0].state != valueobject.StateRejected {
-		t.Fatalf("claimed = %+v, want a single save in state REJECTED", repo.claimed)
+	err := h.ApplyFraudScore(context.Background(), cmd)
+	if err == nil || !strings.Contains(err.Error(), "enqueue rejection") {
+		t.Fatalf("ApplyFraudScore() error = %v, want el error del encolado, para reintentar", err)
 	}
 }
 
 func TestApplyFraudScore_ApproveThenAcquirerApproves(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	expectTx(pool) // el resultado y su evento en el outbox
 
 	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t)}
 	acquirer := &fakeAcquirer{authorizeResp: service.AcquirerResponse{
@@ -235,26 +236,28 @@ func TestApplyFraudScore_ApproveThenAcquirerApproves(t *testing.T) {
 	}
 }
 
-func TestApplyFraudScore_ApproveThenPublishApprovedErrorIsNonFatal(t *testing.T) {
+// La aprobación se encola en la transacción que la guarda: si falla, no queda ninguna de las dos,
+// y la transacción sigue en PROCESSING, donde la toma el conciliador.
+func TestApplyFraudScore_ApproveThenEnqueueErrorLeavesItProcessing(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectRollback() // sin commit: el guardado y el evento se deshacen juntos
 
 	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t)}
 	acquirer := &fakeAcquirer{authorizeResp: service.AcquirerResponse{
 		ResponseCode: valueobject.ISO_APPROVED,
 		AuthCode:     "AB1234",
 	}}
-	publisher := &fakePublisher{approvedErr: errors.New("nats unavailable")}
+	publisher := &fakePublisher{approvedErr: errors.New("outbox insert failed")}
 	h := command.NewAuthorizationHandler(
 		repo, acquirer, publisher,
 		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
 	)
 
-	if err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID())); err != nil {
-		t.Fatalf("ApplyFraudScore() error = %v, want nil (publish failure must not fail the saga)", err)
-	}
-	if len(repo.savedTxs) != 1 || repo.savedTxs[0].State() != valueobject.StateApproved {
-		t.Fatalf("saved tx = %+v, want a single tx in state APPROVED", repo.savedTxs)
+	err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID()))
+	if err == nil || !strings.Contains(err.Error(), "persist result") {
+		t.Fatalf("ApplyFraudScore() error = %v, want el error del guardado del resultado", err)
 	}
 }
 
@@ -281,6 +284,7 @@ func TestApplyFraudScore_AcquirerErrorMarksIndeterminate(t *testing.T) {
 func TestApplyFraudScore_AcquirerRejectsWithISOCode(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	expectTx(pool) // el resultado y su evento en el outbox
 
 	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t)}
 	acquirer := &fakeAcquirer{authorizeResp: service.AcquirerResponse{ResponseCode: valueobject.ISO_DO_NOT_HONOR}}
@@ -302,29 +306,30 @@ func TestApplyFraudScore_AcquirerRejectsWithISOCode(t *testing.T) {
 	}
 }
 
-func TestApplyFraudScore_AcquirerRejectsThenPublishErrorIsNonFatal(t *testing.T) {
+func TestApplyFraudScore_AcquirerRejectsThenEnqueueErrorLeavesItProcessing(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectRollback()
 
 	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t)}
 	acquirer := &fakeAcquirer{authorizeResp: service.AcquirerResponse{ResponseCode: valueobject.ISO_DO_NOT_HONOR}}
-	publisher := &fakePublisher{rejectedErr: errors.New("nats unavailable")}
+	publisher := &fakePublisher{rejectedErr: errors.New("outbox insert failed")}
 	h := command.NewAuthorizationHandler(
 		repo, acquirer, publisher,
 		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
 	)
 
-	if err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID())); err != nil {
-		t.Fatalf("ApplyFraudScore() error = %v, want nil (publish failure must not fail the saga)", err)
-	}
-	if len(repo.savedTxs) != 1 || repo.savedTxs[0].State() != valueobject.StateRejected {
-		t.Fatalf("saved tx = %+v, want a single tx in state REJECTED", repo.savedTxs)
+	err := h.ApplyFraudScore(context.Background(), validFraudScoreCmd(t, repo.findResult.ID()))
+	if err == nil || !strings.Contains(err.Error(), "persist result") {
+		t.Fatalf("ApplyFraudScore() error = %v, want el error del guardado del resultado", err)
 	}
 }
 
 func TestApplyFraudScore_AcquirerRejectsWithUnknownResponseCode(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	expectTx(pool) // el resultado y su evento en el outbox
 
 	// ResponseCode vacío → AcquirerResponse.ToRejectionCode() falla →
 	// callAcquirer cae al fallback NewRejectionFromValidation("UNKNOWN_RESPONSE").
@@ -391,6 +396,7 @@ func TestApplyFraudScore_SaveErrorAfterAcquirerApproval(t *testing.T) {
 func TestApplyFraudScore_SavesProcessingBeforeCallingAcquirer(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	expectTx(pool) // el resultado y su evento en el outbox
 
 	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t)}
 	acquirer := &orderedAcquirer{repo: repo, t: t}
@@ -487,6 +493,7 @@ func TestApplyFraudScore_IndeterminateSaveErrorIsNotFatal(t *testing.T) {
 func TestApplyFraudScore_LateAcquirerResponseIsNotPublished(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	expectTx(pool) // el resultado y su evento en el outbox
 
 	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t), resultLost: true}
 	publisher := &fakePublisher{}
@@ -519,6 +526,7 @@ func TestApplyFraudScore_NotSentIsRejectedWithoutReversal(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := newMockPool(t)
 			expectClaimed(pool, 1)
+			expectTx(pool) // el resultado y su evento en el outbox
 
 			repo := &fakeRepo{findResult: newFraudCheckingTransaction(t)}
 			publisher := &fakePublisher{}

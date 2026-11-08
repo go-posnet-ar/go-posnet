@@ -36,3 +36,12 @@ func expectClaimed(pool pgxmock.PgxPoolIface, rowsAffected int64) {
 	pool.ExpectCommit()
 	pool.ExpectRollback()
 }
+
+// expectTx configura una transacción vacía del pool mock: la que abre el handler
+// para guardar un estado y encolar su evento en el outbox. El repositorio y el
+// publisher son fakes, así que la transacción no ejecuta sentencias.
+func expectTx(pool pgxmock.PgxPoolIface) {
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectCommit()
+	pool.ExpectRollback()
+}

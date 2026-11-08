@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/authorization/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/observability"
@@ -115,7 +116,9 @@ func (h *AuthorizationHandler) reconcile(ctx context.Context, tx *aggregate.Tran
 		return false, fmt.Errorf("reject: %w", err)
 	}
 	// Si esto falla, la corrida siguiente repite la reversa, que no tiene efecto.
-	saved, err := h.repo.SaveIfState(ctx, tx, valueobject.StateIndeterminate)
+	saved, err := h.saveAndEnqueue(ctx, tx, valueobject.StateIndeterminate, func(dbTx pgx.Tx) error {
+		return h.publisher.PublishRejected(ctx, dbTx, tx)
+	})
 	if err != nil {
 		return false, fmt.Errorf("save rejection: %w", err)
 	}
@@ -123,7 +126,7 @@ func (h *AuthorizationHandler) reconcile(ctx context.Context, tx *aggregate.Tran
 		return false, nil
 	}
 
-	h.publishRejection(ctx, tx, log)
+	h.recordRejection(ctx, tx)
 	log.Warn("transaction reconciled — reversed in the acquirer and rejected")
 	return true, nil
 }

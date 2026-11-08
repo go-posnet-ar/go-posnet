@@ -1,6 +1,7 @@
 package command_test
 
 import (
+	"context"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -46,3 +47,24 @@ func expectClaimedThenRollback(pool pgxmock.PgxPoolIface) {
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectRollback()
 }
+
+// expectTx configura una transacción de base sin consultas propias del mock: la del resultado y
+// su evento en el outbox, que hacen el fakeRepo y el fakePublisher.
+func expectTx(pool pgxmock.PgxPoolIface) {
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectCommit()
+	pool.ExpectRollback()
+}
+
+// txPool es un pool falso que abre transacciones sin consultas propias y siempre las confirma.
+// Sirve para los tests que no verifican la base, como los del conciliador: el fakeRepo y el
+// fakePublisher reciben la transacción, pero no la usan.
+type txPool struct{}
+
+func (txPool) BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error) { return noopTx{}, nil }
+func (txPool) Ping(context.Context) error                             { return nil }
+
+type noopTx struct{ pgx.Tx }
+
+func (noopTx) Commit(context.Context) error   { return nil }
+func (noopTx) Rollback(context.Context) error { return nil }

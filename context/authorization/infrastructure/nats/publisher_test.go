@@ -3,29 +3,55 @@ package nats
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/authorization/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	"github.com/juantevez/go-posnet/pkg/events"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
+	"github.com/juantevez/go-posnet/pkg/outbox"
+	natsclient "github.com/nats-io/nats.go"
 )
 
-func newTestPublisher(js *fakeJetStream) *EventPublisher {
-	return NewEventPublisher(natsutil.NewPublisher(js))
+// recordingTx simula la transacción de base: guarda cada INSERT del outbox como el mensaje que el
+// relay publicaría después.
+type recordingTx struct {
+	pgx.Tx
+	publishErr error
+	published  []*natsclient.Msg
+}
+
+func (r *recordingTx) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if r.publishErr != nil {
+		return pgconn.CommandTag{}, r.publishErr
+	}
+	if !strings.Contains(sql, "pn_authorization.outbox") {
+		return pgconn.CommandTag{}, fmt.Errorf("unexpected SQL: %s", sql)
+	}
+	msg := &natsclient.Msg{Subject: args[0].(string), Data: args[2].([]byte), Header: natsclient.Header{}}
+	msg.Header.Set(natsclient.MsgIdHdr, args[1].(string))
+	r.published = append(r.published, msg)
+	return pgconn.NewCommandTag("INSERT 0 1"), nil
+}
+
+func newTestPublisher(_ *recordingTx) *EventPublisher {
+	return NewEventPublisher(natsutil.NewPublisher(nil), outbox.NewStore("pn_authorization"))
 }
 
 // ─── PublishApproved ───────────────────────────────────────────────────────────
 
 func TestPublishApproved_Success(t *testing.T) {
-	js := &fakeJetStream{ackSeq: 42}
+	js := &recordingTx{}
 	p := newTestPublisher(js)
 	tx := newApprovedTransaction(t)
 
-	if err := p.PublishApproved(context.Background(), tx); err != nil {
+	if err := p.PublishApproved(context.Background(), js, tx); err != nil {
 		t.Fatalf("PublishApproved() error = %v", err)
 	}
 	if len(js.published) != 1 {
@@ -72,13 +98,13 @@ func TestPublishApproved_Success(t *testing.T) {
 }
 
 func TestPublishApproved_NilAuthCode(t *testing.T) {
-	js := &fakeJetStream{}
+	js := &recordingTx{}
 	p := newTestPublisher(js)
 
 	authorizedAt := time.Now().UTC()
 	tx := aggregate.Reconstitute(baseReconstituteParams(t, valueobject.StateApproved, &authorizedAt, nil))
 
-	err := p.PublishApproved(context.Background(), tx)
+	err := p.PublishApproved(context.Background(), js, tx)
 	if err == nil || !strings.Contains(err.Error(), "auth code is nil") {
 		t.Fatalf("error = %v, want it to contain %q", err, "auth code is nil")
 	}
@@ -88,7 +114,7 @@ func TestPublishApproved_NilAuthCode(t *testing.T) {
 }
 
 func TestPublishApproved_NilAuthorizedAt(t *testing.T) {
-	js := &fakeJetStream{}
+	js := &recordingTx{}
 	p := newTestPublisher(js)
 
 	authCode := "AB1234"
@@ -96,7 +122,7 @@ func TestPublishApproved_NilAuthorizedAt(t *testing.T) {
 	params.AuthCode = &authCode
 	tx := aggregate.Reconstitute(params)
 
-	err := p.PublishApproved(context.Background(), tx)
+	err := p.PublishApproved(context.Background(), js, tx)
 	if err == nil || !strings.Contains(err.Error(), "authorized_at is nil") {
 		t.Fatalf("error = %v, want it to contain %q", err, "authorized_at is nil")
 	}
@@ -106,24 +132,24 @@ func TestPublishApproved_NilAuthorizedAt(t *testing.T) {
 }
 
 func TestPublishApproved_PublishError(t *testing.T) {
-	js := &fakeJetStream{publishErr: errors.New("nats unavailable")}
+	js := &recordingTx{publishErr: errors.New("outbox insert failed")}
 	p := newTestPublisher(js)
 	tx := newApprovedTransaction(t)
 
-	err := p.PublishApproved(context.Background(), tx)
-	if err == nil || !strings.Contains(err.Error(), "publish approved") {
-		t.Fatalf("error = %v, want it to contain %q", err, "publish approved")
+	err := p.PublishApproved(context.Background(), js, tx)
+	if err == nil || !strings.Contains(err.Error(), "enqueue approved") {
+		t.Fatalf("error = %v, want it to contain %q", err, "enqueue approved")
 	}
 }
 
 // ─── PublishRejected ───────────────────────────────────────────────────────────
 
 func TestPublishRejected_Success(t *testing.T) {
-	js := &fakeJetStream{}
+	js := &recordingTx{}
 	p := newTestPublisher(js)
 	tx := newRejectedTransaction(t)
 
-	if err := p.PublishRejected(context.Background(), tx); err != nil {
+	if err := p.PublishRejected(context.Background(), js, tx); err != nil {
 		t.Fatalf("PublishRejected() error = %v", err)
 	}
 	if len(js.published) != 1 {
@@ -158,12 +184,12 @@ func TestPublishRejected_Success(t *testing.T) {
 }
 
 func TestPublishRejected_NilRejectionCode(t *testing.T) {
-	js := &fakeJetStream{}
+	js := &recordingTx{}
 	p := newTestPublisher(js)
 
 	tx := aggregate.Reconstitute(baseReconstituteParams(t, valueobject.StateRejected, nil, nil))
 
-	err := p.PublishRejected(context.Background(), tx)
+	err := p.PublishRejected(context.Background(), js, tx)
 	if err == nil || !strings.Contains(err.Error(), "rejection code is nil") {
 		t.Fatalf("error = %v, want it to contain %q", err, "rejection code is nil")
 	}
@@ -173,21 +199,21 @@ func TestPublishRejected_NilRejectionCode(t *testing.T) {
 }
 
 func TestPublishRejected_PublishError(t *testing.T) {
-	js := &fakeJetStream{publishErr: errors.New("nats unavailable")}
+	js := &recordingTx{publishErr: errors.New("outbox insert failed")}
 	p := newTestPublisher(js)
 	tx := newRejectedTransaction(t)
 
-	err := p.PublishRejected(context.Background(), tx)
-	if err == nil || !strings.Contains(err.Error(), "publish rejected") {
-		t.Fatalf("error = %v, want it to contain %q", err, "publish rejected")
+	err := p.PublishRejected(context.Background(), js, tx)
+	if err == nil || !strings.Contains(err.Error(), "enqueue rejected") {
+		t.Fatalf("error = %v, want it to contain %q", err, "enqueue rejected")
 	}
 }
 
 func TestPublishInvalidRejected(t *testing.T) {
-	js := &fakeJetStream{}
+	js := &recordingTx{}
 	id := domain.NewTransactionID()
 
-	err := newTestPublisher(js).PublishInvalidRejected(context.Background(), valueobject.InvalidTransactionRejection{
+	err := newTestPublisher(js).PublishInvalidRejected(context.Background(), js, valueobject.InvalidTransactionRejection{
 		TransactionID:   id,
 		AmountCents:     5000,
 		Currency:        "ARS",
@@ -230,11 +256,11 @@ func TestPublishInvalidRejected(t *testing.T) {
 // ─── PublishFraudCheckRequested ────────────────────────────────────────────────
 
 func TestPublishFraudCheckRequested_Success(t *testing.T) {
-	js := &fakeJetStream{}
+	js := &recordingTx{}
 	p := newTestPublisher(js)
 	tx := newValidTransaction(t)
 
-	if err := p.PublishFraudCheckRequested(context.Background(), tx); err != nil {
+	if err := p.PublishFraudCheckRequested(context.Background(), js, tx); err != nil {
 		t.Fatalf("PublishFraudCheckRequested() error = %v", err)
 	}
 	msg := js.published[0]
@@ -262,25 +288,25 @@ func TestPublishFraudCheckRequested_Success(t *testing.T) {
 }
 
 func TestPublishFraudCheckRequested_PublishError(t *testing.T) {
-	js := &fakeJetStream{publishErr: errors.New("nats unavailable")}
+	js := &recordingTx{publishErr: errors.New("outbox insert failed")}
 	p := newTestPublisher(js)
 	tx := newValidTransaction(t)
 
-	err := p.PublishFraudCheckRequested(context.Background(), tx)
-	if err == nil || !strings.Contains(err.Error(), "publish fraud check requested") {
-		t.Fatalf("error = %v, want it to contain %q", err, "publish fraud check requested")
+	err := p.PublishFraudCheckRequested(context.Background(), js, tx)
+	if err == nil || !strings.Contains(err.Error(), "enqueue fraud check requested") {
+		t.Fatalf("error = %v, want it to contain %q", err, "enqueue fraud check requested")
 	}
 }
 
 // ─── PublishReversalCompleted ──────────────────────────────────────────────────
 
 func TestPublishReversalCompleted_Success(t *testing.T) {
-	js := &fakeJetStream{}
+	js := &recordingTx{}
 	p := newTestPublisher(js)
 	tx := newApprovedTransaction(t)
 	originalTxID := domain.NewTransactionID() // deliberadamente distinto de tx.ID()
 
-	if err := p.PublishReversalCompleted(context.Background(), originalTxID, tx); err != nil {
+	if err := p.PublishReversalCompleted(context.Background(), js, originalTxID, tx); err != nil {
 		t.Fatalf("PublishReversalCompleted() error = %v", err)
 	}
 	msg := js.published[0]
@@ -309,13 +335,13 @@ func TestPublishReversalCompleted_Success(t *testing.T) {
 }
 
 func TestPublishReversalCompleted_PublishError(t *testing.T) {
-	js := &fakeJetStream{publishErr: errors.New("nats unavailable")}
+	js := &recordingTx{publishErr: errors.New("outbox insert failed")}
 	p := newTestPublisher(js)
 	tx := newApprovedTransaction(t)
 
-	err := p.PublishReversalCompleted(context.Background(), domain.NewTransactionID(), tx)
-	if err == nil || !strings.Contains(err.Error(), "publish reversal completed") {
-		t.Fatalf("error = %v, want it to contain %q", err, "publish reversal completed")
+	err := p.PublishReversalCompleted(context.Background(), js, domain.NewTransactionID(), tx)
+	if err == nil || !strings.Contains(err.Error(), "enqueue reversal completed") {
+		t.Fatalf("error = %v, want it to contain %q", err, "enqueue reversal completed")
 	}
 }
 

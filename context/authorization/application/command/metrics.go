@@ -166,8 +166,13 @@ func (m *Metrics) RecordSagaDuration(ctx context.Context, since time.Time, outco
 // unresolvedQueryTimeout limita la consulta en cada scrape.
 const unresolvedQueryTimeout = 5 * time.Second
 
-// RegisterUnresolvedGauge publica las transacciones sin un resultado conocido, consultando la
-// base en cada scrape. Si la consulta falla, la serie no se informa: un cero las ocultaría.
+// outboxStuckAfter es la antigüedad desde la que un evento del outbox cuenta como trabado. El
+// relay corre cada 200 ms, así que un minuto solo se alcanza si no puede publicar.
+const outboxStuckAfter = time.Minute
+
+// RegisterUnresolvedGauge publica las transacciones sin un resultado conocido y los eventos
+// trabados en el outbox, consultando la base en cada scrape. Si la consulta falla, las series no
+// se informan: un cero las ocultaría.
 func RegisterUnresolvedGauge(repo repository.TransactionRepository, stuckAfter, reversalsAfter time.Duration) error {
 	meter := observability.Meter("posnet.authorization")
 	gauge, err := meter.Int64ObservableGauge(
@@ -177,11 +182,18 @@ func RegisterUnresolvedGauge(repo repository.TransactionRepository, stuckAfter, 
 	if err != nil {
 		return err
 	}
+	outboxGauge, err := meter.Int64ObservableGauge(
+		"posnet_authorization_outbox_stuck",
+		metric.WithDescription("Eventos que esperan en el outbox desde hace más de un minuto."),
+	)
+	if err != nil {
+		return err
+	}
 	_, err = meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
 		ctx, cancel := context.WithTimeout(ctx, unresolvedQueryTimeout)
 		defer cancel()
 		now := time.Now()
-		counts, err := repo.CountUnresolved(ctx, now.Add(-stuckAfter), now.Add(-reversalsAfter))
+		counts, err := repo.CountUnresolved(ctx, now.Add(-stuckAfter), now.Add(-reversalsAfter), now.Add(-outboxStuckAfter))
 		if err != nil {
 			slog.ErrorContext(ctx, "failed to count unresolved transactions", slog.String("error", err.Error()))
 			return nil
@@ -189,7 +201,8 @@ func RegisterUnresolvedGauge(repo repository.TransactionRepository, stuckAfter, 
 		o.ObserveInt64(gauge, counts.Indeterminate, metric.WithAttributes(attribute.String("state", "INDETERMINATE")))
 		o.ObserveInt64(gauge, counts.Processing, metric.WithAttributes(attribute.String("state", "PROCESSING")))
 		o.ObserveInt64(gauge, counts.ReversalPending, metric.WithAttributes(attribute.String("state", "REVERSAL_PENDING")))
+		o.ObserveInt64(outboxGauge, counts.OutboxStuck)
 		return nil
-	}, gauge)
+	}, gauge, outboxGauge)
 	return err
 }

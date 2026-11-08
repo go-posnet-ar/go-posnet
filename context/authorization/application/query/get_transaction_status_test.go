@@ -38,7 +38,7 @@ func (f *fakeRepo) ExistsByID(_ context.Context, _ domain.TransactionID) (bool, 
 	return false, nil
 }
 
-func (f *fakeRepo) SaveInvalidRejection(context.Context, valueobject.InvalidTransactionRejection) error {
+func (f *fakeRepo) SaveInvalidRejectionTx(context.Context, pgx.Tx, valueobject.InvalidTransactionRejection) error {
 	return nil
 }
 
@@ -78,7 +78,7 @@ func (f *fakeRepo) FindPendingReversals(context.Context, time.Time, int) ([]*agg
 	return nil, nil
 }
 
-func (f *fakeRepo) CountUnresolved(context.Context, time.Time, time.Time) (repository.UnresolvedCounts, error) {
+func (f *fakeRepo) CountUnresolved(context.Context, time.Time, time.Time, time.Time) (repository.UnresolvedCounts, error) {
 	return repository.UnresolvedCounts{}, nil
 }
 

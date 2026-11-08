@@ -22,6 +22,7 @@ import (
 	natsinfra "github.com/juantevez/go-posnet/context/authorization/infrastructure/nats"
 	pginfra "github.com/juantevez/go-posnet/context/authorization/infrastructure/postgres"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
+	"github.com/juantevez/go-posnet/pkg/outbox"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 	natsclient "github.com/nats-io/nats.go"
 )
@@ -54,6 +55,10 @@ type app struct {
 	// missingSchema informa lo que falta en la base: sin eso, el servicio no arranca.
 	missingSchema func(context.Context) ([]string, error)
 	grpcStarted   bool
+
+	outboxRelay *outbox.Relay
+	stopRelay   context.CancelFunc
+	relayWG     sync.WaitGroup
 }
 
 // wire construye el grafo de dependencias completo del BC Authorization.
@@ -115,7 +120,9 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	blockedCards := pginfra.NewBlockedCardRepo(pool)
 	idempotency := natsutil.NewIdempotencyStore(pool, "pn_authorization")
 	natsPub := natsutil.NewPublisher(js)
-	eventPub := natsinfra.NewEventPublisher(natsPub)
+	// Los eventos se escriben en el outbox, en la transacción de cada cambio, y el relay los publica.
+	eventPub := natsinfra.NewEventPublisher(natsPub, outbox.NewStore(outboxSchema))
+	outboxRelay := outbox.NewRelay(pool, js, outboxSchema, outboxRelayEvery, outboxRelayBatch)
 
 	// ── Aplicación ─────────────────────────────────────────────────────────────
 	acquirerGW, acquirerClient, err := newAcquirer(cfg)
@@ -176,6 +183,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 
 		invalidRetention: cfg.InvalidTransactionsRetention,
 
+		outboxRelay:   outboxRelay,
 		grpcPort:      cfg.GRPCPort,
 		missingSchema: txRepo.MissingSchema,
 	}, nil
@@ -197,6 +205,14 @@ func newAcquirer(cfg *config.Config) (service.AcquirerGateway, *isoclient.Client
 	}
 	return client, client, nil
 }
+
+// Outbox de Authorization. El relay corre seguido porque los resultados van al cajero: cada
+// ciclo agrega hasta outboxRelayEvery a la respuesta.
+const (
+	outboxSchema     = "pn_authorization"
+	outboxRelayEvery = 200 * time.Millisecond
+	outboxRelayBatch = 100
+)
 
 // acquirerEchoEvery es cada cuánto se prueba la conexión con el host.
 const acquirerEchoEvery = 30 * time.Second
@@ -231,6 +247,18 @@ func (a *app) start(ctx context.Context) error {
 			defer a.acquirerWG.Done()
 			a.acquirerClient.Run(acquirerCtx)
 		}()
+	}
+
+	// Publica lo que el outbox tenga pendiente, también lo que quedó de una ejecución anterior.
+	if a.outboxRelay != nil {
+		relayCtx, stop := context.WithCancel(context.WithoutCancel(ctx))
+		a.stopRelay = stop
+		a.relayWG.Add(1)
+		go func() {
+			defer a.relayWG.Done()
+			a.outboxRelay.Run(relayCtx)
+		}()
+		slog.Info("outbox relay active", slog.Duration("every", outboxRelayEvery))
 	}
 
 	if err := a.subscriber.Subscribe(); err != nil {
@@ -387,6 +415,12 @@ func (a *app) closeResources() {
 	if a.stopAcquirer != nil {
 		a.stopAcquirer()
 		a.acquirerWG.Wait()
+	}
+	// Después de las llamadas al adquirente, que encolan sus resultados: lo que no llegue a
+	// publicarse queda en el outbox y sale en el próximo arranque.
+	if a.stopRelay != nil {
+		a.stopRelay()
+		a.relayWG.Wait()
 	}
 
 	if a.pool != nil {

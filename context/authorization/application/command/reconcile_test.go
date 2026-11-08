@@ -37,7 +37,7 @@ func indeterminateTx(t *testing.T) *aggregate.Transaction {
 }
 
 func reconciler(repo *fakeRepo, acquirer *fakeAcquirer, publisher *fakePublisher) *command.AuthorizationHandler {
-	return command.NewAuthorizationHandler(repo, acquirer, publisher, natsutil.NewIdempotencyStore(nil, idempotencySchema), nil)
+	return command.NewAuthorizationHandler(repo, acquirer, publisher, natsutil.NewIdempotencyStore(nil, idempotencySchema), txPool{})
 }
 
 func TestReconcile_IndeterminateIsReversedAndRejected(t *testing.T) {
@@ -223,6 +223,7 @@ func (a *blockingAcquirer) Authorize(ctx context.Context, _ *aggregate.Transacti
 func TestApplyFraudScore_CallRunsOutsideTheHandler(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	expectTx(pool) // el resultado y su evento en el outbox, en el worker
 
 	repo := &fakeRepo{findResult: newFraudCheckingTransaction(t)}
 	acquirer := &blockingAcquirer{started: make(chan struct{}, 1), release: make(chan struct{}), timeout: make(chan bool, 1)}

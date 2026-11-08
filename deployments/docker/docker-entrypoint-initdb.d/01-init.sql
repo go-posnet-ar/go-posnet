@@ -61,6 +61,16 @@ CREATE INDEX IF NOT EXISTS idx_auth_txn_terminal_created
 CREATE INDEX IF NOT EXISTS idx_auth_txn_merchant_approved
     ON pn_authorization.transactions (merchant_id, created_at)
     WHERE state = 'APPROVED';
+-- Outbox: los eventos se escriben en la transacción de cada cambio, y un relay los publica.
+CREATE TABLE IF NOT EXISTS pn_authorization.outbox (
+    id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    subject    TEXT        NOT NULL,
+    event_id   TEXT        NOT NULL,
+    payload    BYTEA       NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_auth_outbox_created_at ON pn_authorization.outbox (created_at);
+
 CREATE TABLE IF NOT EXISTS pn_authorization.processed_events (
     event_id     UUID        PRIMARY KEY,
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

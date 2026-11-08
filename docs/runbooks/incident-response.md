@@ -86,6 +86,7 @@ verificar NATS por separado.
 | `PoolPostgresAgotado`, `PostgresDeadlock` | [Sección 4](#4-postgres) |
 | `DuplicadosNATSAltos` | Reinicios en bucle o `AckWait` insuficiente |
 | `ReversasEnRevision` | [Escenario H](batch-close-failure.md#escenario-h--reversas-en-revisión). `MERCHANT_MISMATCH` es lo más urgente |
+| `OutboxAuthorizationTrabado` | NATS y el log `outbox relay`. **No se pierde nada:** los resultados de las ventas salen solos al resolver la causa; mientras tanto, los cajeros esperan |
 | `OutboxSettlementTrabado` | NATS y el log `outbox relay`. **No se pierde nada:** los eventos de Settlement salen solos al resolver la causa |
 | `EventoSettlementPerdido` | **Falta una venta, una reversa o un cierre en Settlement.** Buscá `deliveries exhausted` en los logs y seguí [Reprocesamiento](nats-dlq-reprocess.md) |
 | `LotesEnDisputa` | [Escenario A](batch-close-failure.md#escenario-a--lote-en-disputed) |

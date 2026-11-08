@@ -170,6 +170,7 @@ func TestApplyFraudScore_CaptureOrderBlocksTheCard(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := newMockPool(t)
 			expectClaimed(pool, 1)
+			expectTx(pool)
 
 			tx := newFraudCheckingTransactionWithToken(t)
 			repo := &fakeRepo{findResult: tx}
@@ -207,6 +208,7 @@ func TestApplyFraudScore_CaptureOrderBlocksTheCard(t *testing.T) {
 func TestApplyFraudScore_BlocklistWriteFailureStillRejects(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	expectTx(pool)
 
 	tx := newFraudCheckingTransactionWithToken(t)
 	repo := &fakeRepo{findResult: tx}

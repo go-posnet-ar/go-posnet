@@ -195,6 +195,11 @@ func (h *AuthorizationHandler) AuthorizeTransaction(ctx context.Context, cmd por
 		}
 		if !created {
 			log.Warn(duplicateTransactionMsg)
+			return nil
+		}
+		// ── Paso 5: FraudCheckRequested, en el outbox de la misma transacción ──
+		if err := h.publisher.PublishFraudCheckRequested(ctx, dbTx, tx); err != nil {
+			return fmt.Errorf("enqueue fraud check: %w", err)
 		}
 		return nil
 	})
@@ -206,14 +211,6 @@ func (h *AuthorizationHandler) AuthorizeTransaction(ctx context.Context, cmd por
 		return nil
 	}
 	h.metrics.RecordReceived(ctx)
-
-	// ── Paso 5: Publicar FraudCheckRequested ─────────────────────────────────
-	if err := h.publisher.PublishFraudCheckRequested(ctx, tx); err != nil {
-		// El fraud check es asíncrono — si falla la publicación, loguear y continuar.
-		// La Saga tiene un mecanismo de bypass por timeout en ApplyFraudScore.
-		log.Error("failed to publish fraud check request — fraud bypass will apply",
-			slog.String("error", err.Error()))
-	}
 
 	log.Info("transaction received and fraud check requested",
 		slog.String("state", tx.State().String()),
@@ -306,13 +303,14 @@ func (h *AuthorizationHandler) rejectInvalid(
 	}
 
 	rejection := newInvalidRejection(cmd, txID, cause)
-	// Sin este registro, el rechazo sigue siendo válido: lo importante es que la sesión se entere.
-	if err := h.repo.SaveInvalidRejection(ctx, rejection); err != nil {
-		observability.RecordError(ctx, err)
-		log.Error("could not record the invalid transaction", slog.String("error", err.Error()))
-	}
-	if err := h.publisher.PublishInvalidRejected(ctx, rejection); err != nil {
-		return fmt.Errorf("rejectInvalid: publish: %w", err)
+	// El registro y el rechazo van juntos: si algo falla, el mensaje se reintenta entero.
+	if err := pgutil.WithReadCommitted(ctx, h.pool, func(dbTx pgx.Tx) error {
+		if err := h.repo.SaveInvalidRejectionTx(ctx, dbTx, rejection); err != nil {
+			return err
+		}
+		return h.publisher.PublishInvalidRejected(ctx, dbTx, rejection)
+	}); err != nil {
+		return fmt.Errorf("rejectInvalid: record and enqueue: %w", err)
 	}
 	h.metrics.RecordReceived(ctx)
 	h.metrics.RecordRejected(ctx, rejection.Rejection.Code(), string(rejection.Rejection.Source()))
@@ -418,6 +416,11 @@ func (h *AuthorizationHandler) ApplyFraudScore(ctx context.Context, cmd port.App
 			log.Warn("fraud score ignored — another score moved the transaction first")
 			return nil
 		}
+		if tx.State() == valueobject.StateRejected {
+			if err := h.publisher.PublishRejected(ctx, dbTx, tx); err != nil {
+				return fmt.Errorf("enqueue rejection: %w", err)
+			}
+		}
 		advanced = true
 		return nil
 	})
@@ -428,9 +431,9 @@ func (h *AuthorizationHandler) ApplyFraudScore(ctx context.Context, cmd port.App
 		return nil
 	}
 
-	// Si el fraud rechazó → publicar rechazo y terminar
+	// Si el fraud rechazó, el rechazo ya quedó en el outbox
 	if tx.State() == valueobject.StateRejected {
-		h.publishRejection(ctx, tx, log)
+		h.recordRejection(ctx, tx)
 		return nil
 	}
 
@@ -506,8 +509,14 @@ func (h *AuthorizationHandler) callAcquirer(
 		h.blockCard(ctx, tx, rc, log)
 	}
 
-	saved, err := h.repo.SaveIfState(ctx, tx, valueobject.StateProcessing)
+	saved, err := h.saveAndEnqueue(ctx, tx, valueobject.StateProcessing, func(dbTx pgx.Tx) error {
+		if tx.State() == valueobject.StateApproved {
+			return h.publisher.PublishApproved(ctx, dbTx, tx)
+		}
+		return h.publisher.PublishRejected(ctx, dbTx, tx)
+	})
 	if err != nil {
+		// Sigue en PROCESSING: el conciliador la revierte, como con cualquier respuesta perdida.
 		observability.RecordError(ctx, err)
 		return fmt.Errorf("callAcquirer: persist result: %w", err)
 	}
@@ -519,23 +528,14 @@ func (h *AuthorizationHandler) callAcquirer(
 		return nil
 	}
 
-	// Publicar resultado a NATS (fuera de la transacción Postgres)
+	// El resultado ya quedó en el outbox, con el nuevo estado.
 	if tx.State() == valueobject.StateApproved {
 		h.metrics.RecordApproved(ctx)
 		h.metrics.RecordSagaDuration(ctx, tx.ReceivedAt(), "approved")
-		if err := h.publisher.PublishApproved(ctx, tx); err != nil {
-			// Loguear pero no fallar — la transacción ya está en Postgres.
-			// El proceso de reconciliación puede republicar si es necesario.
-			log.Error("failed to publish approval event", slog.String("error", err.Error()))
-		}
 		log.Info("transaction approved", slog.String("auth_code", tx.AuthCode().String()))
 	} else {
 		rc := tx.RejectionCode()
-		h.metrics.RecordRejected(ctx, rc.Code(), string(rc.Source()))
-		h.metrics.RecordSagaDuration(ctx, tx.ReceivedAt(), "rejected")
-		if err := h.publisher.PublishRejected(ctx, tx); err != nil {
-			log.Error("failed to publish rejection event", slog.String("error", err.Error()))
-		}
+		h.recordRejection(ctx, tx)
 		log.Info("transaction rejected",
 			slog.String("rejection_code", rc.Code()),
 			slog.String("rejection_source", string(rc.Source())),
@@ -630,8 +630,9 @@ func (h *AuthorizationHandler) rejectBlockedCard(
 		}
 		if !created {
 			log.Warn(duplicateTransactionMsg)
+			return nil
 		}
-		return nil
+		return h.publisher.PublishRejected(ctx, dbTx, tx)
 	}); err != nil {
 		observability.RecordError(ctx, err)
 		return fmt.Errorf("rejectBlockedCard: persist: %w", err)
@@ -644,24 +645,43 @@ func (h *AuthorizationHandler) rejectBlockedCard(
 	log.Warn("transaction rejected — card is on the blocklist",
 		slog.String("rejection_code", rc.Code()),
 		slog.String("card_token", tx.CardToken().String()))
-	h.publishRejection(ctx, tx, log)
+	h.recordRejection(ctx, tx)
 	return nil
 }
 
-// publishRejection registra las métricas del rechazo y lo publica a NATS.
-// Separado de la persistencia porque los rechazos que ya se guardaron dentro
-// de una transacción de base solo necesitan esta mitad.
-func (h *AuthorizationHandler) publishRejection(
-	ctx context.Context,
-	tx *aggregate.Transaction,
-	log *slog.Logger,
-) {
+// recordRejection registra las métricas de un rechazo. El evento ya quedó en el outbox, en la
+// transacción que guardó el rechazo.
+func (h *AuthorizationHandler) recordRejection(ctx context.Context, tx *aggregate.Transaction) {
 	rc := tx.RejectionCode()
 	h.metrics.RecordRejected(ctx, rc.Code(), string(rc.Source()))
 	h.metrics.RecordSagaDuration(ctx, tx.ReceivedAt(), "rejected")
-	if err := h.publisher.PublishRejected(ctx, tx); err != nil {
-		log.Error("failed to publish rejection", slog.String("error", err.Error()))
-	}
+}
+
+// saveAndEnqueue guarda tx, si en la base sigue en expected, y encola su evento con enqueue, en
+// una sola transacción: el evento se publica si y solo si el cambio se confirma. Devuelve false,
+// sin encolar nada, si otro proceso la movió antes.
+func (h *AuthorizationHandler) saveAndEnqueue(
+	ctx context.Context,
+	tx *aggregate.Transaction,
+	expected valueobject.TransactionState,
+	enqueue func(dbTx pgx.Tx) error,
+) (bool, error) {
+	var saved bool
+	err := pgutil.WithReadCommitted(ctx, h.pool, func(dbTx pgx.Tx) error {
+		ok, err := h.repo.SaveIfStateTx(ctx, dbTx, tx, expected)
+		if err != nil {
+			return fmt.Errorf("save: %w", err)
+		}
+		if !ok {
+			return nil
+		}
+		if err := enqueue(dbTx); err != nil {
+			return fmt.Errorf("enqueue event: %w", err)
+		}
+		saved = true
+		return nil
+	})
+	return saved, err
 }
 
 // ProcessReversal procesa un pedido de anulación. El estado se valida antes de llamar al
@@ -749,15 +769,14 @@ func (h *AuthorizationHandler) completeReversal(ctx context.Context, tx *aggrega
 		return false, fmt.Errorf("reverse aggregate: %w", err)
 	}
 	// Si esto falla, se repite la reversa, que no tiene efecto.
-	saved, err := h.repo.SaveIfState(ctx, tx, valueobject.StateApproved)
+	saved, err := h.saveAndEnqueue(ctx, tx, valueobject.StateApproved, func(dbTx pgx.Tx) error {
+		return h.publisher.PublishReversalCompleted(ctx, dbTx, tx.ID(), tx)
+	})
 	if err != nil {
 		return false, fmt.Errorf("persist: %w", err)
 	}
 	if !saved {
 		return false, nil
-	}
-	if err := h.publisher.PublishReversalCompleted(ctx, tx.ID(), tx); err != nil {
-		log.Error("failed to publish reversal completed", slog.String("error", err.Error()))
 	}
 	log.Info("reversal completed successfully")
 	return true, nil

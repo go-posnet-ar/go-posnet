@@ -19,7 +19,7 @@ fraude sigue sin alcanzarse en el flujo QR con los pesos por defecto (ver
 |---|---|---|
 | Inicio de la Saga y coordinación con Fraud Detection | Implementado | Por eventos NATS |
 | Máquina de estados de `Transaction` | Implementado | Ver [§4.2](#42-máquina-de-estados) |
-| Publicación de resultados | Implementado | Directa a NATS, sin outbox |
+| Publicación de resultados | Implementado | Por outbox, al menos una vez |
 | Reversas | Implementado | Contra el mock |
 | Consulta de estado | Implementado | HTTP y gRPC, sin autenticación |
 | Métricas, trazas, alertas y SLO | Implementado | Ver [§10](#10-observabilidad) |
@@ -217,22 +217,21 @@ descuenta. **Terminal Gateway no se entera:** ya respondió `202` e ignora este 
 
 | Fallo | Resultado | ¿Se recupera solo? |
 |---|---|---|
-| `transaction.received` con datos inválidos | Publica `auth.rejected` con `INVALID_DATA`, lo registra en `invalid_transactions` y `Term` | **Sí**: la sesión pasa a rechazada |
-| Ídem, y falla ese registro | Se loguea, y el rechazo se publica igual. La consulta responde `404` | La sesión, sí. El registro, no |
+| `transaction.received` con datos inválidos | Lo registra en `invalid_transactions`, encola `auth.rejected` con `INVALID_DATA` en la misma transacción y `Term` | **Sí**: la sesión pasa a rechazada |
 | Ídem, sin un `transaction_id` válido o con uno que ya existe | `Term`; no se publica nada | No hace falta: no hay sesión a la que avisar, o vale la transacción original |
-| Ídem, y falla la consulta o la publicación del rechazo | `Nak` y reintento. Al agotar las entregas, se pierde | **Sí**, si se recupera antes |
+| Ídem, y falla la consulta, el registro o el encolado del rechazo | No queda ninguno de los dos: `Nak` y reintento. Al agotar las entregas, se pierde | **Sí**, si se recupera antes |
 | Error de base de datos antes de marcar el evento | `Nak` y reintento | **Sí** |
-| Falla el alta o el commit de la transacción | Nada queda guardado, ni el evento marcado: `Nak` y reintento | **Sí** |
+| Falla el alta, el encolado de `fraud.check-requested` o el commit | Nada queda guardado, ni el evento marcado: `Nak` y reintento | **Sí** |
 | Otro `transaction.received` con un `transaction_id` que ya existe | Se ignora con un `WARN` y se marca el evento: la transacción original no cambia | No hace falta |
-| Falla la publicación de `fraud.check-requested` | Se registra y se confirma; queda en `FRAUD_CHECKING` | No |
 | Fraud Detection nunca responde | Queda en `FRAUD_CHECKING`; no hay timeout | No |
-| Error de base de datos antes de guardar `PROCESSING` | Nada queda guardado: `Nak` y reintento, sin haber llamado al adquirente | **Sí** |
+| Error de base de datos al aplicar el score, incluido el encolado de un rechazo por fraude | Nada queda guardado: `Nak` y reintento, sin haber llamado al adquirente | **Sí** |
 | Llega otro score de una transacción que ya no lo espera | Se ignora con un `WARN` y se confirma | No hace falta |
 | Caída durante la llamada al adquirente | Queda en `PROCESSING`; la toma el conciliador | **Sí**: la revierte y la rechaza |
 | Error del adquirente | Pasa a `INDETERMINATE`; la toma el conciliador | **Sí**: la revierte y la rechaza |
-| Falla el guardado tras responder el adquirente | Queda en `PROCESSING`; la toma el conciliador | **Sí**: la revierte, aunque el emisor la haya aprobado |
+| Falla el guardado o el encolado del resultado tras responder el adquirente | Queda en `PROCESSING`; la toma el conciliador | **Sí**: la revierte, aunque el emisor la haya aprobado |
+| Falla el guardado o el encolado tras completar una reversa | Sigue en `APPROVED`, con la reversa pedida; el conciliador la vuelve a pedir | **Sí** |
 | La reversa del conciliador falla | Sigue en `INDETERMINATE`; alerta `TransaccionesSinResolver` | **Sí**, cuando el adquirente responda |
-| Falla la publicación del resultado | Se registra y se confirma; la base queda correcta, pero nadie se entera | No |
+| NATS no disponible al publicar | Los eventos esperan en el outbox; alerta `OutboxAuthorizationTrabado` | **Sí**, al volver NATS |
 
 El rechazo por `INVALID_DATA` solo lleva los campos que pasaron la validación; los demás van vacíos o en cero. Un
 `card_last4` o `card_network` inválido tampoco se loguea ni se guarda, porque podría traer un PAN completo.
@@ -370,7 +369,18 @@ que publica este contexto, `correlation_id` es el `TransactionID`.
 
 ### Publicados
 
-Todos se publican directamente, sin outbox.
+Todos se publican por outbox: se guardan en `pn_authorization.outbox`, en la misma transacción que el cambio de estado
+que los origina, así que no hay un resultado guardado sin su evento ni un evento sin su resultado. Un Relay revisa la
+tabla cada 200 ms, publica hasta 100 eventos por ciclo y borra los enviados. Eso suma hasta 200 ms a cada resultado.
+Puede correr en varias instancias: cada fila la toma una sola, con `FOR UPDATE SKIP LOCKED`.
+
+**La entrega es al menos una vez.** Si el Relay publica y no llega a borrar la fila, reenvía el evento con el mismo
+`Nats-Msg-Id`, el `event_id`: JetStream lo descarta dentro de su ventana de deduplicación, de 2 minutos por defecto. Pasada
+esa ventana, llega duplicado, y el consumidor debe descartarlo por `event_id`.
+
+**El orden no está garantizado con varias instancias.** Cada Relay publica sus filas por `created_at`, pero dos instancias
+pueden tomar eventos de la misma transacción en lotes distintos y publicarlos en otro orden. Solo afecta a una reversa
+completada muy poco después de su aprobación: Settlement la deja [en revisión](SETTLEMENT.md#revisiones-de-reversas) hasta que llegue la compra.
 
 | Subject | Stream | Cuándo | Consumidores |
 |---|---|---|---|
@@ -423,6 +433,7 @@ usa el schema `authorization` y no incluye la blocklist.
 |---|---|---|
 | `transactions` | Transacciones | PK `id`; índice parcial en `card_token`; índices por terminal y fecha, y de aprobadas por comercio y fecha, para el historial de Fraud Detection |
 | `processed_events` | Idempotencia de eventos | PK `event_id` |
+| `outbox` | Eventos pendientes de publicar | PK `id`; índice `created_at` |
 | `blocked_cards` | Blocklist | PK `card_token`; sin FK, para sobrevivir a purgas de transacciones |
 | `invalid_transactions` | Rechazos por datos inválidos. Solo valores validados, nunca el payload original | PK `transaction_id` |
 
@@ -496,10 +507,23 @@ El script es idempotente. Existe `000001_card_blocklist.down.sql` para deshacerl
 datos que no se pueden reconstruir**: la blocklist y los `card_token` de las transacciones. En un
 entorno con datos reales, exportarlos antes de ejecutarlo.
 
+### Aplicar la migración del outbox
+
+**Una base existente necesita `000006` antes de desplegar esta versión.** Sin ella, el servicio no arranca. Se puede aplicar
+con el servicio anterior en marcha:
+
+```bash
+psql "$POSTGRES_DSN" -f migrations/pn_authorization/000006_outbox.up.sql
+```
+
+Es idempotente. `000006_outbox.down.sql` la revierte: exige volver antes a la versión anterior del servicio, y falla sin
+cambiar nada si quedan eventos sin publicar, porque borrarlos perdería resultados de ventas.
+
 ### Garantías actuales
 
-- **Publicación:** *at-most-once* en la práctica. No hay outbox: si NATS falla después de guardar, el
-  evento se pierde. La reentrega no ayuda, porque el mensaje se confirma igual.
+- **Publicación:** *at-least-once*, por [outbox](#publicados). Cada evento se confirma junto con su cambio de estado, y
+  si NATS falla, espera en la tabla hasta que se pueda publicar. Un duplicado se descarta por `Nats-Msg-Id` o, pasada la
+  ventana de JetStream, por `event_id` en el consumidor.
 - **Idempotencia:** el `event_id` se registra en `processed_events`. En `AuthorizeTransaction`, ese registro se confirma
   junto con el alta, que no modifica una transacción existente. En `ApplyFraudScore` y `ProcessReversal`, se confirma
   junto con el nuevo estado o el pedido, y **antes** de llamar al adquirente: un fallo previo se
@@ -509,8 +533,8 @@ entorno con datos reales, exportarlos antes de ejecutarlo.
 ### Apagado
 
 Ante `SIGINT` o `SIGTERM`: detiene el conciliador, la purga y HTTP (hasta 10 s), drena y cierra NATS, espera las llamadas al
-adquirente en curso, hasta su timeout más 5 s, y cierra el pool de Postgres. Lo que no termine a tiempo lo retoma el
-conciliador. El servidor gRPC espera hasta 10 s las llamadas en curso.
+adquirente en curso, hasta su timeout más 5 s, detiene el Relay y cierra el pool de Postgres. Lo que no termine a tiempo lo
+retoma el conciliador, y los eventos que queden en el outbox salen al arrancar otra instancia. El servidor gRPC espera hasta 10 s las llamadas en curso.
 
 ## 10. Observabilidad
 
@@ -525,6 +549,7 @@ conciliador. El servidor gRPC espera hasta 10 s las llamadas en curso.
 | `posnet_acquirer_request_duration_seconds` | Histogram | `result` |
 | `posnet_saga_duration_seconds` | Histogram | `outcome` |
 | `posnet_authorization_unresolved_transactions` | Gauge | `state`: `INDETERMINATE`, `PROCESSING` trabadas o `REVERSAL_PENDING`. Consulta la base en cada scrape |
+| `posnet_authorization_outbox_stuck` | Gauge | Eventos en el outbox desde hace más de 1 minuto. Se calcula en la misma consulta |
 | `posnet_acquirer_connected` | Gauge | Con `iso8583`: 1 conectado, 0 caído |
 | `posnet_reversals_ignored_total` | Counter | `state`: pedidos de reversa sin nada que revertir |
 
@@ -550,6 +575,7 @@ Reglas en [`deployments/docker/prometheus/rules/`](../../deployments/docker/prom
 | `ErrorRateAlta` | Crítica | Rechazos por encima del 10 % de las recibidas durante 5 min |
 | `AdquirenteDesconectado` | Warning | Sin conexión con el host durante 2 min: las ventas se rechazan con `91` |
 | `TransaccionesSinResolver` | Warning | Transacciones sin resultado conocido o reversas sin completar durante 5 min: las reversas están fallando |
+| `OutboxAuthorizationTrabado` | Warning | Eventos en el outbox hace más de 1 minuto, durante 5 min: no llegan a NATS. Se publican solos al resolver la causa |
 | `LatenciaSagaAlta` | Warning | p95 de la Saga por encima de 3 s durante 5 min |
 | `DuplicadosNATSAltos` | Warning | Duplicados por encima de 0,05/s durante 5 min |
 
@@ -562,8 +588,7 @@ Reglas en [`deployments/docker/prometheus/rules/`](../../deployments/docker/prom
 
 Cada comando abre un span (`command.AuthorizeTransaction`, `command.ApplyFraudScore`,
 `command.callAcquirer`, etc.). Para seguir un pago en los logs, buscar por `transaction_id`. Los logs
-más relevantes para detectar pérdidas son `failed to publish` y `acquirer error`, porque ninguna
-métrica cuenta las publicaciones fallidas.
+más relevantes son `acquirer error` y `outbox relay`, que informa los ciclos del Relay que no pudieron publicar.
 
 ## 11. Configuración y ejecución
 
@@ -677,7 +702,6 @@ Con el simulador, estas fallas solo ocurren con [los montos de prueba](#probar-l
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
 | No existe el bypass ni el timeout de fraude | El log dice `fraud bypass will apply` y la documentación del evento menciona 500 ms, pero `BypassFraudCheck` no se invoca. Si Fraud Detection no responde, la transacción queda trabada para siempre | `AuthorizeTransaction` |
-| Resultados publicados sin outbox | Si falla la publicación de una aprobación, Settlement no la liquida y el cajero no la ve, aunque figure `APPROVED` | `callAcquirer`, `publishRejection`, `reconcile` |
 | Notification no consume `reversal-completed` | El contrato del evento prevé un comprobante de anulación, pero el subscriber de Notification no se suscribe, así que no se genera | `nt_nats_subscriber.go` |
 
 ### Blocklist y datos de tarjeta
@@ -699,4 +723,5 @@ Con el simulador, estas fallas solo ocurren con [los montos de prueba](#probar-l
 | Acoplamiento con Fraud Detection | Lee las tablas de este contexto directamente, en contra de lo que indica la documentación de arquitectura | `fd_postgres_repository.go` |
 | gRPC sin TLS ni autenticación | Cualquiera con acceso de red al puerto puede consultar transacciones. Hoy ningún servicio lo usa | `server.go` |
 | API HTTP sin autenticación | Cualquiera con acceso de red y un ID puede leer el estado y el monto de una transacción | `router.go` |
-| Eventos de dominio sin usar | `Transaction` registra eventos internos (`TransactionApproved`, etc.) que nadie lee. Se conservan porque son la base natural del outbox de resultados | `transaction.go` |
+| Eventos de dominio sin usar | `Transaction` registra eventos internos (`TransactionApproved`, etc.) que nadie lee: el outbox arma los eventos de integración desde la transacción | `transaction.go` |
+| Orden de eventos con varias instancias | Los Relays de dos instancias pueden publicar eventos de una misma transacción en otro orden (ver [§8](#publicados)) | `outbox.Relay` |

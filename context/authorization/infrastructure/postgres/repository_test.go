@@ -131,7 +131,7 @@ func TestInsertTx_RejectedTransactionArgs(t *testing.T) {
 
 // ─── Rechazos por datos inválidos ───────────────────────────────────────────
 
-func TestSaveInvalidRejection(t *testing.T) {
+func TestSaveInvalidRejectionTx(t *testing.T) {
 	pool := newMockPool(t)
 	r := valueobject.InvalidTransactionRejection{
 		TransactionID:   domain.NewTransactionID(),
@@ -142,22 +142,24 @@ func TestSaveInvalidRejection(t *testing.T) {
 		ValidationError: "invalid card_network: unknown value",
 		RejectedAt:      time.Date(2026, 11, 6, 15, 0, 4, 0, time.UTC),
 	}
+	dbTx := beginMockTx(t, pool)
 	pool.ExpectExec(`INSERT INTO pn_authorization.invalid_transactions[\s\S]*ON CONFLICT \(transaction_id\) DO NOTHING`).
 		WithArgs(r.TransactionID.String(), "", "", int64(5000), "ARS", valueobject.CodeInvalidData, r.ValidationError, r.RejectedAt).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 
-	if err := postgres.NewTransactionRepo(pool).SaveInvalidRejection(context.Background(), r); err != nil {
-		t.Fatalf("SaveInvalidRejection() error = %v", err)
+	if err := postgres.NewTransactionRepo(pool).SaveInvalidRejectionTx(context.Background(), dbTx, r); err != nil {
+		t.Fatalf("SaveInvalidRejectionTx() error = %v", err)
 	}
 }
 
-func TestSaveInvalidRejection_ExecError(t *testing.T) {
+func TestSaveInvalidRejectionTx_ExecError(t *testing.T) {
 	pool := newMockPool(t)
+	dbTx := beginMockTx(t, pool)
 	pool.ExpectExec("invalid_transactions").WithArgs(anyArgs(8)...).WillReturnError(errors.New("db down"))
 
-	err := postgres.NewTransactionRepo(pool).SaveInvalidRejection(context.Background(), valueobject.InvalidTransactionRejection{TransactionID: domain.NewTransactionID()})
+	err := postgres.NewTransactionRepo(pool).SaveInvalidRejectionTx(context.Background(), dbTx, valueobject.InvalidTransactionRejection{TransactionID: domain.NewTransactionID()})
 	if err == nil {
-		t.Fatal("SaveInvalidRejection() error = nil, want error")
+		t.Fatal("SaveInvalidRejectionTx() error = nil, want error")
 	}
 }
 
@@ -503,11 +505,12 @@ func TestCountUnresolved(t *testing.T) {
 	pool := newMockPool(t)
 	before := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	reversals := before.Add(time.Minute)
-	pool.ExpectQuery("COUNT").WithArgs(before, reversals).
-		WillReturnRows(pgxmock.NewRows([]string{"i", "p", "r"}).AddRow(int64(2), int64(3), int64(4)))
+	outboxBefore := before.Add(2 * time.Minute)
+	pool.ExpectQuery("pn_authorization.outbox WHERE created_at < \\$3").WithArgs(before, reversals, outboxBefore).
+		WillReturnRows(pgxmock.NewRows([]string{"i", "p", "r", "o"}).AddRow(int64(2), int64(3), int64(4), int64(5)))
 
-	got, err := postgres.NewTransactionRepo(pool).CountUnresolved(context.Background(), before, reversals)
-	want := repository.UnresolvedCounts{Indeterminate: 2, Processing: 3, ReversalPending: 4}
+	got, err := postgres.NewTransactionRepo(pool).CountUnresolved(context.Background(), before, reversals, outboxBefore)
+	want := repository.UnresolvedCounts{Indeterminate: 2, Processing: 3, ReversalPending: 4, OutboxStuck: 5}
 	if err != nil || got != want {
 		t.Errorf("CountUnresolved() = %+v, %v, want %+v", got, err, want)
 	}

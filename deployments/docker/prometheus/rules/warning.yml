@@ -138,6 +138,18 @@ groups:
           summary: "{{ $value }} transacciones sin resultado conocido"
           description: "Sin resultado conocido o con una reversa pedida sin completar. Revisar el adquirente y los logs 'transaction not reconciled' y 'reversal not completed'."
 
+      # Outbox de Authorization sin avanzar: los resultados no se pierden, pero no salen, así que
+      # Terminal Gateway, Settlement y Notification no se enteran.
+      # Investigar: conexión a NATS y logs "outbox relay".
+      - alert: OutboxAuthorizationTrabado
+        expr: max(posnet_authorization_outbox_stuck) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} eventos trabados en el outbox de Authorization"
+          description: "Los resultados de las transacciones y fraud.check-requested no llegan a NATS. Se publicarán solos cuando se resuelva la causa. Revisar NATS y los logs 'outbox relay'."
+
       # Outbox de Settlement sin avanzar: los eventos no se pierden, pero no salen.
       # Investigar: conexión a NATS y logs "outbox relay".
       - alert: OutboxSettlementTrabado

@@ -83,7 +83,13 @@ func (f *fakeRepo) SaveIfState(_ context.Context, tx *aggregate.Transaction, exp
 	return true, nil
 }
 
-func (f *fakeRepo) SaveIfStateTx(_ context.Context, _ pgx.Tx, tx *aggregate.Transaction, expected valueobject.TransactionState) (bool, error) {
+// SaveIfStateTx es el guardado del score, desde FRAUD_CHECKING, junto con el evento (claim*), o
+// el del resultado y el evento en el outbox, desde cualquier otro estado, que se comporta como
+// SaveIfState.
+func (f *fakeRepo) SaveIfStateTx(ctx context.Context, _ pgx.Tx, tx *aggregate.Transaction, expected valueobject.TransactionState) (bool, error) {
+	if expected != valueobject.StateFraudChecking {
+		return f.SaveIfState(ctx, tx, expected)
+	}
 	if f.claimErr != nil {
 		return false, f.claimErr
 	}
@@ -111,7 +117,7 @@ func (f *fakeRepo) FindPendingReversals(context.Context, time.Time, int) ([]*agg
 	return f.pendingReversals, f.pendingErr
 }
 
-func (f *fakeRepo) CountUnresolved(context.Context, time.Time, time.Time) (repository.UnresolvedCounts, error) {
+func (f *fakeRepo) CountUnresolved(context.Context, time.Time, time.Time, time.Time) (repository.UnresolvedCounts, error) {
 	return repository.UnresolvedCounts{}, nil
 }
 
@@ -128,7 +134,7 @@ func (f *fakeRepo) InsertTx(_ context.Context, _ pgx.Tx, tx *aggregate.Transacti
 	return true, nil
 }
 
-func (f *fakeRepo) SaveInvalidRejection(_ context.Context, r valueobject.InvalidTransactionRejection) error {
+func (f *fakeRepo) SaveInvalidRejectionTx(_ context.Context, _ pgx.Tx, r valueobject.InvalidTransactionRejection) error {
 	if f.invalidErr != nil {
 		return f.invalidErr
 	}
@@ -230,17 +236,17 @@ type fakePublisher struct {
 
 var _ service.EventPublisher = (*fakePublisher)(nil)
 
-func (f *fakePublisher) PublishApproved(_ context.Context, _ *aggregate.Transaction) error {
+func (f *fakePublisher) PublishApproved(_ context.Context, _ pgx.Tx, _ *aggregate.Transaction) error {
 	f.approvedCalls++
 	return f.approvedErr
 }
 
-func (f *fakePublisher) PublishRejected(_ context.Context, _ *aggregate.Transaction) error {
+func (f *fakePublisher) PublishRejected(_ context.Context, _ pgx.Tx, _ *aggregate.Transaction) error {
 	f.rejectedCalls++
 	return f.rejectedErr
 }
 
-func (f *fakePublisher) PublishInvalidRejected(_ context.Context, r valueobject.InvalidTransactionRejection) error {
+func (f *fakePublisher) PublishInvalidRejected(_ context.Context, _ pgx.Tx, r valueobject.InvalidTransactionRejection) error {
 	if f.invalidErr != nil {
 		return f.invalidErr
 	}
@@ -248,12 +254,12 @@ func (f *fakePublisher) PublishInvalidRejected(_ context.Context, r valueobject.
 	return nil
 }
 
-func (f *fakePublisher) PublishFraudCheckRequested(_ context.Context, _ *aggregate.Transaction) error {
+func (f *fakePublisher) PublishFraudCheckRequested(_ context.Context, _ pgx.Tx, _ *aggregate.Transaction) error {
 	f.fraudCheckCalls++
 	return f.fraudCheckErr
 }
 
-func (f *fakePublisher) PublishReversalCompleted(_ context.Context, _ domain.TransactionID, _ *aggregate.Transaction) error {
+func (f *fakePublisher) PublishReversalCompleted(_ context.Context, _ pgx.Tx, _ domain.TransactionID, _ *aggregate.Transaction) error {
 	f.reversalCalls++
 	return f.reversalErr
 }

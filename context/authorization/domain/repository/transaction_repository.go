@@ -25,7 +25,7 @@ type TransactionRepository interface {
 
 	// SaveInvalidRejection registra el rechazo de una transacción con datos inválidos. Si ya
 	// está registrado, no cambia nada.
-	SaveInvalidRejection(ctx context.Context, rejection valueobject.InvalidTransactionRejection) error
+	SaveInvalidRejectionTx(ctx context.Context, dbTx pgx.Tx, rejection valueobject.InvalidTransactionRejection) error
 
 	// FindInvalidRejection recupera ese registro. Devuelve nil si no existe.
 	FindInvalidRejection(ctx context.Context, id domain.TransactionID) (*valueobject.InvalidTransactionRejection, error)
@@ -64,8 +64,9 @@ type TransactionRepository interface {
 	// anterior a requestedBefore, de la más antigua a la más nueva.
 	FindPendingReversals(ctx context.Context, requestedBefore time.Time, limit int) ([]*aggregate.Transaction, error)
 
-	// CountUnresolved cuenta las transacciones sin resolver, según los mismos cortes.
-	CountUnresolved(ctx context.Context, processingBefore, reversalsBefore time.Time) (UnresolvedCounts, error)
+	// CountUnresolved cuenta las transacciones sin resolver, según los mismos cortes, y los
+	// eventos que esperan en el outbox desde antes de outboxBefore.
+	CountUnresolved(ctx context.Context, processingBefore, reversalsBefore, outboxBefore time.Time) (UnresolvedCounts, error)
 }
 
 // UnresolvedCounts son las transacciones que el conciliador tiene pendientes.
@@ -73,4 +74,5 @@ type UnresolvedCounts struct {
 	Indeterminate   int64 // En INDETERMINATE
 	Processing      int64 // En PROCESSING desde antes del corte
 	ReversalPending int64 // En APPROVED, con un pedido de reversa anterior al corte
+	OutboxStuck     int64 // Eventos en el outbox desde antes del corte: el relay no avanza
 }

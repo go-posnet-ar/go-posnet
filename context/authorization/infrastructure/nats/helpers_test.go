@@ -74,7 +74,7 @@ func (f *fakeRepo) Save(_ context.Context, tx *aggregate.Transaction) error {
 	return f.saveErr
 }
 
-func (f *fakeRepo) SaveInvalidRejection(context.Context, valueobject.InvalidTransactionRejection) error {
+func (f *fakeRepo) SaveInvalidRejectionTx(context.Context, pgx.Tx, valueobject.InvalidTransactionRejection) error {
 	return nil
 }
 
@@ -122,7 +122,7 @@ func (f *fakeRepo) FindPendingReversals(context.Context, time.Time, int) ([]*agg
 	return nil, nil
 }
 
-func (f *fakeRepo) CountUnresolved(context.Context, time.Time, time.Time) (repository.UnresolvedCounts, error) {
+func (f *fakeRepo) CountUnresolved(context.Context, time.Time, time.Time, time.Time) (repository.UnresolvedCounts, error) {
 	return repository.UnresolvedCounts{}, nil
 }
 
@@ -157,27 +157,27 @@ type fakeDomainPublisher struct {
 
 var _ service.EventPublisher = (*fakeDomainPublisher)(nil)
 
-func (f *fakeDomainPublisher) PublishApproved(_ context.Context, _ *aggregate.Transaction) error {
+func (f *fakeDomainPublisher) PublishApproved(_ context.Context, _ pgx.Tx, _ *aggregate.Transaction) error {
 	f.approvedCalls++
 	return nil
 }
 
-func (f *fakeDomainPublisher) PublishRejected(_ context.Context, _ *aggregate.Transaction) error {
+func (f *fakeDomainPublisher) PublishRejected(_ context.Context, _ pgx.Tx, _ *aggregate.Transaction) error {
 	f.rejectedCalls++
 	return nil
 }
 
-func (f *fakeDomainPublisher) PublishInvalidRejected(_ context.Context, _ valueobject.InvalidTransactionRejection) error {
+func (f *fakeDomainPublisher) PublishInvalidRejected(_ context.Context, _ pgx.Tx, _ valueobject.InvalidTransactionRejection) error {
 	f.invalidRejectedCalls++
 	return f.invalidRejectedErr
 }
 
-func (f *fakeDomainPublisher) PublishFraudCheckRequested(_ context.Context, _ *aggregate.Transaction) error {
+func (f *fakeDomainPublisher) PublishFraudCheckRequested(_ context.Context, _ pgx.Tx, _ *aggregate.Transaction) error {
 	f.fraudCheckCalls++
 	return nil
 }
 
-func (f *fakeDomainPublisher) PublishReversalCompleted(_ context.Context, _ domain.TransactionID, _ *aggregate.Transaction) error {
+func (f *fakeDomainPublisher) PublishReversalCompleted(_ context.Context, _ pgx.Tx, _ domain.TransactionID, _ *aggregate.Transaction) error {
 	f.reversalCalls++
 	return nil
 }

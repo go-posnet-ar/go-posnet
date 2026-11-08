@@ -137,6 +137,7 @@ func TestProcessReversal_SaveErrorIsLeftForTheReconciler(t *testing.T) {
 func TestProcessReversal_Success(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	expectTx(pool) // REVERSED y su evento en el outbox
 
 	repo := &fakeRepo{findResult: newApprovedTransaction(t)}
 	acquirer := &fakeAcquirer{}
@@ -160,22 +161,26 @@ func TestProcessReversal_Success(t *testing.T) {
 	}
 }
 
-func TestProcessReversal_PublishErrorIsNonFatal(t *testing.T) {
+// La reversa completada se encola en la transacción que la guarda: si falla, no queda ninguna de
+// las dos. Sigue en APPROVED con el pedido guardado, y el conciliador la reintenta.
+func TestProcessReversal_EnqueueErrorIsRetriedByTheReconciler(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectRollback()
 
 	repo := &fakeRepo{findResult: newApprovedTransaction(t)}
-	publisher := &fakePublisher{reversalErr: errors.New("nats unavailable")}
+	publisher := &fakePublisher{reversalErr: errors.New("outbox insert failed")}
 	h := command.NewAuthorizationHandler(
 		repo, &fakeAcquirer{}, publisher,
 		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
 	)
 
 	if err := h.ProcessReversal(context.Background(), validReversalCmd(t, repo.findResult.ID())); err != nil {
-		t.Fatalf("ProcessReversal() error = %v, want nil (publish failure must not fail the saga)", err)
+		t.Fatalf("ProcessReversal() error = %v, want nil: el pedido ya quedó guardado", err)
 	}
-	if len(repo.savedTxs) != 1 {
-		t.Errorf("saved txs = %d, want 1", len(repo.savedTxs))
+	if repo.reversalMarks != 1 {
+		t.Errorf("marks = %d, want 1: el pedido tiene que quedar para el conciliador", repo.reversalMarks)
 	}
 }
 
@@ -198,6 +203,9 @@ func TestProcessReversal_ByState(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := newMockPool(t)
 			expectClaimed(pool, 1)
+			if tc.reverses > 0 {
+				expectTx(pool) // REVERSED y su evento en el outbox
+			}
 
 			repo := &fakeRepo{findResult: tc.tx(t)}
 			acquirer := &fakeAcquirer{}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/jackc/pgx/v5"
 	"log/slog"
 	"strings"
 	"sync"
@@ -201,7 +202,12 @@ func TestHandleTransactionReceived_HandlerValidationError(t *testing.T) {
 
 func TestHandleTransactionReceived_InvalidDataPublishesRejection(t *testing.T) {
 	pub := &fakeDomainPublisher{}
-	h := command.NewAuthorizationHandler(&fakeRepo{}, &fakeAcquirer{}, pub, natsutil.NewIdempotencyStore(nil, idempotencySchema), nil)
+	// El registro y el rechazo van en una transacción de base.
+	pool := newMockPool(t)
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectCommit()
+	pool.ExpectRollback()
+	h := command.NewAuthorizationHandler(&fakeRepo{}, &fakeAcquirer{}, pub, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool)
 	s := NewSubscriber(&fakeJetStream{}, h)
 
 	id := domain.NewTransactionID().String()
@@ -324,6 +330,7 @@ func TestHandleReversalRequested_UnwrapError(t *testing.T) {
 func TestHandleReversalRequested_Success(t *testing.T) {
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
+	expectTx(pool)
 
 	repo := &fakeRepo{findResult: newApprovedTransaction(t)}
 	pub := &fakeDomainPublisher{}

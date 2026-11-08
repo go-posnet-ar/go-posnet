@@ -191,13 +191,15 @@ func TestIntegration_TransactionRepo(t *testing.T) {
 		save := func(rejectedAt time.Time) domain.TransactionID {
 			t.Helper()
 			id := domain.NewTransactionID()
-			if err := repo.SaveInvalidRejection(ctx, valueobject.InvalidTransactionRejection{
-				TransactionID:   id,
-				Rejection:       valueobject.NewRejectionFromValidation(valueobject.CodeInvalidData),
-				ValidationError: "motivo",
-				RejectedAt:      rejectedAt,
+			if err := pgutil.WithReadCommitted(ctx, pool, func(dbTx pgx.Tx) error {
+				return repo.SaveInvalidRejectionTx(ctx, dbTx, valueobject.InvalidTransactionRejection{
+					TransactionID:   id,
+					Rejection:       valueobject.NewRejectionFromValidation(valueobject.CodeInvalidData),
+					ValidationError: "motivo",
+					RejectedAt:      rejectedAt,
+				})
 			}); err != nil {
-				t.Fatalf("SaveInvalidRejection() error = %v", err)
+				t.Fatalf("SaveInvalidRejectionTx() error = %v", err)
 			}
 			return id
 		}

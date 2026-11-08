@@ -40,10 +40,15 @@ func TestAuthorizeTransaction_ValidationErrors(t *testing.T) {
 			cmd := validAuthorizeCmd(t)
 			tc.mutate(&cmd)
 
+			// Con un transaction_id válido, el rechazo se registra y se encola en una transacción.
+			pool := newMockPool(t)
+			if tc.name != "invalid transaction id" {
+				expectTx(pool)
+			}
 			h := command.NewAuthorizationHandler(
 				&fakeRepo{}, &fakeAcquirer{}, &fakePublisher{},
 				natsutil.NewIdempotencyStore(nil, idempotencySchema),
-				nil, // el pool no debe tocarse: la validación falla antes de llegar a la DB
+				pool,
 			)
 
 			err := h.AuthorizeTransaction(context.Background(), cmd)
@@ -61,11 +66,28 @@ func TestAuthorizeTransaction_ValidationErrors(t *testing.T) {
 	}
 }
 
-func newInvalidDataHandler(repo *fakeRepo, publisher *fakePublisher) *command.AuthorizationHandler {
-	// El pool queda en nil: una transacción inválida no abre una transacción de base.
+// txOutcome es lo que hace la transacción del rechazo de una transacción inválida.
+type txOutcome int
+
+const (
+	noTx       txOutcome = iota // no llega a abrirla
+	txCommit                    // registra y encola
+	txRollback                  // falla el registro o el encolado
+)
+
+func newInvalidDataHandler(t *testing.T, repo *fakeRepo, publisher *fakePublisher, outcome txOutcome) *command.AuthorizationHandler {
+	t.Helper()
+	pool := newMockPool(t)
+	switch outcome {
+	case txCommit:
+		expectTx(pool)
+	case txRollback:
+		pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		pool.ExpectRollback()
+	}
 	return command.NewAuthorizationHandler(
 		repo, &fakeAcquirer{}, publisher,
-		natsutil.NewIdempotencyStore(nil, idempotencySchema), nil,
+		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
 	)
 }
 
@@ -75,7 +97,7 @@ func TestAuthorizeTransaction_InvalidDataPublishesRejection(t *testing.T) {
 	repo := &fakeRepo{}
 	publisher := &fakePublisher{}
 
-	err := newInvalidDataHandler(repo, publisher).AuthorizeTransaction(context.Background(), cmd)
+	err := newInvalidDataHandler(t, repo, publisher, txCommit).AuthorizeTransaction(context.Background(), cmd)
 
 	var ve *pkgerrors.ValidationError
 	if !errors.As(err, &ve) {
@@ -113,20 +135,22 @@ func TestAuthorizeTransaction_InvalidDataPublishesRejection(t *testing.T) {
 }
 
 // Si no se puede registrar, la sesión igual tiene que enterarse del rechazo.
-func TestAuthorizeTransaction_InvalidDataRecordFailureStillPublishes(t *testing.T) {
+// El registro y el rechazo van en la misma transacción: si falla el registro, no se encola el
+// rechazo, y el mensaje se reintenta entero.
+func TestAuthorizeTransaction_InvalidDataRecordFailureIsRetried(t *testing.T) {
 	cmd := validAuthorizeCmd(t)
 	cmd.CardNetwork = "BOGUS"
 	publisher := &fakePublisher{}
 
-	err := newInvalidDataHandler(&fakeRepo{invalidErr: errors.New("db down")}, publisher).
+	err := newInvalidDataHandler(t, &fakeRepo{invalidErr: errors.New("db down")}, publisher, txRollback).
 		AuthorizeTransaction(context.Background(), cmd)
 
 	var ve *pkgerrors.ValidationError
-	if !errors.As(err, &ve) {
-		t.Errorf("error = %v, want a ValidationError", err)
+	if err == nil || errors.As(err, &ve) {
+		t.Errorf("error = %v, want un error que no sea de validación, para reintentar", err)
 	}
-	if len(publisher.invalidRejections) != 1 {
-		t.Errorf("rechazos publicados = %d, want 1", len(publisher.invalidRejections))
+	if len(publisher.invalidRejections) != 0 {
+		t.Errorf("rechazos encolados = %d, want 0", len(publisher.invalidRejections))
 	}
 }
 
@@ -148,7 +172,7 @@ func TestAuthorizeTransaction_InvalidCardDataIsNotForwarded(t *testing.T) {
 			repo := &fakeRepo{}
 			publisher := &fakePublisher{}
 
-			err := newInvalidDataHandler(repo, publisher).AuthorizeTransaction(context.Background(), cmd)
+			err := newInvalidDataHandler(t, repo, publisher, txCommit).AuthorizeTransaction(context.Background(), cmd)
 			if err == nil {
 				t.Fatal("AuthorizeTransaction() error = nil, want a validation error")
 			}
@@ -182,7 +206,7 @@ func TestAuthorizeTransaction_InvalidDataNotPublished(t *testing.T) {
 			tc.mutate(&cmd)
 			publisher := &fakePublisher{}
 
-			err := newInvalidDataHandler(tc.repo, publisher).AuthorizeTransaction(context.Background(), cmd)
+			err := newInvalidDataHandler(t, tc.repo, publisher, noTx).AuthorizeTransaction(context.Background(), cmd)
 
 			var ve *pkgerrors.ValidationError
 			if !errors.As(err, &ve) {
@@ -203,16 +227,17 @@ func TestAuthorizeTransaction_InvalidDataTransientErrorsAreRetried(t *testing.T)
 		name      string
 		repo      *fakeRepo
 		publisher *fakePublisher
+		outcome   txOutcome
 	}{
-		{"falla la consulta", &fakeRepo{existsErr: boom}, &fakePublisher{}},
-		{"falla la publicación", &fakeRepo{}, &fakePublisher{invalidErr: boom}},
+		{"falla la consulta", &fakeRepo{existsErr: boom}, &fakePublisher{}, noTx},
+		{"falla el encolado", &fakeRepo{}, &fakePublisher{invalidErr: boom}, txRollback},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			cmd := validAuthorizeCmd(t)
 			cmd.CardNetwork = "BOGUS"
 
-			err := newInvalidDataHandler(tc.repo, tc.publisher).AuthorizeTransaction(context.Background(), cmd)
+			err := newInvalidDataHandler(t, tc.repo, tc.publisher, tc.outcome).AuthorizeTransaction(context.Background(), cmd)
 
 			var ve *pkgerrors.ValidationError
 			if !errors.Is(err, boom) || errors.As(err, &ve) {
@@ -226,7 +251,7 @@ func TestPurgeInvalidRejections(t *testing.T) {
 	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
 	repo := &fakeRepo{purgeDeleted: 3}
 
-	deleted, err := newInvalidDataHandler(repo, &fakePublisher{}).PurgeInvalidRejections(context.Background(), now, 24*time.Hour)
+	deleted, err := newInvalidDataHandler(t, repo, &fakePublisher{}, noTx).PurgeInvalidRejections(context.Background(), now, 24*time.Hour)
 	if err != nil || deleted != 3 {
 		t.Fatalf("PurgeInvalidRejections() = %d, %v, want 3, nil", deleted, err)
 	}
@@ -237,7 +262,7 @@ func TestPurgeInvalidRejections(t *testing.T) {
 
 func TestPurgeInvalidRejections_Error(t *testing.T) {
 	boom := errors.New("boom")
-	h := newInvalidDataHandler(&fakeRepo{purgeErr: boom}, &fakePublisher{})
+	h := newInvalidDataHandler(t, &fakeRepo{purgeErr: boom}, &fakePublisher{}, noTx)
 
 	if _, err := h.PurgeInvalidRejections(context.Background(), time.Now(), time.Hour); !errors.Is(err, boom) {
 		t.Errorf("error = %v, want %v", err, boom)
@@ -336,22 +361,21 @@ func TestAuthorizeTransaction_SaveErrorRollsBack(t *testing.T) {
 	}
 }
 
-func TestAuthorizeTransaction_PublishFraudCheckErrorIsNonFatal(t *testing.T) {
+// El pedido de fraude se encola en la transacción del alta: si falla, no queda ni la transacción
+// ni el evento marcado, y la reentrega lo reintenta. Antes quedaba trabada en FRAUD_CHECKING.
+func TestAuthorizeTransaction_FraudCheckEnqueueErrorRollsBack(t *testing.T) {
 	pool := newMockPool(t)
-	expectClaimed(pool, 1)
+	expectClaimedThenRollback(pool)
 
-	repo := &fakeRepo{}
-	publisher := &fakePublisher{fraudCheckErr: errors.New("nats unavailable")}
+	publisher := &fakePublisher{fraudCheckErr: errors.New("outbox insert failed")}
 	h := command.NewAuthorizationHandler(
-		repo, &fakeAcquirer{}, publisher,
+		&fakeRepo{}, &fakeAcquirer{}, publisher,
 		natsutil.NewIdempotencyStore(nil, idempotencySchema), pool,
 	)
 
-	if err := h.AuthorizeTransaction(context.Background(), validAuthorizeCmd(t)); err != nil {
-		t.Fatalf("AuthorizeTransaction() error = %v, want nil (publish failure must not fail the saga)", err)
-	}
-	if len(repo.savedTxs) != 1 {
-		t.Errorf("saved txs = %d, want 1", len(repo.savedTxs))
+	err := h.AuthorizeTransaction(context.Background(), validAuthorizeCmd(t))
+	if err == nil || !strings.Contains(err.Error(), "enqueue fraud check") {
+		t.Fatalf("AuthorizeTransaction() error = %v, want el error del encolado, para reintentar", err)
 	}
 }
 

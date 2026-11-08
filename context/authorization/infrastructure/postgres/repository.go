@@ -140,7 +140,7 @@ func (r *TransactionRepo) InsertTx(ctx context.Context, dbTx pgx.Tx, tx *aggrega
 
 // SaveInvalidRejection registra el rechazo de una transacción con datos inválidos. Un reintento
 // del mismo mensaje no lo duplica.
-func (r *TransactionRepo) SaveInvalidRejection(ctx context.Context, rejection valueobject.InvalidTransactionRejection) error {
+func (r *TransactionRepo) SaveInvalidRejectionTx(ctx context.Context, dbTx pgx.Tx, rejection valueobject.InvalidTransactionRejection) error {
 	const query = `
 		INSERT INTO pn_authorization.invalid_transactions (
 			transaction_id, terminal_id, merchant_id,
@@ -153,13 +153,13 @@ func (r *TransactionRepo) SaveInvalidRejection(ctx context.Context, rejection va
 		)
 		ON CONFLICT (transaction_id) DO NOTHING
 	`
-	_, err := r.pool.Exec(ctx, query,
+	_, err := dbTx.Exec(ctx, query,
 		rejection.TransactionID.String(), rejection.TerminalID, rejection.MerchantID,
 		rejection.AmountCents, rejection.Currency,
 		rejection.Rejection.Code(), rejection.ValidationError, rejection.RejectedAt,
 	)
 	if err != nil {
-		return fmt.Errorf("TransactionRepo.SaveInvalidRejection: %w", err)
+		return fmt.Errorf("TransactionRepo.SaveInvalidRejectionTx: %w", err)
 	}
 	return nil
 }
@@ -363,19 +363,22 @@ func (r *TransactionRepo) MarkReversalRequestedTx(ctx context.Context, dbTx pgx.
 	return nil
 }
 
-// CountUnresolved cuenta las transacciones sin resolver, por motivo.
-func (r *TransactionRepo) CountUnresolved(ctx context.Context, processingBefore, reversalsBefore time.Time) (repository.UnresolvedCounts, error) {
+// CountUnresolved cuenta las transacciones sin resolver, por motivo, y los eventos trabados
+// en el outbox.
+func (r *TransactionRepo) CountUnresolved(ctx context.Context, processingBefore, reversalsBefore, outboxBefore time.Time) (repository.UnresolvedCounts, error) {
 	const query = `
 		SELECT
 			COUNT(*) FILTER (WHERE state = 'INDETERMINATE'),
 			COUNT(*) FILTER (WHERE state = 'PROCESSING' AND COALESCE(processing_started_at, created_at) < $1),
-			COUNT(*) FILTER (WHERE state = 'APPROVED' AND reversal_requested_at < $2)
+			COUNT(*) FILTER (WHERE state = 'APPROVED' AND reversal_requested_at < $2),
+			(SELECT COUNT(*) FROM pn_authorization.outbox WHERE created_at < $3)
 		FROM pn_authorization.transactions
 		WHERE state IN ('INDETERMINATE', 'PROCESSING')
 		   OR (state = 'APPROVED' AND reversal_requested_at IS NOT NULL)
 	`
 	var c repository.UnresolvedCounts
-	if err := r.pool.QueryRow(ctx, query, processingBefore, reversalsBefore).Scan(&c.Indeterminate, &c.Processing, &c.ReversalPending); err != nil {
+	if err := r.pool.QueryRow(ctx, query, processingBefore, reversalsBefore, outboxBefore).
+		Scan(&c.Indeterminate, &c.Processing, &c.ReversalPending, &c.OutboxStuck); err != nil {
 		return repository.UnresolvedCounts{}, fmt.Errorf("TransactionRepo.CountUnresolved: %w", err)
 	}
 	return c, nil
@@ -389,6 +392,7 @@ var (
 		"pn_authorization.processed_events",
 		"pn_authorization.blocked_cards",
 		"pn_authorization.invalid_transactions",
+		"pn_authorization.outbox",
 	}
 	requiredColumns = []string{"card_token", "processing_started_at", "reversal_requested_at"}
 )
