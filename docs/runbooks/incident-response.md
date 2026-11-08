@@ -86,6 +86,7 @@ verificar NATS por separado.
 | `PoolPostgresAgotado`, `PostgresDeadlock` | [Sección 4](#4-postgres) |
 | `DuplicadosNATSAltos` | Reinicios en bucle o `AckWait` insuficiente |
 | `ReversasEnRevision` | [Escenario H](batch-close-failure.md#escenario-h--reversas-en-revisión). `MERCHANT_MISMATCH` es lo más urgente |
+| `CircuitoAdquirenteAbierto` | El host adquirente y los logs `acquirer circuit`. **Las ventas se rechazan con `91` mientras dure:** el cliente puede reintentar. Se cierra solo cuando una llamada de prueba recibe respuesta |
 | `FraudCheckSinRespuesta` | Fraud Detection: que esté levantado, su consumidor de `fraud.check-requested` y `posnet_fraud_engine_duration_seconds`. **Las ventas se rechazan mientras dure,** con `FRAUD_TIMEOUT`: el cliente puede reintentar |
 | `OutboxAuthorizationTrabado` | NATS y el log `outbox relay`. **No se pierde nada:** los resultados de las ventas salen solos al resolver la causa; mientras tanto, los cajeros esperan |
 | `OutboxSettlementTrabado` | NATS y el log `outbox relay`. **No se pierde nada:** los eventos de Settlement salen solos al resolver la causa |

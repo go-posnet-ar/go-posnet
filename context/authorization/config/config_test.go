@@ -18,6 +18,7 @@ var optionalEnvKeys = []string{
 	"OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION", "OTEL_EXPORTER_OTLP_ENDPOINT", "ENVIRONMENT",
 	"ACQUIRER_HOST", "ACQUIRER_PORT", "ACQUIRER_TLS_CERT", "ACQUIRER_TLS_KEY", "ACQUIRER_TLS_CA",
 	"ACQUIRER_TIMEOUT_SECONDS", "INVALID_TRANSACTIONS_RETENTION", "FRAUD_CHECK_TIMEOUT",
+	"ACQUIRER_BREAKER_FAILURES", "ACQUIRER_BREAKER_COOLDOWN",
 }
 
 func clearOptionalEnv(t *testing.T) {
@@ -456,6 +457,45 @@ func TestLoad_FraudCheckTimeout(t *testing.T) {
 			}
 			if cfg.FraudCheckTimeout != tc.want {
 				t.Errorf("FraudCheckTimeout = %v, want %v", cfg.FraudCheckTimeout, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_BreakerConfig(t *testing.T) {
+	t.Setenv("POSTGRES_DSN", "postgres://x")
+	t.Setenv("NATS_URL", "nats://x")
+
+	tests := []struct {
+		name         string
+		failures     string
+		cooldown     string
+		wantFailures int
+		wantCooldown time.Duration
+		wantErr      bool
+	}{
+		{name: "defaults", wantFailures: 5, wantCooldown: 30 * time.Second},
+		{name: "custom", failures: "3", cooldown: "10s", wantFailures: 3, wantCooldown: 10 * time.Second},
+		{name: "disabled", failures: "0", wantFailures: 0, wantCooldown: 30 * time.Second},
+		{name: "negative failures", failures: "-1", wantErr: true},
+		{name: "zero cooldown", cooldown: "0s", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("ACQUIRER_BREAKER_FAILURES", tc.failures)
+			t.Setenv("ACQUIRER_BREAKER_COOLDOWN", tc.cooldown)
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("Load() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Acquirer.BreakerFailures != tc.wantFailures || cfg.Acquirer.BreakerCooldown != tc.wantCooldown {
+				t.Errorf("breaker = %d, %s, want %d, %s", cfg.Acquirer.BreakerFailures, cfg.Acquirer.BreakerCooldown, tc.wantFailures, tc.wantCooldown)
 			}
 		})
 	}

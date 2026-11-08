@@ -13,6 +13,7 @@ import (
 	"github.com/juantevez/go-posnet/context/authorization/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/authorization/domain/service"
 	"github.com/juantevez/go-posnet/context/authorization/domain/valueobject"
+	"github.com/juantevez/go-posnet/context/authorization/infrastructure/breaker"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
@@ -521,6 +522,7 @@ func TestApplyFraudScore_NotSentIsRejectedWithoutReversal(t *testing.T) {
 	}{
 		{"sin conexión", service.ErrNotSent, valueobject.ISO_ISSUER_UNAVAILABLE},
 		{"tarjeta desconocida", fmt.Errorf("%w: %w", service.ErrNotSent, service.ErrCardDataNotFound), valueobject.ISO_CARD_NOT_FOUND},
+		{"circuito abierto", breaker.ErrOpen, valueobject.ISO_ISSUER_UNAVAILABLE},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

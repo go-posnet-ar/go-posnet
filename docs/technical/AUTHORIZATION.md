@@ -24,6 +24,7 @@ fraude sigue sin alcanzarse en el flujo QR con los pesos por defecto (ver
 | Consulta de estado | Implementado | HTTP y gRPC, sin autenticación |
 | Métricas, trazas, alertas y SLO | Implementado | Ver [§10](#10-observabilidad) |
 | Adquirente por ISO 8583 sobre TCP | Implementado | `0100`, `0400` y `0800`, contra un [simulador](#iso-8583). Sin TLS |
+| Circuit breaker del adquirente | Implementado | Con el host sin responder, rechaza con `91` al instante. Ver [Circuit breaker](#circuit-breaker) |
 | Datos de la tarjeta | **Stub** | Tarjetas de prueba. No se puede usar en producción |
 | Blocklist de tarjetas | Implementado | Con `card_token` en `/pay` y un `41` del host |
 | Timeout de fraude | Implementado | Sin score a tiempo, rechaza con `FRAUD_TIMEOUT`. Ver [§5.2](#52-decisión-de-fraude) |
@@ -247,6 +248,7 @@ descuenta. **Terminal Gateway no se entera:** ya respondió `202` e ignora este 
 | Llega otro score de una transacción que ya no lo espera | Se ignora con un `WARN` y se confirma | No hace falta |
 | Caída durante la llamada al adquirente | Queda en `PROCESSING`; la toma el conciliador | **Sí**: la revierte y la rechaza |
 | Error del adquirente | Pasa a `INDETERMINATE`; la toma el conciliador | **Sí**: la revierte y la rechaza |
+| El host deja de responder | Con varias llamadas seguidas sin respuesta, el [circuit breaker](#circuit-breaker) se abre y rechaza con `91` al instante | **Sí**: se cierra cuando el host vuelve a responder |
 | Falla el guardado o el encolado del resultado tras responder el adquirente | Queda en `PROCESSING`; la toma el conciliador | **Sí**: la revierte, aunque el emisor la haya aprobado |
 | Falla el guardado o el encolado tras completar una reversa | Sigue en `APPROVED`, con la reversa pedida; el conciliador la vuelve a pedir | **Sí** |
 | La reversa del conciliador falla | Sigue en `INDETERMINATE`; alerta `TransaccionesSinResolver` | **Sí**, cuando el adquirente responda |
@@ -277,6 +279,26 @@ No ocupan el handler de NATS. La transacción ya está guardada, así que el men
 en un worker, con hasta `ACQUIRER_MAX_CONCURRENT` simultáneas y un timeout de `ACQUIRER_TIMEOUT_SECONDS` cada una, que no
 depende del `AckWait` de NATS. Un adquirente lento no frena la cola hasta que se ocupan todos los workers. Ahí, el consumo
 espera, en lugar de acumular llamadas sin límite.
+
+### Circuit breaker
+
+Si el host está conectado pero no responde, cada llamada espera su timeout entero, ocupa un worker y termina en
+`INDETERMINATE`, con una reversa. Para cortarlo, las llamadas pasan por un circuit breaker:
+
+| Estado | Qué hace | Cuándo cambia |
+|---|---|---|
+| Cerrado | Las llamadas pasan | Con `ACQUIRER_BREAKER_FAILURES` llamadas seguidas sin respuesta, 5 por defecto, se abre |
+| Abierto | Rechaza las ventas con `91` al instante, sin llamar al host. Las reversas fallan y el conciliador las reintenta | Pasado `ACQUIRER_BREAKER_COOLDOWN`, 30 s por defecto, pasa a medio abierto |
+| Medio abierto | Deja pasar una sola llamada de prueba, y rechaza las demás mientras tanto | Si el host responde, se cierra; si no, se abre otro cooldown |
+
+- **Qué cuenta como falla:** solo un error ambiguo, el de una llamada que salió y no recibió respuesta. Una respuesta del
+  emisor, aprobada o rechazada, reinicia la cuenta. Un envío imposible, como sin conexión o con una tarjeta desconocida, ya
+  se rechaza al instante y no cuenta.
+- **El `91` es reintentable,** y no hay nada que revertir: la venta no salió. Lo mismo que [sin conexión](#iso-8583).
+- **Con varias instancias,** cada una tiene su breaker y lo abre por su cuenta.
+- **Lo informan** `posnet_acquirer_circuit_open` y la alerta `CircuitoAdquirenteAbierto`. Los logs son `acquirer circuit
+  opened`, `half-open` y `closed`.
+- **`ACQUIRER_BREAKER_FAILURES=0` lo desactiva.**
 
 ### ISO 8583
 
@@ -582,6 +604,7 @@ retoma el conciliador, y los eventos que queden en el outbox salen al arrancar o
 | `posnet_authorization_unresolved_transactions` | Gauge | `state`: `INDETERMINATE`, `PROCESSING` trabadas o `REVERSAL_PENDING`. Consulta la base en cada scrape |
 | `posnet_authorization_outbox_stuck` | Gauge | Eventos en el outbox desde hace más de 1 minuto. Se calcula en la misma consulta |
 | `posnet_acquirer_connected` | Gauge | Con `iso8583`: 1 conectado, 0 caído |
+| `posnet_acquirer_circuit_open` | Gauge | 1 con el [circuit breaker](#circuit-breaker) abierto o probando, 0 cerrado |
 | `posnet_reversals_ignored_total` | Counter | `state`: pedidos de reversa sin nada que revertir |
 
 `posnet_saga_duration_seconds` solo registra sagas que terminan en aprobación o rechazo: las trabadas no aparecen, ni
@@ -605,6 +628,7 @@ Reglas en [`deployments/docker/prometheus/rules/`](../../deployments/docker/prom
 | `SagaCompletaDetenida` | Crítica | Entran transacciones y ninguna se aprueba durante 2 min |
 | `ErrorRateAlta` | Crítica | Rechazos por encima del 10 % de las recibidas durante 5 min |
 | `AdquirenteDesconectado` | Warning | Sin conexión con el host durante 2 min: las ventas se rechazan con `91` |
+| `CircuitoAdquirenteAbierto` | Warning | El circuit breaker sigue abierto 1 min: el host no responde y las ventas se rechazan con `91` |
 | `FraudCheckSinRespuesta` | Critical | Ventas rechazadas con `FRAUD_TIMEOUT` en los últimos 5 min, durante 1 min: Fraud Detection no responde a tiempo. `increase` no cuenta el primer rechazo desde que arrancó el servicio, así que un rechazo aislado no la dispara |
 | `TransaccionesSinResolver` | Warning | Transacciones sin resultado conocido o reversas sin completar durante 5 min: las reversas están fallando |
 | `OutboxAuthorizationTrabado` | Warning | Eventos en el outbox hace más de 1 minuto, durante 5 min: no llegan a NATS. Se publican solos al resolver la causa |
@@ -648,6 +672,8 @@ más relevantes son `acquirer error` y `outbox relay`, que informa los ciclos de
 | `ACQUIRER_INSTITUTION_ID` | `000001` | Con `iso8583`; es el DE-32 |
 | `ACQUIRER_TIMEOUT_SECONDS` | `30` | Sí; timeout de cada llamada al adquirente. Docker Compose usa `3` |
 | `ACQUIRER_MAX_CONCURRENT` | `20` | Sí; llamadas simultáneas al adquirente. Si es menor que 1, el servicio no arranca |
+| `ACQUIRER_BREAKER_FAILURES` | `5` | Sí; llamadas seguidas sin respuesta que abren el [circuit breaker](#circuit-breaker). `0` lo desactiva; negativo, el servicio no arranca |
+| `ACQUIRER_BREAKER_COOLDOWN` | `30s` | Sí; cuánto rechaza el breaker abierto antes de probar con una llamada. Con el breaker activo, debe ser positivo |
 | `ACQUIRER_MOCK_SCENARIOS` | `false` | Solo con `ACQUIRER_MODE=mock`; el mock responde [según el monto](#probar-los-fallos-del-adquirente). Con `ENVIRONMENT=production`, el servicio no arranca |
 | `ACQUIRER_TLS_CERT`, `ACQUIRER_TLS_KEY`, `ACQUIRER_TLS_CA` | Vacías | **No**: el cliente no usa TLS |
 | `MIGRATIONS_DIR` | `migrations/authorization` | **No**: `Migrate` no hace nada, y esa carpeta no existe |
@@ -692,7 +718,7 @@ mismo sin conexión. Con cualquier otro monto, aprueban. La colección de Postma
 | `770051` | Responde `51` | `REJECTED`, de origen `ACQUIRER` |
 | `770041` | Responde `41` | `REJECTED`, ordena retener la tarjeta y, si llegó `card_token`, la bloquea |
 | `770091` | Cierra la conexión | `INDETERMINATE`, y el conciliador la rechaza con `TIMEOUT` |
-| `770098` | No responde | Igual que el anterior, unos segundos después |
+| `770098` | No responde | Igual que el anterior, unos segundos después. Con `ACQUIRER_BREAKER_FAILURES` seguidas, abre el [circuit breaker](#circuit-breaker) |
 | `770092` | Aprueba, y responde `96` a las dos primeras reversas | `APPROVED`, y `REVERSED` cuando el conciliador reintenta |
 
 El simulador solo acepta tarjetas de prueba, y responde `14` a cualquier otra: una tarjeta real no pasa por acá. También
@@ -728,7 +754,7 @@ Con el simulador, estas fallas solo ocurren con [los montos de prueba](#probar-l
 | Respuesta tardía al cliente | Sin respuesta del adquirente, el cliente espera hasta `ACQUIRER_STUCK_AFTER` más una corrida. Si Terminal Gateway ya borró la sesión, el rechazo no encuentra a quién avisar | `ReconcileUnresolved`, `DeleteExpired` |
 | Terminal Gateway no conoce el resultado de una reversa | Ya respondió `202` e ignora `reversal-completed`: el terminal no sabe si se completó ni si se ignoró. Se consulta con `GET /transactions/{id}`. Resolverlo requiere cambiar Terminal Gateway | `tg_nats_subscriber.go` |
 | Una reversa que nunca se completa no tiene límite | Se reintenta cada corrida, sin un máximo ni una espera creciente, hasta que el host responda. Solo avisa la alerta | `ReconcileUnresolved` |
-| Workers ocupados frenan todo el consumo | Con un adquirente caído, las llamadas ocupan los workers hasta su timeout, y las demás esperan. Sin un corte, el host caído suma demora a cada venta | `runAcquirerCall` |
+| Workers ocupados hasta que abre el breaker | Con el host colgado, las primeras `ACQUIRER_BREAKER_FAILURES` llamadas, y las que estén en curso, esperan su timeout y terminan en `INDETERMINATE` antes de que el [circuit breaker](#circuit-breaker) corte | `runAcquirerCall`, `breaker.Gateway` |
 
 ### Saga
 

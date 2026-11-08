@@ -76,6 +76,11 @@ type AcquirerConfig struct {
 	MaxConcurrent int
 	// MockScenarios hace que el mock responda según el monto. Solo para desarrollo.
 	MockScenarios bool
+	// BreakerFailures es cuántas llamadas seguidas sin respuesta abren el circuit breaker. 0 lo
+	// desactiva.
+	BreakerFailures int
+	// BreakerCooldown es cuánto rechaza el breaker abierto antes de probar con una llamada.
+	BreakerCooldown time.Duration
 
 	// ReconcileEvery es cada cuánto corre el conciliador. 0 lo desactiva.
 	ReconcileEvery time.Duration
@@ -143,16 +148,18 @@ func Load() (*Config, error) {
 			Host: envStr("ACQUIRER_HOST", "localhost"),
 			Port: envInt("ACQUIRER_PORT", 9100),
 			// Opcionales — no hacen panic si están vacíos
-			TLSCertPath:    envStr("ACQUIRER_TLS_CERT", ""),
-			TLSKeyPath:     envStr("ACQUIRER_TLS_KEY", ""),
-			TLSCAPath:      envStr("ACQUIRER_TLS_CA", ""),
-			TimeoutSeconds: envInt("ACQUIRER_TIMEOUT_SECONDS", 30),
-			Mode:           envStr("ACQUIRER_MODE", AcquirerModeMock),
-			InstitutionID:  envStr("ACQUIRER_INSTITUTION_ID", "000001"),
-			MaxConcurrent:  envInt("ACQUIRER_MAX_CONCURRENT", 20),
-			MockScenarios:  envStr("ACQUIRER_MOCK_SCENARIOS", "") == "true",
-			ReconcileEvery: envDuration("ACQUIRER_RECONCILE_EVERY", 30*time.Second),
-			StuckAfter:     envDuration("ACQUIRER_STUCK_AFTER", 2*time.Minute),
+			TLSCertPath:     envStr("ACQUIRER_TLS_CERT", ""),
+			TLSKeyPath:      envStr("ACQUIRER_TLS_KEY", ""),
+			TLSCAPath:       envStr("ACQUIRER_TLS_CA", ""),
+			TimeoutSeconds:  envInt("ACQUIRER_TIMEOUT_SECONDS", 30),
+			Mode:            envStr("ACQUIRER_MODE", AcquirerModeMock),
+			InstitutionID:   envStr("ACQUIRER_INSTITUTION_ID", "000001"),
+			MaxConcurrent:   envInt("ACQUIRER_MAX_CONCURRENT", 20),
+			MockScenarios:   envStr("ACQUIRER_MOCK_SCENARIOS", "") == "true",
+			ReconcileEvery:  envDuration("ACQUIRER_RECONCILE_EVERY", 30*time.Second),
+			StuckAfter:      envDuration("ACQUIRER_STUCK_AFTER", 2*time.Minute),
+			BreakerFailures: envInt("ACQUIRER_BREAKER_FAILURES", 5),
+			BreakerCooldown: envDuration("ACQUIRER_BREAKER_COOLDOWN", 30*time.Second),
 		},
 	}
 
@@ -178,6 +185,12 @@ func Load() (*Config, error) {
 	}
 	if cfg.Acquirer.MockScenarios && cfg.OTEL.Environment == "production" {
 		return nil, fmt.Errorf("config: ACQUIRER_MOCK_SCENARIOS cannot be used with ENVIRONMENT=production")
+	}
+	if cfg.Acquirer.BreakerFailures < 0 {
+		return nil, fmt.Errorf("config: ACQUIRER_BREAKER_FAILURES %d cannot be negative", cfg.Acquirer.BreakerFailures)
+	}
+	if cfg.Acquirer.BreakerFailures > 0 && cfg.Acquirer.BreakerCooldown <= 0 {
+		return nil, fmt.Errorf("config: ACQUIRER_BREAKER_COOLDOWN %s must be positive", cfg.Acquirer.BreakerCooldown)
 	}
 	if cfg.Acquirer.ReconcileEvery < 0 {
 		return nil, fmt.Errorf("config: ACQUIRER_RECONCILE_EVERY %s cannot be negative", cfg.Acquirer.ReconcileEvery)

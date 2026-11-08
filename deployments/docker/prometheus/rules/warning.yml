@@ -127,6 +127,18 @@ groups:
           summary: "Sin conexión con el host adquirente"
           description: "Las ventas se rechazan con 91 y las reversas quedan pendientes hasta que vuelva. El servicio reconecta solo. Revisar el host y los logs 'acquirer host unreachable'."
 
+      # Circuit breaker abierto: el host está conectado pero no responde, y las ventas se rechazan
+      # con 91 sin llamarlo. Cada ACQUIRER_BREAKER_COOLDOWN prueba con una llamada.
+      # Investigar: el host adquirente y los logs 'acquirer circuit'.
+      - alert: CircuitoAdquirenteAbierto
+        expr: max(posnet_acquirer_circuit_open) == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Circuit breaker del adquirente abierto"
+          description: "El host no responde: las ventas se rechazan con 91 sin llamarlo, y se cierra solo cuando una llamada de prueba recibe respuesta. Revisar el host y los logs 'acquirer circuit'."
+
       # El conciliador las resuelve en menos de un minuto: si siguen, las reversas están fallando.
       # Investigar: docs/runbooks/incident-response.md, "Transacciones trabadas".
       - alert: TransaccionesSinResolver

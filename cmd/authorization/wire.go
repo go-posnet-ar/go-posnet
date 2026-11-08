@@ -19,6 +19,7 @@ import (
 	grpcserver "github.com/juantevez/go-posnet/context/authorization/infrastructure/grpc/server"
 	httpinfra "github.com/juantevez/go-posnet/context/authorization/infrastructure/http"
 	isoclient "github.com/juantevez/go-posnet/context/authorization/infrastructure/iso8583"
+	"github.com/juantevez/go-posnet/context/authorization/infrastructure/breaker"
 	natsinfra "github.com/juantevez/go-posnet/context/authorization/infrastructure/nats"
 	pginfra "github.com/juantevez/go-posnet/context/authorization/infrastructure/postgres"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
@@ -132,6 +133,18 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	acquirerGW, acquirerClient, err := newAcquirer(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("wire: %w", err)
+	}
+	if cfg.Acquirer.BreakerFailures > 0 {
+		cb := breaker.New(acquirerGW, cfg.Acquirer.BreakerFailures, cfg.Acquirer.BreakerCooldown,
+			slog.Default().With(slog.String("component", "acquirer.breaker")))
+		if err := cb.RegisterOpenGauge(); err != nil {
+			return nil, fmt.Errorf("wire: register breaker gauge: %w", err)
+		}
+		acquirerGW = cb
+		slog.Info("acquirer circuit breaker active",
+			slog.Int("failures", cfg.Acquirer.BreakerFailures), slog.Duration("cooldown", cfg.Acquirer.BreakerCooldown))
+	} else {
+		slog.Warn("acquirer circuit breaker disabled — a hung host delays every sale until its timeout")
 	}
 	authHandler := command.NewAuthorizationHandler(
 		txRepo,
