@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 
 	"github.com/juantevez/go-posnet/context/authorization/application/port"
@@ -203,76 +205,64 @@ func TestToProtoStatusResponse(t *testing.T) {
 	}
 }
 
-// ─── parseRFC3339 ────────────────────────────────────────────────────────────
+// ─── Listen, Serve y GracefulStop ─────────────────────────────────────────────
 
-func TestParseRFC3339(t *testing.T) {
-	t.Run("empty string returns zero time without error", func(t *testing.T) {
-		got, err := parseRFC3339("")
-		if err != nil {
-			t.Fatalf("parseRFC3339(\"\") error = %v", err)
-		}
-		if !got.IsZero() {
-			t.Errorf("parseRFC3339(\"\") = %v, want zero time", got)
-		}
-	})
-
-	t.Run("valid RFC3339", func(t *testing.T) {
-		got, err := parseRFC3339("2026-01-01T10:00:00Z")
-		if err != nil {
-			t.Fatalf("parseRFC3339() error = %v", err)
-		}
-		want := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
-		if !got.Equal(want) {
-			t.Errorf("parseRFC3339() = %v, want %v", got, want)
-		}
-	})
-
-	t.Run("invalid format returns error", func(t *testing.T) {
-		if _, err := parseRFC3339("not-a-date"); err == nil {
-			t.Fatal("parseRFC3339(\"not-a-date\") error = nil, want error")
-		}
-	})
-}
-
-// ─── Start ───────────────────────────────────────────────────────────────────
-
-func TestStart_ListenError(t *testing.T) {
-	// Ocupar un puerto libre primero para forzar el error de bind en Start().
+func TestListen_PortInUse(t *testing.T) {
 	occupied, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("net.Listen() error = %v", err)
 	}
 	defer occupied.Close()
 
-	port := occupied.Addr().(*net.TCPAddr).Port
-
-	srv := NewAuthorizationServer(&fakeQueryService{})
-	err = Start(srv, port)
-	if err == nil {
-		t.Fatal("Start() error = nil, want bind error")
-	}
-	if !strings.Contains(err.Error(), "listen on port") {
-		t.Errorf("error = %q, want it to contain %q", err.Error(), "listen on port")
+	_, err = Listen(occupied.Addr().(*net.TCPAddr).Port)
+	if err == nil || !strings.Contains(err.Error(), "listen on port") {
+		t.Fatalf("Listen() error = %v, want el error del puerto ocupado", err)
 	}
 }
 
-func TestStart_ServesSuccessfully(t *testing.T) {
+// Serve atiende llamadas hasta GracefulStop, que lo hace volver.
+func TestServe_UntilGracefulStop(t *testing.T) {
 	srv := NewAuthorizationServer(&fakeQueryService{})
+	lis, err := Listen(0)
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	served := make(chan error, 1)
+	go func() { served <- srv.Serve(lis) }()
 
-	errCh := make(chan error, 1)
-	go func() {
-		// Puerto 0: el OS asigna uno libre. Start() no expone el listener ni el
-		// *grpc.Server, así que no hay forma de apagarlo prolijamente desde el test;
-		// el goroutine queda corriendo en background hasta que termine el binario
-		// de test, que libera el socket al salir.
-		errCh <- Start(srv, 0)
-	}()
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err = authv1.NewAuthorizationServiceClient(conn).GetTransactionStatus(ctx, &authv1.GetTransactionStatusRequest{TransactionId: "x"})
+	if code := status.Code(err); code != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument: el servidor tiene que atender", code)
+	}
 
+	srv.GracefulStop(time.Second)
 	select {
-	case err := <-errCh:
-		t.Fatalf("Start() returned early with error = %v, want it to keep serving", err)
-	case <-time.After(200 * time.Millisecond):
-		// No devolvió error en la ventana de espera → bind + register + Serve()
-		// arrancaron correctamente.
+	case err := <-served:
+		if err != nil {
+			t.Errorf("Serve() error = %v, want nil después de GracefulStop", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve() no volvió después de GracefulStop")
+	}
+}
+
+// GracefulStop antes de servir no se cuelga: close lo llama aunque el arranque haya fallado.
+func TestGracefulStop_BeforeServe(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		NewAuthorizationServer(&fakeQueryService{}).GracefulStop(time.Second)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("GracefulStop() se colgó")
 	}
 }

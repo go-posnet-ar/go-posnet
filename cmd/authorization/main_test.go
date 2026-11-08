@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"net"
 	"strings"
 	"testing"
 )
@@ -61,4 +63,46 @@ func TestAppClose_IsIdempotent(t *testing.T) {
 	a := &app{}
 	a.close()
 	a.close()
+}
+
+// Sin una migración, el servicio no arranca: cada evento fallaría hasta agotar sus reintentos.
+func TestStart_RefusesAnIncompleteSchema(t *testing.T) {
+	cases := []struct {
+		name    string
+		missing func(context.Context) ([]string, error)
+		want    string
+	}{
+		{"falta una columna", func(context.Context) ([]string, error) {
+			return []string{"pn_authorization.transactions.reversal_requested_at"}, nil
+		}, "database schema incomplete"},
+		{"no se puede verificar", func(context.Context) ([]string, error) {
+			return nil, errors.New("db down")
+		}, "check the database schema"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Sin subscriber ni servidores: tiene que cortar antes de usarlos.
+			err := (&app{missingSchema: tc.missing}).start(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("start() error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// Si el puerto gRPC está ocupado, el servicio no arranca, en lugar de seguir sin gRPC.
+func TestStart_RefusesABusyGRPCPort(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v", err)
+	}
+	defer occupied.Close()
+
+	a := &app{
+		grpcPort:      occupied.Addr().(*net.TCPAddr).Port,
+		missingSchema: func(context.Context) ([]string, error) { return nil, nil },
+	}
+	if err := a.start(context.Background()); err == nil || !strings.Contains(err.Error(), "listen on port") {
+		t.Fatalf("start() error = %v, want el error del puerto ocupado", err)
+	}
 }

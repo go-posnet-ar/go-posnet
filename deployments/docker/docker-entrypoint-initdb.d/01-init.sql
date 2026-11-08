@@ -55,6 +55,12 @@ CREATE INDEX IF NOT EXISTS idx_auth_txn_unresolved
 CREATE INDEX IF NOT EXISTS idx_auth_txn_card_token
     ON pn_authorization.transactions(card_token)
     WHERE card_token IS NOT NULL;
+-- Consultas de historial de Fraud Detection: por terminal y fecha, y aprobadas por comercio.
+CREATE INDEX IF NOT EXISTS idx_auth_txn_terminal_created
+    ON pn_authorization.transactions (terminal_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_auth_txn_merchant_approved
+    ON pn_authorization.transactions (merchant_id, created_at)
+    WHERE state = 'APPROVED';
 CREATE TABLE IF NOT EXISTS pn_authorization.processed_events (
     event_id     UUID        PRIMARY KEY,
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

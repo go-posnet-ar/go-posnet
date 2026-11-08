@@ -24,6 +24,8 @@ type Handler struct {
 	pool         pgutil.PgxPool
 	// missingSchema informa las tablas y columnas que faltan en la base; nil = sin verificar.
 	missingSchema func(ctx context.Context) ([]string, error)
+	// natsConnected indica si hay conexión con NATS; nil = sin verificar.
+	natsConnected func() bool
 }
 
 func NewHandler(queryService port.QueryService, pool pgutil.PgxPool) *Handler {
@@ -69,6 +71,14 @@ func (h *Handler) handleReady(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+	}
+	// Sin NATS no entran ventas ni salen resultados: la instancia no está lista.
+	if h.natsConnected != nil && !h.natsConnected() {
+		slog.Error("readiness: NATS is not connected")
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "not ready", "reason": "nats unavailable",
+		})
+		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }

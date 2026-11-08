@@ -284,7 +284,7 @@ func TestIntegration_InvalidTransactionIsRejected(t *testing.T) {
 	ctx := context.Background()
 	natsURL := startNATS(ctx, t)
 	cfg := &config.Config{
-		GRPCPort: 9090,
+		GRPCPort: freePort(t),
 		HTTPPort: freePort(t),
 		Postgres: config.PostgresConfig{
 			DSN:             startPostgres(ctx, t),
@@ -454,7 +454,7 @@ func TestIntegration_WireStartClose(t *testing.T) {
 	httpPort := freePort(t)
 
 	cfg := &config.Config{
-		GRPCPort: 9090,
+		GRPCPort: freePort(t),
 		HTTPPort: httpPort,
 		Postgres: config.PostgresConfig{
 			DSN:             dsn,
@@ -517,5 +517,47 @@ func TestIntegration_WireStartClose(t *testing.T) {
 	}
 	if app.natsConn.IsConnected() {
 		t.Error("natsConn sigue conectado tras close()")
+	}
+}
+
+// TestIntegration_StartRefusesIncompleteSchema: con una columna de una migración faltante, el
+// servicio no arranca, y no crea los consumidores de NATS.
+func TestIntegration_StartRefusesIncompleteSchema(t *testing.T) {
+	ctx := context.Background()
+	dsn := startPostgres(ctx, t)
+	natsURL := startNATS(ctx, t)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pgx.Connect() error = %v", err)
+	}
+	if _, err := conn.Exec(ctx, `ALTER TABLE pn_authorization.transactions DROP COLUMN reversal_requested_at`); err != nil {
+		t.Fatalf("borrar la columna: %v", err)
+	}
+	_ = conn.Close(ctx)
+
+	cfg := &config.Config{
+		GRPCPort: freePort(t),
+		HTTPPort: freePort(t),
+		Postgres: config.PostgresConfig{DSN: dsn, MaxConns: 5, MinConns: 1, MaxConnLifetime: 30 * time.Minute, MaxConnIdleTime: 5 * time.Minute},
+		NATS:     config.NATSConfig{URL: natsURL, MaxReconnect: -1, ReconnectWait: 2 * time.Second},
+	}
+	app, err := wire(ctx, cfg)
+	if err != nil {
+		t.Fatalf("wire() error = %v", err)
+	}
+	defer app.close()
+
+	err = app.start(ctx)
+	if err == nil || !strings.Contains(err.Error(), "reversal_requested_at") {
+		t.Fatalf("start() error = %v, want que nombre la columna faltante", err)
+	}
+
+	js, err := app.natsConn.JetStream()
+	if err != nil {
+		t.Fatalf("JetStream() error = %v", err)
+	}
+	if _, err := js.ConsumerInfo("POSNET_TRANSACTIONS", "auth-txn-receiver"); err == nil {
+		t.Error("se creó el consumidor de transaction.received: los eventos se consumirían y fallarían")
 	}
 }

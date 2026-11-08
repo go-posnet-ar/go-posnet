@@ -187,7 +187,7 @@ func TestHandleReady_Schema(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			router := NewRouter(&fakeQueryService{}, &fakePool{}, func(context.Context) ([]string, error) { return tc.missing, tc.err })
+			router := NewRouter(&fakeQueryService{}, &fakePool{}, Readiness{MissingSchema: func(context.Context) ([]string, error) { return tc.missing, tc.err }})
 			rec := httptest.NewRecorder()
 			router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 			if rec.Code != tc.want {
@@ -200,5 +200,24 @@ func TestHandleReady_Schema(t *testing.T) {
 				t.Errorf("body = %s: the endpoint has no token, it should not name the schema", rec.Body)
 			}
 		})
+	}
+}
+
+// Sin NATS no entran ventas ni salen resultados: la instancia no está lista.
+func TestHandleReady_NATS(t *testing.T) {
+	for _, tc := range []struct {
+		connected bool
+		want      int
+	}{{true, http.StatusOK}, {false, http.StatusServiceUnavailable}} {
+		connected := tc.connected
+		router := NewRouter(&fakeQueryService{}, &fakePool{}, Readiness{NATSConnected: func() bool { return connected }})
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+		if rec.Code != tc.want {
+			t.Errorf("conectado=%v: status = %d, want %d", tc.connected, rec.Code, tc.want)
+		}
+		if !tc.connected && decodeJSON(t, rec.Body.Bytes())["reason"] != "nats unavailable" {
+			t.Errorf("body = %s, want reason=nats unavailable", rec.Body)
+		}
 	}
 }

@@ -323,7 +323,7 @@ Puerto `HTTP_PORT` (8080 por defecto). **No hay autenticación.**
 | Método y ruta | Uso | Éxito | Errores |
 |---|---|---|---|
 | `GET /healthz` | Liveness | `200` | — |
-| `GET /readyz` | Readiness; verifica Postgres y las tablas y columnas requeridas. `reason`: `database unavailable` o `database schema incomplete`, y el log nombra lo que falta | `200` | `503` |
+| `GET /readyz` | Readiness; verifica Postgres, las tablas y columnas requeridas y la conexión con NATS. `reason`: `database unavailable`, `database schema incomplete` o `nats unavailable`, y el log nombra lo que falta | `200` | `503` |
 | `GET /metrics` | Métricas Prometheus | `200` | — |
 | `GET /transactions/{id}` | Estado de una transacción | `200` | `400`, `404`, `500` |
 
@@ -350,8 +350,9 @@ Los errores tienen la forma `{"error": "CODIGO", "message": "..."}`.
 
 ## 7. API gRPC
 
-Contrato: [`authorization.proto`](../../pkg/proto/authorization/v1/authorization.proto). El puerto es
-9090, sin TLS. Hoy ningún otro servicio del repositorio lo consume.
+Contrato: [`authorization.proto`](../../pkg/proto/authorization/v1/authorization.proto). El puerto es `GRPC_PORT`
+(9090), sin TLS ni autenticación. Hoy ningún otro servicio del repositorio lo consume. Si el puerto está ocupado, el
+servicio no arranca. Al apagar, espera hasta 10 s las llamadas en curso.
 
 | RPC | Comportamiento actual |
 |---|---|
@@ -420,16 +421,22 @@ usa el schema `authorization` y no incluye la blocklist.
 
 | Tabla | Propósito | Claves e índices |
 |---|---|---|
-| `transactions` | Transacciones | PK `id`; índice parcial en `card_token` |
+| `transactions` | Transacciones | PK `id`; índice parcial en `card_token`; índices por terminal y fecha, y de aprobadas por comercio y fecha, para el historial de Fraud Detection |
 | `processed_events` | Idempotencia de eventos | PK `event_id` |
 | `blocked_cards` | Blocklist | PK `card_token`; sin FK, para sobrevivir a purgas de transacciones |
 | `invalid_transactions` | Rechazos por datos inválidos. Solo valores validados, nunca el payload original | PK `transaction_id` |
 
+### Migraciones
+
+Las migraciones se aplican a mano. **Al arrancar, el servicio verifica las tablas y columnas que necesita y, si falta alguna,
+no arranca:** termina con un error que nombra lo que falta. No llega a consumir eventos, así que esperan en NATS hasta que
+se aplique la migración, en lugar de fallar hasta agotar sus reintentos y perderse. En Docker Compose, el contenedor se
+reinicia hasta que la base esté completa.
+
 ### Aplicar la migración de conciliación
 
-**Una base existente necesita `000002` y `000003` antes de desplegar esta versión del servicio.** Sin ellas, **fallan
-todas las ventas** y, al agotar los reintentos, sus eventos se pierden. `/readyz` responde `503` y Docker marca el contenedor
-`unhealthy`, pero eso no frena el consumo de eventos. Se pueden aplicar con el servicio anterior en marcha:
+**Una base existente necesita `000002` y `000003` antes de desplegar esta versión del servicio.** Sin ellas, el servicio no
+arranca. Se pueden aplicar con el servicio anterior en marcha:
 
 ```bash
 psql "$POSTGRES_DSN" -f migrations/pn_authorization/000002_processing_started_at.up.sql
@@ -443,9 +450,8 @@ hay transacciones en `PROCESSING` o `INDETERMINATE`, y exige volver antes a la v
 
 ### Aplicar la migración de transacciones inválidas
 
-**Una base existente necesita `000004` antes de desplegar esta versión.** Sin ella, las ventas válidas funcionan, pero
-`/readyz` responde `503`, Docker marca el contenedor `unhealthy`, y `GET /transactions/{id}` responde `500` con un ID
-desconocido. Se puede aplicar con el servicio anterior en marcha:
+**Una base existente necesita `000004` antes de desplegar esta versión.** Sin ella, el servicio no arranca. Se puede aplicar
+con el servicio anterior en marcha:
 
 ```bash
 psql "$POSTGRES_DSN" -f migrations/pn_authorization/000004_invalid_transactions.up.sql
@@ -463,10 +469,24 @@ log y reintenta en la corrida siguiente. Con varias instancias, cada una la corr
 Después de ese plazo, `GET /transactions/{id}` vuelve a responder `404`. Para conservar los datos más tiempo, hay que
 exportarlos antes o aumentar la variable.
 
+### Aplicar los índices de historial
+
+**Una base existente necesita `000005`** para que las consultas de historial de Fraud Detection no recorran la tabla entera.
+Sin ella, el servicio arranca igual, porque no es una columna requerida, pero cada evaluación de fraude es más lenta: con
+200.000 transacciones, la consulta de ventas recientes de un terminal pasa de 0,2 ms a 58 ms.
+
+```bash
+psql "$POSTGRES_DSN" -f migrations/pn_authorization/000005_history_indexes.up.sql
+```
+
+Crea los índices con `CONCURRENTLY`, así que se aplica con el servicio en marcha, sin bloquear las escrituras, y es
+idempotente. Si se interrumpe a mitad, un índice puede quedar inválido y la siguiente ejecución lo saltearía: hay que
+borrarlo con `DROP INDEX CONCURRENTLY` y volver a aplicar el archivo. `000005_history_indexes.down.sql` los borra.
+
 ### Aplicar la migración de blocklist
 
 **Una base creada antes de este cambio necesita la migración manualmente.** Sin la columna
-`card_token`, fallan tanto `InsertTx` como `FindByID`, y con ellos todas las transacciones:
+`card_token`, el servicio no arranca:
 
 ```bash
 psql "$POSTGRES_DSN" -f migrations/pn_authorization/000001_card_blocklist.up.sql
@@ -490,7 +510,7 @@ entorno con datos reales, exportarlos antes de ejecutarlo.
 
 Ante `SIGINT` o `SIGTERM`: detiene el conciliador, la purga y HTTP (hasta 10 s), drena y cierra NATS, espera las llamadas al
 adquirente en curso, hasta su timeout más 5 s, y cierra el pool de Postgres. Lo que no termine a tiempo lo retoma el
-conciliador. El servidor gRPC no se detiene de forma ordenada.
+conciliador. El servidor gRPC espera hasta 10 s las llamadas en curso.
 
 ## 10. Observabilidad
 
@@ -561,7 +581,7 @@ métrica cuenta las publicaciones fallidas.
 | `OTEL_SERVICE_VERSION` | `1.0.0` | Sí |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel-collector:4317` | Sí |
 | `ENVIRONMENT` | `development` | Sí |
-| `GRPC_PORT` | `9090` | **No**: el puerto está fijo en 9090 |
+| `GRPC_PORT` | `9090` | Sí. Si está ocupado, el servicio no arranca |
 | `INVALID_TRANSACTIONS_RETENTION` | `2160h` (90 días) | Sí; cuánto se conservan las [transacciones inválidas](#retención-de-transacciones-inválidas), y `0` desactiva la purga. Va en horas: con un valor como `30d`, o negativo, el servicio no arranca |
 | `ACQUIRER_RECONCILE_EVERY` | `30s` | Sí; cada cuánto corre el conciliador, y `0` lo desactiva. Docker Compose usa `2s`. Si es negativo, el servicio no arranca |
 | `ACQUIRER_STUCK_AFTER` | `2m` | Sí; Docker Compose usa `10s`. Cuánto puede seguir una transacción en `PROCESSING`. Si no supera `ACQUIRER_TIMEOUT_SECONDS`, el servicio no arranca: revertiría llamadas en curso |
@@ -651,7 +671,6 @@ Con el simulador, estas fallas solo ocurren con [los montos de prueba](#probar-l
 | Terminal Gateway no conoce el resultado de una reversa | Ya respondió `202` e ignora `reversal-completed`: el terminal no sabe si se completó ni si se ignoró. Se consulta con `GET /transactions/{id}`. Resolverlo requiere cambiar Terminal Gateway | `tg_nats_subscriber.go` |
 | Una reversa que nunca se completa no tiene límite | Se reintenta cada corrida, sin un máximo ni una espera creciente, hasta que el host responda. Solo avisa la alerta | `ReconcileUnresolved` |
 | Workers ocupados frenan todo el consumo | Con un adquirente caído, las llamadas ocupan los workers hasta su timeout, y las demás esperan. Sin un corte, el host caído suma demora a cada venta | `runAcquirerCall` |
-| Sin migración, el servicio sigue consumiendo | `/readyz` y Docker lo avisan, pero los eventos fallan y, al agotar los reintentos, se pierden | `wire` |
 
 ### Saga
 
@@ -676,10 +695,8 @@ Con el simulador, estas fallas solo ocurren con [los montos de prueba](#probar-l
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| Sin migraciones automáticas | Cambios como `card_token` requieren aplicarse a mano; si no, fallan todas las transacciones (ver [§9](#9-persistencia)) | `pkg/pgutil/migrate.go` |
-| Faltan índices en `01-init.sql` | Solo está el de `card_token`. Las consultas de historial de Fraud Detection, por terminal y fecha, recorren la tabla | `01-init.sql` |
+| Sin migraciones automáticas | Cada migración se aplica a mano. Si falta una columna requerida, el servicio no arranca hasta aplicarla (ver [§9](#migraciones)); un índice faltante solo lo hace más lento | `pkg/pgutil/migrate.go` |
 | Acoplamiento con Fraud Detection | Lee las tablas de este contexto directamente, en contra de lo que indica la documentación de arquitectura | `fd_postgres_repository.go` |
-| gRPC sin TLS, sin autenticación y sin apagado ordenado | Si falla el listen, solo se registra el error y el proceso sigue. El puerto ignora `GRPC_PORT` | `server.go`, `wire.go` |
+| gRPC sin TLS ni autenticación | Cualquiera con acceso de red al puerto puede consultar transacciones. Hoy ningún servicio lo usa | `server.go` |
 | API HTTP sin autenticación | Cualquiera con acceso de red y un ID puede leer el estado y el monto de una transacción | `router.go` |
-| `/readyz` no verifica NATS | Una instancia sin NATS sigue figurando como lista | `handler.go` |
-| Código sin uso | `FindBySTAN`, `UpdateState`, `parseRFC3339` y los eventos de dominio internos no se usan | `repository.go`, `server.go`, `transaction.go` |
+| Eventos de dominio sin usar | `Transaction` registra eventos internos (`TransactionApproved`, etc.) que nadie lee. Se conservan porque son la base natural del outbox de resultados | `transaction.go` |

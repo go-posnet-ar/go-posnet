@@ -18,11 +18,21 @@ import (
 //	GET  /readyz               → readiness probe (verifica Postgres y el schema)
 //	GET  /metrics              → métricas Prometheus
 //	GET  /transactions/{id}    → estado de una transacción (operaciones)
-func NewRouter(queryService port.QueryService, pool pgutil.PgxPool, missingSchema func(ctx context.Context) ([]string, error)) http.Handler {
+//
+// Readiness son los chequeos de /readyz, además de Postgres. Cualquiera en nil no se verifica.
+type Readiness struct {
+	// MissingSchema informa las tablas y columnas que faltan en la base.
+	MissingSchema func(ctx context.Context) ([]string, error)
+	// NATSConnected indica si la conexión con NATS está activa.
+	NATSConnected func() bool
+}
+
+func NewRouter(queryService port.QueryService, pool pgutil.PgxPool, readiness Readiness) http.Handler {
 	mux := http.NewServeMux()
 
 	h := NewHandler(queryService, pool)
-	h.missingSchema = missingSchema
+	h.missingSchema = readiness.MissingSchema
+	h.natsConnected = readiness.NATSConnected
 	h.RegisterRoutes(mux)
 
 	// Registrar endpoint de métricas Prometheus.

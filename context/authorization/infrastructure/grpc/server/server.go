@@ -24,27 +24,47 @@ import (
 type AuthorizationServer struct {
 	authv1.UnimplementedAuthorizationServiceServer
 	queryService port.QueryService
+	grpc         *grpc.Server
 }
 
+// NewAuthorizationServer crea el servidor, ya registrado. Se crea acá, y no al servir, para que
+// GracefulStop funcione en cualquier momento.
 func NewAuthorizationServer(queryService port.QueryService) *AuthorizationServer {
-	return &AuthorizationServer{queryService: queryService}
+	s := &AuthorizationServer{queryService: queryService}
+	s.grpc = grpc.NewServer(grpc.UnaryInterceptor(observability.GRPCUnaryServerInterceptor()))
+	authv1.RegisterAuthorizationServiceServer(s.grpc, s)
+	return s
 }
 
-// Start arranca el servidor gRPC en el puerto dado.
-func Start(srv *AuthorizationServer, grpcPort int) error {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", grpcPort))
+// Listen abre el puerto gRPC. Va separado de Serve para que, si el puerto está ocupado, el
+// servicio no arranque, en lugar de seguir sin gRPC.
+func Listen(port int) (net.Listener, error) {
+	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		return fmt.Errorf("grpc server: listen on port %d: %w", grpcPort, err)
+		return nil, fmt.Errorf("grpc server: listen on port %d: %w", port, err)
 	}
+	return lis, nil
+}
 
-	grpcServer := grpc.NewServer(
-		grpc.UnaryInterceptor(observability.GRPCUnaryServerInterceptor()),
-	)
+// Serve atiende en lis hasta que se llame a GracefulStop.
+func (s *AuthorizationServer) Serve(lis net.Listener) error {
+	slog.Info("gRPC server listening", slog.String("addr", lis.Addr().String()))
+	return s.grpc.Serve(lis)
+}
 
-	authv1.RegisterAuthorizationServiceServer(grpcServer, srv)
-
-	slog.Info("gRPC server listening", slog.Int("port", grpcPort))
-	return grpcServer.Serve(listener)
+// GracefulStop deja de aceptar llamadas y espera las que están en curso, hasta timeout. Después
+// corta las que queden.
+func (s *AuthorizationServer) GracefulStop(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		s.grpc.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		s.grpc.Stop()
+	}
 }
 
 // GetTransactionStatus retorna el estado de una transacción por ID.
@@ -113,12 +133,4 @@ func toProtoState(s string) authv1.TransactionState {
 		return v
 	}
 	return authv1.TransactionState_TRANSACTION_STATE_UNSPECIFIED
-}
-
-// parseRFC3339 parsea un string RFC3339 — helper local.
-func parseRFC3339(s string) (time.Time, error) {
-	if s == "" {
-		return time.Time{}, nil
-	}
-	return time.Parse(time.RFC3339, s)
 }

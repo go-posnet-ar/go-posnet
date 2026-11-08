@@ -49,6 +49,11 @@ type app struct {
 	purgeWG          sync.WaitGroup
 
 	closeOnce sync.Once
+
+	grpcPort int
+	// missingSchema informa lo que falta en la base: sin eso, el servicio no arranca.
+	missingSchema func(context.Context) ([]string, error)
+	grpcStarted   bool
 }
 
 // wire construye el grafo de dependencias completo del BC Authorization.
@@ -144,7 +149,10 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	subscriber := natsinfra.NewSubscriber(js, authHandler)
 	grpcSrv := grpcserver.NewAuthorizationServer(queryHandler)
 
-	router := httpinfra.NewRouter(queryHandler, pool, txRepo.MissingSchema)
+	router := httpinfra.NewRouter(queryHandler, pool, httpinfra.Readiness{
+		MissingSchema: txRepo.MissingSchema,
+		NATSConnected: natsConn.IsConnected,
+	})
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,
@@ -167,6 +175,9 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		callTimeout:    acquirerTimeout,
 
 		invalidRetention: cfg.InvalidTransactionsRetention,
+
+		grpcPort:      cfg.GRPCPort,
+		missingSchema: txRepo.MissingSchema,
 	}, nil
 }
 
@@ -192,6 +203,25 @@ const acquirerEchoEvery = 30 * time.Second
 
 // start arranca todos los servidores en goroutines independientes.
 func (a *app) start(ctx context.Context) error {
+	// Sin una migración, cada evento fallaría hasta agotar sus reintentos, y se perdería. Sin
+	// consumir, quedan en NATS hasta que se aplique.
+	if a.missingSchema != nil {
+		missing, err := a.missingSchema(ctx)
+		if err != nil {
+			return fmt.Errorf("start: check the database schema: %w", err)
+		}
+		if len(missing) > 0 {
+			return fmt.Errorf("start: database schema incomplete — apply the migrations before starting (see AUTHORIZATION.md §9): %v", missing)
+		}
+	}
+
+	// Si el puerto gRPC está ocupado, el servicio no arranca.
+	grpcLis, err := grpcserver.Listen(a.grpcPort)
+	if err != nil {
+		return fmt.Errorf("start: %w", err)
+	}
+	a.grpcStarted = true
+
 	// Antes de consumir eventos, para que las primeras ventas ya tengan conexión.
 	if a.acquirerClient != nil {
 		acquirerCtx, stop := context.WithCancel(ctx)
@@ -209,11 +239,10 @@ func (a *app) start(ctx context.Context) error {
 	slog.Info("NATS consumers active")
 
 	go func() {
-		if err := grpcserver.Start(a.grpcSrv, 9090); err != nil {
+		if err := a.grpcSrv.Serve(grpcLis); err != nil {
 			slog.Error("gRPC server stopped", slog.String("error", err.Error()))
 		}
 	}()
-	slog.Info("gRPC server starting", slog.Int("port", 9090))
 
 	go func() {
 		if err := a.httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -338,6 +367,9 @@ func (a *app) closeResources() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = a.httpSrv.Shutdown(ctx)
+	}
+	if a.grpcSrv != nil && a.grpcStarted {
+		a.grpcSrv.GracefulStop(10 * time.Second)
 	}
 
 	if a.natsConn != nil {

@@ -464,59 +464,6 @@ func (r *TransactionRepo) FindByIDForUpdateTx(ctx context.Context, dbTx pgx.Tx, 
 	return scanTransaction(dbTx.QueryRow(ctx, query, id.String()))
 }
 
-// FindBySTAN recupera una transacción por STAN y terminal en un día dado.
-func (r *TransactionRepo) FindBySTAN(
-	ctx context.Context,
-	terminalID domain.TerminalID,
-	stan domain.STAN,
-	date time.Time,
-) (*aggregate.Transaction, error) {
-	const query = `
-		SELECT
-			id, terminal_id, merchant_id,
-			state, amount_cents, currency,
-			pan_last4, card_network, entry_mode,
-			stan, auth_code, rejection_code, rejection_source,
-			fraud_score, fraud_decision, fraud_rules_hit,
-			emv_data_b64, iso8583_raw,
-			created_at, authorized_at, rejected_at,
-			card_token, reversal_requested_at
-		FROM pn_authorization.transactions
-		WHERE terminal_id = $1
-		  AND stan = $2
-		  AND created_at::date = $3::date
-		LIMIT 1
-	`
-
-	row := r.pool.QueryRow(ctx, query, terminalID.String(), stan.Value(), date)
-	tx, err := scanTransaction(row)
-	if err != nil {
-		// scanTransaction convierte pgx.ErrNoRows en *pkgerrors.NotFoundError,
-		// por lo que no queda en la cadena de errors.Is — hay que detectar el
-		// tipo convertido en lugar del error original de pgx.
-		var notFound *pkgerrors.NotFoundError
-		if errors.As(err, &notFound) {
-			return nil, nil // No encontrado no es un error en este caso
-		}
-		return nil, err
-	}
-	return tx, nil
-}
-
-// UpdateState actualiza solo el estado de una transacción.
-func (r *TransactionRepo) UpdateState(
-	ctx context.Context,
-	id domain.TransactionID,
-	state valueobject.TransactionState,
-) error {
-	const query = `UPDATE pn_authorization.transactions SET state = $1 WHERE id = $2`
-	_, err := r.pool.Exec(ctx, query, state.String(), id.String())
-	if err != nil {
-		return fmt.Errorf("TransactionRepo.UpdateState: %w", err)
-	}
-	return nil
-}
-
 // ExistsByID verifica si una transacción con ese ID ya existe.
 func (r *TransactionRepo) ExistsByID(ctx context.Context, id domain.TransactionID) (bool, error) {
 	const query = `SELECT EXISTS(SELECT 1 FROM pn_authorization.transactions WHERE id = $1)`

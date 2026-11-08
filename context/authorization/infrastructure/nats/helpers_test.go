@@ -90,14 +90,6 @@ func (f *fakeRepo) FindByID(_ context.Context, _ domain.TransactionID) (*aggrega
 	return f.findResult, f.findErr
 }
 
-func (f *fakeRepo) FindBySTAN(_ context.Context, _ domain.TerminalID, _ domain.STAN, _ time.Time) (*aggregate.Transaction, error) {
-	return nil, nil
-}
-
-func (f *fakeRepo) UpdateState(_ context.Context, _ domain.TransactionID, _ valueobject.TransactionState) error {
-	return nil
-}
-
 func (f *fakeRepo) ExistsByID(_ context.Context, _ domain.TransactionID) (bool, error) {
 	return false, nil
 }
