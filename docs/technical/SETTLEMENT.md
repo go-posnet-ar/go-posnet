@@ -148,7 +148,8 @@ El valor no mide la diferencia de dinero: solo indica cuántas transacciones fal
 
 **Los ajustes no entran en la conciliación,** porque el terminal no los conoce: ni en la cantidad ni en el monto
 que se comparan, tampoco en el acumulado de un terminal que no reinicia sus contadores. Sí entran en `total_amount`,
-que es lo que se envía y se liquida, y se guardan aparte en `adjustment_count` y `adjustment_amount`.
+que es lo que se envía y se liquida, y se guardan aparte en `adjustment_count` y `adjustment_amount`. Los eventos
+`batch-closed` y `settlement.completed` los informan aparte, y el adaptador del procesador los tiene en el lote.
 
 **El terminal debe informar `terminal_count` contando compras y reversas, y `terminal_amount` como monto
 neto.** Después de cada cierre, sus contadores deben volver a cero: el cierre siguiente solo abarca lo
@@ -209,11 +210,17 @@ actuales, haya cerrado la revisión el sistema o un operador. El cierre guarda c
 |---|---|---|---|
 | Por el terminal | Los totales que informó el terminal | Pasa a `CLOSED` y se envía | Sigue `DISPUTED`, con las discrepancias recalculadas |
 | Por el job, `force-close` o `resolve-dispute` | Nada: no hay totales del terminal | Pasa a `CLOSED` y se envía | — |
-| Antes de `000007` | No se sabe | No se libera: `resolve-dispute` o `reopen` | — |
+| Antes de `000007` | Los totales que guardó el cierre, que `000010` copia como los del terminal | Pasa a `CLOSED` y se envía | Sigue `DISPUTED`, con las discrepancias recalculadas |
+
+Un lote retenido solo por revisiones cerró sin discrepancias: lo que informó el terminal coincidía con los totales
+del cierre, y las acciones sobre las revisiones cambian las transacciones, no esos totales. `000010` los copia en los
+lotes de antes de `000007`, aunque el lote lo haya cerrado el job: es la comparación más estricta.
 
 La liberación queda en la auditoría como `AUTO_RELEASE`, con `operator_id` `system`. Corre después de cerrar la
 revisión, en su propia transacción: si falla, la revisión ya está cerrada y el lote sigue `DISPUTED`, con un log
-`could not release the held batch`. La alerta `LotesEnDisputa` lo muestra, y se resuelve con `resolve-dispute`.
+`could not release the held batch`. **El job de cierre automático la reintenta en cada barrido,** para los lotes
+`DISPUTED` sin discrepancias, con la referencia guardada y sin revisiones abiertas (log `retrying the release of a
+held batch`). Un lote que se volvió a conciliar y no coincide ya tiene discrepancias: el job no lo vuelve a tomar.
 
 **Una reversa excluida vuelve si llega su compra.** `EXCLUDE` sobre una revisión `PURCHASE_NOT_FOUND` saca la
 reversa porque la compra no estaba. Si la compra llega después y coincide, la reversa se agrega al lote de la compra,
@@ -274,6 +281,11 @@ operaciones siguientes. **Los lotes `OPEN` del comercio fechados hoy en la zona 
 la misma transacción, para que la venta siguiente no abra otro lote. Los de días anteriores conservan su fecha y los
 cierra el job. Si un terminal ya tiene un lote `OPEN` en la fecha nueva, el cambio responde `409` y no cambia nada.
 
+**Una venta o reversa simultánea al cambio no abre otro lote.** Lee la zona dentro de su transacción, con un lock
+compartido del comercio, y el cambio espera el lock exclusivo antes de mover los lotes: o la venta termina de
+guardarse en la fecha anterior y su lote se mueve con los demás, o espera al cambio y lee la zona nueva. Las ventas
+de un mismo comercio no se esperan entre sí.
+
 El cierre usa el `batch_date` que informa el terminal. Sin él, usa el día de negocio del pedido. Terminal
 Gateway rechaza una moneda o una fecha inválidas.
 
@@ -308,6 +320,9 @@ terminal lo cierre él y concilie. Con `SETTLEMENT_BATCH_CLOSE_HOUR=0` queda des
 Un evento sintético en `processed_events`, determinístico por lote y día, evita que dos instancias cierren
 el mismo lote. Si falla el cierre de un lote, el job sigue con los demás y reintenta en el minuto
 siguiente.
+
+En cada barrido, el job también **reintenta liberar los lotes retenidos** cuyas revisiones ya se cerraron (ver
+[5.2](#52-reversa)). Uno que falla se reintenta en el barrido siguiente.
 
 ### 5.7 Disputas
 
@@ -372,6 +387,9 @@ proceso la cambió, nada se guarda y devuelve `ErrStaleBatch`. Así, una venta s
 Las ventas, reversas y cierres **reintentan internamente** hasta 8 veces, con espera aleatoria, volviendo a
 cargar el lote. Si el conflicto persiste, el error llega a NATS como transitorio. Las operaciones de
 administración responden `409`, y hay que repetirlas.
+
+Un cambio de zona y las ventas y reversas del mismo comercio se ordenan con un lock de Postgres por comercio
+(`pg_advisory_xact_lock`): las ventas lo toman compartido y el cambio, exclusivo (ver [5.5](#55-día-de-negocio)).
 
 ## 6. API HTTP
 
@@ -658,7 +676,8 @@ Payload de `batch-closed`:
 |---|---|
 | `batch_id`, `terminal_id`, `merchant_id` | `batch_id` también es el `correlation_id` |
 | `batch_date` | `YYYY-MM-DD` |
-| `total_count`, `total_amount`, `currency` | Totales del backend |
+| `total_count`, `total_amount`, `currency` | Totales del backend. `total_amount` incluye los ajustes; `total_count`, no |
+| `adjustment_count`, `adjustment_amount` | Ajustes del lote: correcciones de lotes ya enviados. `adjustment_amount` tiene signo: positivo devuelve al comercio. Se omiten si no hay |
 | `discrepancies` | Permite distinguir un cierre con diferencias |
 | `closed_at` | RFC3339 UTC |
 
@@ -668,7 +687,8 @@ Payload de `settlement.completed`:
 |---|---|
 | `merchant_id`, `settlement_date` | `merchant_id` también es el `correlation_id` |
 | `total_batches`, `currency` | Lotes liquidados en esa moneda |
-| `total_amount`, `net_amount`, `mdr_percent` | Bruto, neto y comisión aplicada; el MDR no se guarda por lote |
+| `total_amount`, `net_amount`, `mdr_percent` | Bruto, neto y comisión aplicada; el MDR no se guarda por lote. `total_amount` incluye los ajustes |
+| `adjustment_amount` | Suma, con signo, de los ajustes incluidos en `total_amount`. Se omite si no hay |
 | `completed_at` | RFC3339 UTC |
 
 ## 9. Persistencia
@@ -700,7 +720,8 @@ Con 2.000 lotes y 400.000 transacciones, cargar un lote pasó de recorrer toda l
 
 ### Aplicar la migración
 
-**Una base existente necesita `000001` y de `000003` a `000009` antes de desplegar esta versión del servicio.**
+**Una base existente necesita `000001` y de `000003` a `000009` antes de desplegar esta versión del servicio, y
+`000010` después de `000007`.**
 `01-init.sql` solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
 
 ```bash
@@ -713,9 +734,10 @@ psql "$POSTGRES_DSN" -f migrations/settlement/000006_merchant_timezones.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000007_release_held_batches.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000008_maintenance_runs.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000009_batch_adjustments.up.sql
+psql "$POSTGRES_DSN" -f migrations/settlement/000010_backfill_held_batches.up.sql
 ```
 
-Son idempotentes y no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
+Son idempotentes y, salvo `000010`, no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
 coincide con el de una base nueva.
 
 **Con una tabla faltante, o una columna de `000007` o `000009`, `/readyz` responde `503` con `database schema incomplete`,** y el
@@ -727,8 +749,9 @@ eventos:** mientras falte una tabla, los que la usen fallan y, al agotar los rei
 requieren atención. **Sin `000004`, fallan las operaciones de administración.** **Sin `000005` o `000006`, fallan todas las ventas y reversas,**
 y al agotar los reintentos sus eventos se pierden. Sin `000006` también fallan los cierres. **Sin `000007` o `000009`, falla cada
 guardado de un lote:** ventas, reversas, cierres y operaciones. Todas se pueden aplicar con el servicio anterior en
-marcha, porque solo agregan tablas o columnas que admiten `NULL`. Los lotes cerrados antes de `000007` no tienen
-referencia de conciliación y no se liberan solos. **Sin `000008`, `/metrics` deja de informar los lotes que requieren
+marcha, porque solo agregan tablas o columnas que admiten `NULL`. **Sin `000010`, los lotes retenidos antes de
+`000007` no se liberan solos:** no tienen referencia de conciliación. `000010` solo completa la referencia de los
+lotes `DISPUTED` sin discrepancias que tienen revisiones; el job los libera en su barrido siguiente. **Sin `000008`, `/metrics` deja de informar los lotes que requieren
 atención,** y `/readyz` responde `503`. No inserta ninguna fila: después hay que ejecutar
 `settlement-recover-reversals` (Escenario E), o la alerta `ReversasSinRecuperar` sigue activa.
 
@@ -745,7 +768,8 @@ exige volver antes a una versión del servicio que no use la tabla. `000006_merc
 mismo: los comercios configurados vuelven a la zona general. `000007_release_held_batches.down.sql` también: se pierde
 la referencia de conciliación de los lotes y la acción de las revisiones. `000008_maintenance_runs.down.sql` también:
 se pierde el registro de la recuperación. `000009_batch_adjustments.down.sql` exige lo mismo, y falla sin cambiar nada
-si ya hay ajustes: la versión anterior los sumaría como compras.
+si ya hay ajustes: la versión anterior los sumaría como compras. `000010_backfill_held_batches.down.sql` no revierte
+nada: los lotes completados ya pudieron enviarse.
 
 ### Auditoría de operadores
 
@@ -949,11 +973,9 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| Los lotes retenidos antes de `000007` no se liberan solos | No tienen guardado contra qué se conciliaron: siguen `DISPUTED` hasta un `resolve-dispute` o `reopen` | `SettlementBatch.Release` |
-| Una liberación fallida no se reintenta | Si falla después de cerrar la revisión, el lote sigue `DISPUTED`, con el log `could not release the held batch` | `ReleaseHeldBatch` |
-| Los eventos no distinguen los ajustes | `batch-closed` y `settlement.completed` informan el total con los ajustes incluidos, sin desglose: Notification no puede explicarle al comercio la diferencia | `st_nats_publisher.go` |
-| Sin especificación del procesador | Un ajuste viaja dentro del total del lote siguiente. Si el procesador real exige informarlos aparte, habrá que adaptarlo en su adaptador | `ADJUSTMENT` |
-| Una venta simultánea al cambio de zona puede abrir otro lote | Si leyó la zona anterior justo antes del cambio, busca el lote en la fecha vieja, que ya se movió, y abre uno nuevo. La ventana es de milisegundos | `SetMerchantTimezone`, `RegisterApproval` |
+| Notification no muestra los ajustes | `batch-closed` y `settlement.completed` los informan aparte, pero Notification todavía no lee esos campos: el comercio ve el total sin la explicación | `nt_nats_subscriber.go` |
+| Sin especificación del procesador | Un ajuste viaja dentro del total del lote siguiente. El adaptador tiene el desglose en el lote (`Summary().AdjustmentAmount()` y las transacciones `ADJUSTMENT`), pero hasta conocer el formato no se sabe si hay que informarlos aparte | `ADJUSTMENT` |
+| La liberación se reintenta solo con el job | Con `SETTLEMENT_BATCH_CLOSE_HOUR=0`, una liberación fallida no se reintenta: el lote sigue `DISPUTED` hasta un `resolve-dispute` | `ReleaseHeldBatches` |
 
 ### Ciclo de vida del lote
 

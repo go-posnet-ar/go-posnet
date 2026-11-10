@@ -120,7 +120,7 @@ type fakePublisher struct {
 type completedEvent struct {
 	merchantID, date string
 	batches          int
-	gross, net       int64
+	gross, adj, net  int64
 	currency         string
 	mdr              float64
 }
@@ -130,8 +130,8 @@ func (f *fakePublisher) BuildBatchClosed(context.Context, *aggregate.SettlementB
 	return "posnet.settlement.batch-closed.v1", "event-closed", []byte("{}"), f.buildBatchClosedErr
 }
 
-func (f *fakePublisher) BuildSettlementCompleted(_ context.Context, merchantID, date string, batches int, gross, net int64, currency string, mdr float64) (string, string, []byte, error) {
-	f.completed = append(f.completed, completedEvent{merchantID, date, batches, gross, net, currency, mdr})
+func (f *fakePublisher) BuildSettlementCompleted(_ context.Context, merchantID, date string, batches int, gross, adj, net int64, currency string, mdr float64) (string, string, []byte, error) {
+	f.completed = append(f.completed, completedEvent{merchantID, date, batches, gross, adj, net, currency, mdr})
 	return "posnet.settlement.completed.v1", "event-completed", []byte("{}"), f.buildCompletedErr
 }
 

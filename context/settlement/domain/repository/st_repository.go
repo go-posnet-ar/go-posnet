@@ -59,9 +59,10 @@ type SettlementBatchRepository interface {
 
 // MerchantDayBatch resume un batch para decidir si se completó la liquidación diaria.
 type MerchantDayBatch struct {
-	Currency    string
-	Settled     bool
-	TotalAmount int64
+	Currency         string
+	Settled          bool
+	TotalAmount      int64 // Con los ajustes
+	AdjustmentAmount int64
 }
 
 // Acciones de operador que quedan en la auditoría.
@@ -196,6 +197,11 @@ type ReversalReviewLog interface {
 	// CountOpenReversalReviews cuenta las revisiones abiertas de las reversas de un lote.
 	CountOpenReversalReviews(ctx context.Context, batchID string) (int, error)
 
+	// FindReleasableHeldBatchIDs lista los lotes DISPUTED que solo retenían revisiones de reversa,
+	// ya todas cerradas: sin discrepancias, con la referencia de conciliación guardada y con al
+	// menos una revisión. Son los que ReleaseHeldBatch debería haber liberado.
+	FindReleasableHeldBatchIDs(ctx context.Context) ([]string, error)
+
 	// ListOpenReversalReviews lista las revisiones abiertas, de la más antigua a la más nueva.
 	ListOpenReversalReviews(ctx context.Context, limit int) ([]StoredReversalReview, error)
 
@@ -222,6 +228,11 @@ type ReversalReviewLog interface {
 type MerchantTimezones interface {
 	// MerchantTimezone devuelve la zona del comercio, o vacío si no tiene una propia.
 	MerchantTimezone(ctx context.Context, merchantID string) (string, error)
+
+	// MerchantTimezoneTx devuelve la zona como MerchantTimezone, pero antes toma, en tx, un lock
+	// compartido del comercio que SetMerchantTimezone espera. Una venta o reversa que lee la zona
+	// así termina de guardarse en su lote antes de que el cambio mueva los lotes, o lee la zona nueva.
+	MerchantTimezoneTx(ctx context.Context, tx pgx.Tx, merchantID string) (string, error)
 
 	// SetMerchantTimezone guarda la zona y, en la misma transacción, mueve los lotes OPEN del
 	// comercio fechados hoy en la zona anterior a hoy en la nueva, con su auditoría.

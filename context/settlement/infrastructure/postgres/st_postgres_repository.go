@@ -410,6 +410,27 @@ func (r *SettlementBatchRepo) CountOpenReversalReviews(ctx context.Context, batc
 	return n, nil
 }
 
+// FindReleasableHeldBatchIDs lista los lotes retenidos cuyas revisiones ya se cerraron. Un lote
+// que se volvió a conciliar y no coincide ya tiene discrepancias: no vuelve a aparecer.
+func (r *SettlementBatchRepo) FindReleasableHeldBatchIDs(ctx context.Context) ([]string, error) {
+	const q = `
+		SELECT b.id::text FROM settlement.settlement_batches b
+		WHERE b.state = 'DISPUTED' AND b.discrepancies = 0 AND b.reconciled_with IS NOT NULL
+		  AND EXISTS (SELECT 1 FROM settlement.reversal_reviews r WHERE r.batch_id = b.id)
+		  AND NOT EXISTS (SELECT 1 FROM settlement.reversal_reviews r WHERE r.batch_id = b.id AND r.resolved_at IS NULL)
+		ORDER BY b.batch_date ASC
+	`
+	rows, err := r.pool.Query(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("FindReleasableHeldBatchIDs: query: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("FindReleasableHeldBatchIDs: %w", err)
+	}
+	return ids, nil
+}
+
 // reversalReviewColumns son las columnas que lee scanReversalReview. Requiere los alias
 // r (reversal_reviews) y b (settlement_batches).
 const reversalReviewColumns = `
@@ -562,9 +583,31 @@ func (r *SettlementBatchRepo) MerchantTimezone(ctx context.Context, merchantID s
 	return tz, nil
 }
 
+// merchantTimezoneLock es la clave del lock entre las ventas y reversas de un comercio, que lo
+// toman compartido para leer la zona, y el cambio de zona, que lo toma exclusivo.
+const merchantTimezoneLock = `hashtextextended('settlement-merchant-timezone:' || $1::text, 0)`
+
+// MerchantTimezoneTx toma el lock compartido del comercio y lee su zona. El lock dura hasta el
+// fin de tx.
+func (r *SettlementBatchRepo) MerchantTimezoneTx(ctx context.Context, tx pgx.Tx, merchantID string) (string, error) {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock_shared(`+merchantTimezoneLock+`)`, merchantID); err != nil {
+		return "", fmt.Errorf("MerchantTimezoneTx: lock: %w", err)
+	}
+	var tz string
+	err := tx.QueryRow(ctx, `SELECT timezone FROM settlement.merchant_timezones WHERE merchant_id = $1`, merchantID).Scan(&tz)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("MerchantTimezoneTx: %w", err)
+	}
+	return tz, nil
+}
+
 // SetMerchantTimezone guarda la zona, solo si Postgres la reconoce, y mueve los lotes OPEN del
 // día a la fecha de la zona nueva. Todo en una transacción: si un lote choca con otro OPEN, no
-// cambia nada.
+// cambia nada. Antes espera el lock exclusivo del comercio: las ventas y reversas que ya leyeron
+// la zona anterior terminan de guardarse, y sus lotes se mueven con los demás.
 func (r *SettlementBatchRepo) SetMerchantTimezone(ctx context.Context, merchantID, timezone, defaultTimezone, operatorID string) ([]repository.RedatedBatch, error) {
 	// La zona anterior es la propia del comercio o, si no tenía, la general. Solo se mueve el lote
 	// de hoy: los de días anteriores los cierra el job. now() es el inicio de la transacción.
@@ -600,6 +643,10 @@ func (r *SettlementBatchRepo) SetMerchantTimezone(ctx context.Context, merchantI
 		}
 		if !known {
 			return repository.ErrUnknownTimezone
+		}
+		// Cada consulta posterior ve lo que guardaron las ventas que tenían el lock.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(`+merchantTimezoneLock+`)`, merchantID); err != nil {
+			return fmt.Errorf("SetMerchantTimezone: lock: %w", err)
 		}
 
 		rows, err := tx.Query(ctx, redateQ, merchantID, timezone, defaultTimezone)
@@ -687,7 +734,7 @@ func (r *SettlementBatchRepo) MerchantDayBatchesTx(ctx context.Context, tx pgx.T
 	}
 
 	const q = `
-		SELECT b.currency, b.state = 'SETTLED', COALESCE(b.total_amount, 0)
+		SELECT b.currency, b.state = 'SETTLED', COALESCE(b.total_amount, 0), COALESCE(b.adjustment_amount, 0)
 		FROM settlement.settlement_batches b
 		WHERE b.merchant_id = $1 AND b.batch_date = $2::date
 		  AND EXISTS (SELECT 1 FROM settlement.batch_transactions t WHERE t.batch_id = b.id)
@@ -701,7 +748,7 @@ func (r *SettlementBatchRepo) MerchantDayBatchesTx(ctx context.Context, tx pgx.T
 	var batches []repository.MerchantDayBatch
 	for rows.Next() {
 		var d repository.MerchantDayBatch
-		if err := rows.Scan(&d.Currency, &d.Settled, &d.TotalAmount); err != nil {
+		if err := rows.Scan(&d.Currency, &d.Settled, &d.TotalAmount, &d.AdjustmentAmount); err != nil {
 			return nil, fmt.Errorf("MerchantDayBatchesTx: scan: %w", err)
 		}
 		batches = append(batches, d)

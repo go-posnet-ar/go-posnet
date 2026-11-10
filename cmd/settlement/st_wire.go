@@ -277,7 +277,8 @@ const batchCloseSweep = 15 * time.Minute
 // minuto, y también al arrancar, para no perder la corrida si el servicio estaba
 // caído a la hora de cierre; barre una vez por cada tramo de batchCloseSweep. Reintenta
 // mientras la última corrida tenga fallas. Cada lote se cierra después de la medianoche de su
-// comercio más el plazo configurado: eso lo decide la consulta, no la hora del job.
+// comercio más el plazo configurado: eso lo decide la consulta, no la hora del job. En cada
+// barrido también reintenta liberar los lotes retenidos cuyas revisiones ya se cerraron.
 func (a *app) runBatchCloser(ctx context.Context) {
 	if a.batchCloseHour == 0 {
 		slog.Info("automatic batch close disabled")
@@ -309,6 +310,20 @@ func (a *app) runBatchCloser(ctx context.Context) {
 		}
 		if failed == 0 {
 			lastSweep = sweep
+		}
+
+		// Un lote que no se liberó al cerrar su última revisión: se reintenta en cada barrido,
+		// sin repetir el barrido para él.
+		retried, releaseFailed, err := a.batchHandler.ReleaseHeldBatches(ctx)
+		if err != nil {
+			slog.Error("held batch release retry failed", slog.String("error", err.Error()))
+			return
+		}
+		if retried > 0 {
+			slog.Info("held batch release retry finished",
+				slog.Int("retried", retried),
+				slog.Int("failed", releaseFailed),
+			)
 		}
 	}
 

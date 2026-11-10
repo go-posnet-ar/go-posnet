@@ -894,9 +894,9 @@ func TestMerchantDayBatchesTx_LocksBeforeReading(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	pool.ExpectQuery("FROM settlement.settlement_batches").
 		WithArgs(merchantID.String(), "2026-11-05").
-		WillReturnRows(pgxmock.NewRows([]string{"currency", "settled", "total"}).
-			AddRow("ARS", true, int64(1000)).
-			AddRow("USD", false, int64(0)))
+		WillReturnRows(pgxmock.NewRows([]string{"currency", "settled", "total", "adjustments"}).
+			AddRow("ARS", true, int64(1000), int64(-400)).
+			AddRow("USD", false, int64(0), int64(0)))
 	pool.ExpectRollback()
 
 	tx, err := pool.Begin(context.Background())
@@ -910,7 +910,7 @@ func TestMerchantDayBatchesTx_LocksBeforeReading(t *testing.T) {
 		t.Fatalf("MerchantDayBatchesTx() error = %v", err)
 	}
 	want := []repository.MerchantDayBatch{
-		{Currency: "ARS", Settled: true, TotalAmount: 1000},
+		{Currency: "ARS", Settled: true, TotalAmount: 1000, AdjustmentAmount: -400},
 		{Currency: "USD", Settled: false, TotalAmount: 0},
 	}
 	if len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
@@ -1300,6 +1300,8 @@ func TestSetMerchantTimezone_RedatesTodaysOpenBatch(t *testing.T) {
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectQuery("FROM pg_timezone_names").WithArgs("Asia/Tokyo").
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	pool.ExpectExec(`pg_advisory_xact_lock\(hashtextextended`).WithArgs("m-1").
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	pool.ExpectQuery("UPDATE settlement.settlement_batches b").
 		WithArgs("m-1", "Asia/Tokyo", "America/Argentina/Buenos_Aires").
 		WillReturnRows(pgxmock.NewRows([]string{"id", "old_date", "batch_date", "discrepancies"}).
@@ -1332,6 +1334,8 @@ func TestSetMerchantTimezone_OpenBatchConflict(t *testing.T) {
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectQuery("FROM pg_timezone_names").WithArgs("Asia/Tokyo").
 		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	pool.ExpectExec(`pg_advisory_xact_lock\(hashtextextended`).WithArgs("m-1").
+		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	pool.ExpectQuery("UPDATE settlement.settlement_batches b").
 		WithArgs("m-1", "Asia/Tokyo", "UTC").
 		WillReturnError(&pgconn.PgError{Code: "23505", ConstraintName: "uq_settlement_batches_open"})
@@ -1340,6 +1344,42 @@ func TestSetMerchantTimezone_OpenBatchConflict(t *testing.T) {
 	_, err := repo.SetMerchantTimezone(context.Background(), "m-1", "Asia/Tokyo", "UTC", "op-1")
 	if !errors.Is(err, repository.ErrOpenBatchConflict) {
 		t.Fatalf("error = %v, want ErrOpenBatchConflict", err)
+	}
+}
+
+// La venta toma el lock compartido del comercio antes de leer la zona: un cambio de zona en curso
+// la hace esperar, y uno posterior espera a que se guarde.
+func TestMerchantTimezoneTx_LocksBeforeReading(t *testing.T) {
+	cases := []struct {
+		name string
+		rows *pgxmock.Rows
+		want string
+	}{
+		{"zona propia", pgxmock.NewRows([]string{"timezone"}).AddRow("Asia/Tokyo"), "Asia/Tokyo"},
+		{"sin zona propia", pgxmock.NewRows([]string{"timezone"}), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newMockPool(t)
+			repo := postgres.NewSettlementBatchRepo(pool)
+
+			pool.ExpectBegin()
+			pool.ExpectExec(`pg_advisory_xact_lock_shared\(hashtextextended`).WithArgs("m-1").
+				WillReturnResult(pgxmock.NewResult("SELECT", 1))
+			pool.ExpectQuery("FROM settlement.merchant_timezones").WithArgs("m-1").WillReturnRows(tc.rows)
+			pool.ExpectRollback()
+
+			tx, err := pool.Begin(context.Background())
+			if err != nil {
+				t.Fatalf("Begin() error = %v", err)
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+
+			got, err := repo.MerchantTimezoneTx(context.Background(), tx, "m-1")
+			if err != nil || got != tc.want {
+				t.Errorf("MerchantTimezoneTx() = %q, %v, want %q", got, err, tc.want)
+			}
+		})
 	}
 }
 
@@ -1489,5 +1529,16 @@ func TestFindByID_ReadsAdjustments(t *testing.T) {
 	}
 	if s := b.Summary(); s == nil || s.AdjustmentCount() != 1 || s.AdjustmentAmount() != -400 || s.TotalAmount().Cents() != 600 {
 		t.Errorf("summary = %+v, want total 600 with one adjustment of -400", s)
+	}
+}
+
+func TestFindReleasableHeldBatchIDs(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectQuery(`state = 'DISPUTED' AND b.discrepancies = 0 AND b.reconciled_with IS NOT NULL`).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow("b-1").AddRow("b-2"))
+
+	ids, err := postgres.NewSettlementBatchRepo(pool).FindReleasableHeldBatchIDs(context.Background())
+	if err != nil || len(ids) != 2 || ids[0] != "b-1" || ids[1] != "b-2" {
+		t.Errorf("FindReleasableHeldBatchIDs() = %v, %v, want [b-1 b-2]", ids, err)
 	}
 }

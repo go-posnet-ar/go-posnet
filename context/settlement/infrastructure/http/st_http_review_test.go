@@ -41,6 +41,9 @@ func (f *fakeReviewLog) InsertReversalTx(context.Context, pgx.Tx, string, string
 	return nil
 }
 func (f *fakeReviewLog) CountOpenReversalReviews(context.Context, string) (int, error) { return 0, nil }
+func (f *fakeReviewLog) FindReleasableHeldBatchIDs(context.Context) ([]string, error) {
+	return nil, nil
+}
 func (f *fakeReviewLog) ListOpenReversalReviews(context.Context, int) ([]repository.StoredReversalReview, error) {
 	return f.listed, f.listErr
 }
@@ -67,6 +70,9 @@ type fakeTimezoneStore struct {
 }
 
 func (f *fakeTimezoneStore) MerchantTimezone(context.Context, string) (string, error) {
+	return f.timezone, f.err
+}
+func (f *fakeTimezoneStore) MerchantTimezoneTx(context.Context, pgx.Tx, string) (string, error) {
 	return f.timezone, f.err
 }
 func (f *fakeTimezoneStore) SetMerchantTimezone(context.Context, string, string, string, string) ([]repository.RedatedBatch, error) {

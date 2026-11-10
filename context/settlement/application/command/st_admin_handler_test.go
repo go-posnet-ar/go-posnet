@@ -600,7 +600,7 @@ func TestSettleBatch_EnqueuesWhenAllBatchesSettled(t *testing.T) {
 	b := newSubmittedBatch(t, merchantID, "ARS", 10000)
 	repo := &fakeBatchRepo{findByIDResult: b, dayResult: []repository.MerchantDayBatch{
 		{Currency: "ARS", Settled: true, TotalAmount: 10000},
-		{Currency: "ARS", Settled: true, TotalAmount: 5000},
+		{Currency: "ARS", Settled: true, TotalAmount: 5000, AdjustmentAmount: -400},
 	}}
 	publisher := &fakePublisher{}
 	h, pool := newEventAdmin(t, repo, publisher, 2.5)
@@ -619,7 +619,7 @@ func TestSettleBatch_EnqueuesWhenAllBatchesSettled(t *testing.T) {
 	if len(publisher.completed) != 1 {
 		t.Fatalf("completed events = %d, want 1", len(publisher.completed))
 	}
-	want := completedEvent{merchantID.String(), "2026-01-15", 2, 15000, 14625, "ARS", 2.5}
+	want := completedEvent{merchantID.String(), "2026-01-15", 2, 15000, -400, 14625, "ARS", 2.5}
 	if publisher.completed[0] != want {
 		t.Errorf("completed = %+v, want %+v", publisher.completed[0], want)
 	}

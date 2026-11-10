@@ -122,7 +122,7 @@ func (f *fakeDomainPublisher) BuildBatchClosed(context.Context, *aggregate.Settl
 	return "subject", "event-id", []byte("{}"), nil
 }
 
-func (f *fakeDomainPublisher) BuildSettlementCompleted(context.Context, string, string, int, int64, int64, string, float64) (string, string, []byte, error) {
+func (f *fakeDomainPublisher) BuildSettlementCompleted(context.Context, string, string, int, int64, int64, int64, string, float64) (string, string, []byte, error) {
 	return "subject", "event-id", []byte("{}"), nil
 }
 

@@ -388,8 +388,9 @@ func (h *AdminHandler) enqueueCompletedIfDone(ctx context.Context, tx pgx.Tx, se
 	}
 
 	type totals struct {
-		batches int
-		gross   int64
+		batches     int
+		gross       int64
+		adjustments int64
 	}
 	byCurrency := map[string]*totals{}
 	for _, b := range batches {
@@ -403,6 +404,7 @@ func (h *AdminHandler) enqueueCompletedIfDone(ctx context.Context, tx pgx.Tx, se
 		}
 		t.batches++
 		t.gross += b.TotalAmount
+		t.adjustments += b.AdjustmentAmount
 	}
 
 	currencies := make([]string, 0, len(byCurrency))
@@ -415,7 +417,7 @@ func (h *AdminHandler) enqueueCompletedIfDone(ctx context.Context, tx pgx.Tx, se
 		t := byCurrency[c]
 		subject, eventID, payload, err := h.publisher.BuildSettlementCompleted(ctx,
 			settled.MerchantID().String(), settled.BatchDate().Format("2006-01-02"),
-			t.batches, t.gross, netAmount(t.gross, h.mdrPercent), c, h.mdrPercent,
+			t.batches, t.gross, t.adjustments, netAmount(t.gross, h.mdrPercent), c, h.mdrPercent,
 		)
 		if err != nil {
 			return fmt.Errorf("build SettlementCompleted: %w", err)

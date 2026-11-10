@@ -320,10 +320,16 @@ type fakeTimezones struct {
 	err        error
 	setErr     error
 	set        []string
+	locked     []string
 	moved      []repository.RedatedBatch
 }
 
 func (f *fakeTimezones) MerchantTimezone(_ context.Context, merchantID string) (string, error) {
+	return f.byMerchant[merchantID], f.err
+}
+
+func (f *fakeTimezones) MerchantTimezoneTx(_ context.Context, _ pgx.Tx, merchantID string) (string, error) {
+	f.locked = append(f.locked, merchantID)
 	return f.byMerchant[merchantID], f.err
 }
 
@@ -389,12 +395,17 @@ func TestRegisterApproval_UsesMerchantTimezone(t *testing.T) {
 			}
 			h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
 			h.SetBusinessLocation(loc)
-			h.SetMerchantTimezones(&fakeTimezones{byMerchant: map[string]string{merchant.String(): tc.timezone}})
+			timezones := &fakeTimezones{byMerchant: map[string]string{merchant.String(): tc.timezone}}
+			h.SetMerchantTimezones(timezones)
 
 			cmd := validApprovalCmd()
 			cmd.TerminalID, cmd.MerchantID, cmd.AuthorizedAt = terminal.String(), merchant.String(), authorizedAt
 			if err := h.RegisterApproval(context.Background(), cmd); err != nil {
 				t.Fatalf("RegisterApproval() error = %v", err)
+			}
+			// La zona se lee con el lock del comercio, dentro de la transacción de la venta.
+			if len(timezones.locked) != 1 || timezones.locked[0] != merchant.String() {
+				t.Errorf("locked = %v, want [%s]", timezones.locked, merchant)
 			}
 			if got := repo.findOrCreateDate.Format("2006-01-02"); got != tc.want {
 				t.Errorf("batch date = %s, want %s", got, tc.want)

@@ -1144,10 +1144,17 @@ type fakeReviews struct {
 	closedAction string
 
 	insertedReversals []string // "batch|tx|amount|currency" de InsertReversalTx
+
+	releasable    []string
+	releasableErr error
 }
 
 func (f *fakeReviews) CountOpenReversalReviews(context.Context, string) (int, error) {
 	return f.openCount, f.openErr
+}
+
+func (f *fakeReviews) FindReleasableHeldBatchIDs(context.Context) ([]string, error) {
+	return f.releasable, f.releasableErr
 }
 
 func (f *fakeReviews) ListOpenReversalReviews(context.Context, int) ([]repository.StoredReversalReview, error) {

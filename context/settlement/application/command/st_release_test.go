@@ -2,6 +2,7 @@ package command_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -293,5 +294,47 @@ func TestResolveReversalReview_CorrectsAnAcceptedReviewOnceItsBatchWasSent(t *te
 				t.Errorf("stored action = %q, want %q: a second correction must be rejected", reviews.closedAction, tc.action)
 			}
 		})
+	}
+}
+
+// El job reintenta cada lote retenido que quedó sin revisiones abiertas: el que concilia se libera
+// y se envía.
+func TestReleaseHeldBatches_RetriesEachBatch(t *testing.T) {
+	held := heldBatch(t, valueobject.BatchStateDisputed, aggregate.ReconciledWithTerminal, 1, 1000)
+	pool := newMockPool(t)
+	expectReleaseTx(pool)
+	repo := &fakeBatchRepo{findByIDResult: held}
+	processor := &fakeProcessor{confirmationID: "conf-1"}
+	h := newHandler(pool, repo, &fakePublisher{}, processor)
+	h.SetReversalReviews(&fakeReviews{releasable: []string{"b-1"}})
+	h.SetAuditLog(repo)
+
+	retried, failed, err := h.ReleaseHeldBatches(context.Background())
+	if err != nil || retried != 1 || failed != 0 {
+		t.Fatalf("ReleaseHeldBatches() = %d, %d, %v, want 1, 0, nil", retried, failed, err)
+	}
+	if held.State() != valueobject.BatchStateSubmitted || processor.calls != 1 {
+		t.Errorf("state = %s, processor calls = %d, want SUBMITTED and 1", held.State(), processor.calls)
+	}
+}
+
+// Si la liberación vuelve a fallar, se cuenta y el lote sigue DISPUTED para el barrido siguiente.
+func TestReleaseHeldBatches_CountsFailures(t *testing.T) {
+	repo := &fakeBatchRepo{findByIDErr: errors.New("db down")}
+	h := newHandler(newMockPool(t), repo, &fakePublisher{}, &fakeProcessor{})
+	h.SetReversalReviews(&fakeReviews{releasable: []string{"b-1", "b-2"}})
+
+	retried, failed, err := h.ReleaseHeldBatches(context.Background())
+	if err != nil || retried != 2 || failed != 2 {
+		t.Fatalf("ReleaseHeldBatches() = %d, %d, %v, want 2, 2, nil", retried, failed, err)
+	}
+}
+
+func TestReleaseHeldBatches_ListError(t *testing.T) {
+	h := newHandler(newMockPool(t), &fakeBatchRepo{}, &fakePublisher{}, &fakeProcessor{})
+	h.SetReversalReviews(&fakeReviews{releasableErr: errors.New("db down")})
+
+	if _, _, err := h.ReleaseHeldBatches(context.Background()); err == nil {
+		t.Fatal("ReleaseHeldBatches() error = nil, want error")
 	}
 }

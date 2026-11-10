@@ -18,8 +18,9 @@ type EventPublisher interface {
 	// BuildBatchClosed serializa el evento BatchClosed. Consumido por: Notification BC.
 	BuildBatchClosed(ctx context.Context, batch *aggregate.SettlementBatch) (subject, eventID string, payload []byte, err error)
 
-	// BuildSettlementCompleted serializa el resumen de liquidación diaria.
-	BuildSettlementCompleted(ctx context.Context, merchantID, settlementDate string, totalBatches int, totalAmount, netAmount int64, currency string, mdrPercent float64) (subject, eventID string, payload []byte, err error)
+	// BuildSettlementCompleted serializa el resumen de liquidación diaria. totalAmount incluye
+	// los ajustes; adjustmentAmount es su suma, con signo.
+	BuildSettlementCompleted(ctx context.Context, merchantID, settlementDate string, totalBatches int, totalAmount, adjustmentAmount, netAmount int64, currency string, mdrPercent float64) (subject, eventID string, payload []byte, err error)
 }
 
 // SettlementProcessor es el puerto de salida hacia el procesador externo

@@ -37,6 +37,9 @@ func (p *EventPublisher) BuildBatchClosed(ctx context.Context, b *aggregate.Sett
 		Currency:      b.Currency(),
 		Discrepancies: b.Discrepancies(),
 		ClosedAt:      time.Now().UTC().Format(time.RFC3339),
+
+		AdjustmentCount:  b.Summary().AdjustmentCount(),
+		AdjustmentAmount: b.Summary().AdjustmentAmount(),
 	}
 
 	eventID, data, err := p.pub.Build(ctx,
@@ -57,7 +60,7 @@ func (p *EventPublisher) BuildSettlementCompleted(
 	ctx context.Context,
 	merchantID, settlementDate string,
 	totalBatches int,
-	totalAmount, netAmount int64,
+	totalAmount, adjustmentAmount, netAmount int64,
 	currency string,
 	mdrPercent float64,
 ) (string, string, []byte, error) {
@@ -67,9 +70,11 @@ func (p *EventPublisher) BuildSettlementCompleted(
 		TotalBatches:   totalBatches,
 		TotalAmount:    totalAmount,
 		Currency:       currency,
-		NetAmount:      netAmount,
-		MDRPercent:     mdrPercent,
-		CompletedAt:    time.Now().UTC().Format(time.RFC3339),
+
+		AdjustmentAmount: adjustmentAmount,
+		NetAmount:        netAmount,
+		MDRPercent:       mdrPercent,
+		CompletedAt:      time.Now().UTC().Format(time.RFC3339),
 	}
 
 	eventID, data, err := p.pub.Build(ctx,

@@ -14,8 +14,13 @@ type BatchClosedPayload struct {
 	MerchantID    string `json:"merchant_id"`
 	BatchDate     string `json:"batch_date"`   // "2025-06-04"
 	TotalCount    int    `json:"total_count"`  // Cantidad de transacciones en el lote
-	TotalAmount   int64  `json:"total_amount"` // Suma total en centavos
+	TotalAmount   int64  `json:"total_amount"` // Suma total en centavos, con los ajustes
 	Currency      string `json:"currency"`
 	Discrepancies int    `json:"discrepancies"` // Gaps detectados entre terminal y backend
 	ClosedAt      string `json:"closed_at"`     // RFC3339 UTC
+
+	// Ajustes: correcciones de lotes ya enviados que se liquidan con este. No cuentan en
+	// TotalCount; su monto, con signo, ya está en TotalAmount. Positivo devuelve al comercio.
+	AdjustmentCount  int   `json:"adjustment_count,omitempty"`
+	AdjustmentAmount int64 `json:"adjustment_amount,omitempty"`
 }

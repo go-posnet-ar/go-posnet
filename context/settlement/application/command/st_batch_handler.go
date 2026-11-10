@@ -92,16 +92,36 @@ func (h *BatchHandler) defaultLocation() *time.Location {
 // businessDate devuelve el día de negocio de t en la zona del comercio, a medianoche UTC
 // para que el valor no dependa de la zona al formatearlo o guardarlo como DATE.
 func (h *BatchHandler) businessDate(ctx context.Context, merchantID string, t time.Time) (time.Time, error) {
+	if h.timezones == nil {
+		return h.inZone(t, "")
+	}
+	name, err := h.timezones.MerchantTimezone(ctx, merchantID)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("business date: %w", err)
+	}
+	return h.inZone(t, name)
+}
+
+// businessDateTx es businessDate para una venta o reversa que se va a guardar en tx: lee la zona
+// con el lock del comercio, para que un cambio de zona no mueva los lotes en el medio.
+func (h *BatchHandler) businessDateTx(ctx context.Context, tx pgx.Tx, merchantID string, t time.Time) (time.Time, error) {
+	if h.timezones == nil {
+		return h.inZone(t, "")
+	}
+	name, err := h.timezones.MerchantTimezoneTx(ctx, tx, merchantID)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("business date: %w", err)
+	}
+	return h.inZone(t, name)
+}
+
+// inZone devuelve la fecha de t en la zona name, o en la general si name es vacío.
+func (h *BatchHandler) inZone(t time.Time, name string) (time.Time, error) {
 	loc := h.defaultLocation()
-	if h.timezones != nil {
-		name, err := h.timezones.MerchantTimezone(ctx, merchantID)
-		if err != nil {
-			return time.Time{}, fmt.Errorf("business date: %w", err)
-		}
-		if name != "" {
-			if loc, err = time.LoadLocation(name); err != nil {
-				return time.Time{}, fmt.Errorf("business date: load timezone: %w", err)
-			}
+	if name != "" {
+		var err error
+		if loc, err = time.LoadLocation(name); err != nil {
+			return time.Time{}, fmt.Errorf("business date: load timezone: %w", err)
 		}
 	}
 	return midnightUTC(t.In(loc)), nil
@@ -172,10 +192,6 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 	if err != nil {
 		authorizedAt = time.Now().UTC()
 	}
-	batchDate, err := h.businessDate(ctx, merchantID.String(), authorizedAt)
-	if err != nil {
-		return fmt.Errorf("RegisterApproval: %w", err)
-	}
 
 	var (
 		batchID string
@@ -191,6 +207,10 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 			if !inserted {
 				log.Info("approval event already registered — skipping")
 				return nil
+			}
+			batchDate, err := h.businessDateTx(ctx, tx, merchantID.String(), authorizedAt)
+			if err != nil {
+				return err
 			}
 
 			batch, err := h.batchRepo.FindOrCreateOpen(ctx, terminalID, merchantID, batchDate, cmd.Currency)
@@ -271,10 +291,6 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 	if err != nil {
 		completedAt = time.Now().UTC()
 	}
-	batchDate, err := h.businessDate(ctx, merchantID.String(), completedAt)
-	if err != nil {
-		return fmt.Errorf("RegisterReversal: %w", err)
-	}
 
 	var (
 		registered   bool
@@ -289,6 +305,10 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 			}
 			if !inserted {
 				return nil
+			}
+			batchDate, err := h.businessDateTx(ctx, tx, merchantID.String(), completedAt)
+			if err != nil {
+				return err
 			}
 
 			batch, err := h.batchRepo.FindOrCreateOpen(ctx, terminalID, merchantID, batchDate, cmd.Currency)
@@ -497,7 +517,7 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 // abiertas (ver SettlementBatch.Release). Si concilia, pasa a CLOSED, con auditoría, y se envía
 // al procesador. No hace nada si el lote no está DISPUTED o le quedan revisiones. Lo llaman el
 // cierre de una revisión, por el sistema o por un operador: si falla, el lote sigue DISPUTED y
-// un operador lo resuelve con resolve-dispute o reopen.
+// ReleaseHeldBatches lo reintenta en el barrido siguiente del cierre automático.
 func (h *BatchHandler) ReleaseHeldBatch(ctx context.Context, batchID string) error {
 	log := observability.FromContext(ctx).With(slog.String("batch_id", batchID))
 	var (
@@ -575,6 +595,33 @@ func (h *BatchHandler) ReleaseHeldBatch(ctx context.Context, batchID string) err
 		log.Error("submit after release failed — batch stays CLOSED", slog.String("error", err.Error()))
 	}
 	return nil
+}
+
+// ReleaseHeldBatches reintenta liberar los lotes retenidos cuyas revisiones ya se cerraron: los
+// que ReleaseHeldBatch no pudo liberar porque falló, y los cerrados antes de 000007 que la
+// migración 000010 completó. Lo llama el job de cierre automático en cada barrido. Devuelve
+// cuántos intentó y cuántos fallaron; los que fallan se reintentan en el barrido siguiente.
+func (h *BatchHandler) ReleaseHeldBatches(ctx context.Context) (retried, failed int, err error) {
+	ctx, span := observability.StartSpan(ctx, "command.ReleaseHeldBatches")
+	defer span.End()
+
+	if h.reviews == nil {
+		return 0, 0, nil
+	}
+	ids, err := h.reviews.FindReleasableHeldBatchIDs(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("ReleaseHeldBatches: find batches: %w", err)
+	}
+	for _, id := range ids {
+		observability.FromContext(ctx).Info("retrying the release of a held batch with no open reviews", slog.String("batch_id", id))
+		if err := h.ReleaseHeldBatch(ctx, id); err != nil {
+			failed++
+			observability.RecordError(ctx, err)
+			observability.FromContext(ctx).Error("could not release the held batch — it stays DISPUTED, retried on the next sweep",
+				slog.String("batch_id", id), slog.String("error", err.Error()))
+		}
+	}
+	return len(ids), failed, nil
 }
 
 // disputeReasonReversalReview es el motivo de disputa de un lote con reversas en revisión.

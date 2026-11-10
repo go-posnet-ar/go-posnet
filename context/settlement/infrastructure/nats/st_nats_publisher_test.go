@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juantevez/go-posnet/pkg/domain"
 	"github.com/juantevez/go-posnet/pkg/events"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
 )
@@ -109,7 +110,7 @@ func TestBuildSettlementCompleted_Success(t *testing.T) {
 	merchantID := "merchant-1"
 
 	before := time.Now().UTC().Add(-time.Second)
-	subject, eventID, data, err := p.BuildSettlementCompleted(context.Background(), merchantID, "2026-01-15", 4, 100000, 97500, "ARS", 2.5)
+	subject, eventID, data, err := p.BuildSettlementCompleted(context.Background(), merchantID, "2026-01-15", 4, 100000, -400, 97500, "ARS", 2.5)
 	if err != nil {
 		t.Fatalf("BuildSettlementCompleted() error = %v", err)
 	}
@@ -149,6 +150,9 @@ func TestBuildSettlementCompleted_Success(t *testing.T) {
 	if payload.TotalAmount != 100000 {
 		t.Errorf("TotalAmount = %d, want 100000", payload.TotalAmount)
 	}
+	if payload.AdjustmentAmount != -400 {
+		t.Errorf("AdjustmentAmount = %d, want -400", payload.AdjustmentAmount)
+	}
 	if payload.NetAmount != 97500 {
 		t.Errorf("NetAmount = %d, want 97500", payload.NetAmount)
 	}
@@ -165,5 +169,42 @@ func TestBuildSettlementCompleted_Success(t *testing.T) {
 	}
 	if completedAt.Before(before) || completedAt.After(after) {
 		t.Errorf("CompletedAt = %v, want between %v and %v", completedAt, before, after)
+	}
+}
+
+// Un lote con un ajuste lo informa aparte: el total ya lo incluye, la cantidad no.
+func TestBuildBatchClosed_BreaksOutAdjustments(t *testing.T) {
+	p := newTestPublisher(&fakeJetStream{ackSeq: 1})
+	b := newClosableBatch(t)
+	if err := b.AddAdjustment(domain.NewTransactionID(), -400); err != nil {
+		t.Fatalf("AddAdjustment() error = %v", err)
+	}
+	if err := b.RequestClose(); err != nil {
+		t.Fatalf("RequestClose() error = %v", err)
+	}
+	if err := b.Close(1, 1000); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	_, _, data, err := p.BuildBatchClosed(context.Background(), b)
+	if err != nil {
+		t.Fatalf("BuildBatchClosed() error = %v", err)
+	}
+	envelope, err := events.UnmarshalEnvelope(data)
+	if err != nil {
+		t.Fatalf("UnmarshalEnvelope() error = %v", err)
+	}
+	payload, err := events.Unwrap[events.BatchClosedPayload](envelope)
+	if err != nil {
+		t.Fatalf("Unwrap() error = %v", err)
+	}
+	if payload.TotalCount != 1 || payload.TotalAmount != 600 {
+		t.Errorf("totals = %d/%d, want 1/600", payload.TotalCount, payload.TotalAmount)
+	}
+	if payload.AdjustmentCount != 1 || payload.AdjustmentAmount != -400 {
+		t.Errorf("adjustments = %d/%d, want 1/-400", payload.AdjustmentCount, payload.AdjustmentAmount)
+	}
+	if b.Discrepancies() != 0 {
+		t.Errorf("Discrepancies() = %d, want 0", b.Discrepancies())
 	}
 }

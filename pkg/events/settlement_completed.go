@@ -12,9 +12,13 @@ type SettlementCompletedPayload struct {
 	MerchantID     string  `json:"merchant_id"`
 	SettlementDate string  `json:"settlement_date"` // "2025-06-04"
 	TotalBatches   int     `json:"total_batches"`   // Cantidad de lotes liquidados
-	TotalAmount    int64   `json:"total_amount"`    // Monto bruto en centavos
+	TotalAmount    int64   `json:"total_amount"`    // Monto bruto en centavos, con los ajustes
 	Currency       string  `json:"currency"`
 	NetAmount      int64   `json:"net_amount"`   // Monto neto después de MDR (en centavos)
 	MDRPercent     float64 `json:"mdr_percent"`  // Comisión aplicada (ej: 2.5)
 	CompletedAt    string  `json:"completed_at"` // RFC3339 UTC
+
+	// AdjustmentAmount es la suma, con signo, de los ajustes que ya están en TotalAmount:
+	// correcciones de lotes de días anteriores. Positivo devuelve al comercio.
+	AdjustmentAmount int64 `json:"adjustment_amount,omitempty"`
 }

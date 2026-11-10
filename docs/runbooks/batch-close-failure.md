@@ -429,8 +429,10 @@ does not match`): ahí `ACCEPT` la deja excluida y `USE_PURCHASE_AMOUNT` la agre
 
 **Al cerrar la última revisión, el lote se libera solo si concilia:** pasa a `CLOSED` y se envía (log `held batch
 released`, auditoría `AUTO_RELEASE`). Si no concilia (log `still does not reconcile`, por ejemplo porque el terminal
-había contado la reversa que excluiste) o se cerró antes de `000007` (log `closed before its reconciliation was
-recorded`), sigue en `DISPUTED`. Entonces:
+había contado la reversa que excluiste) o se cerró antes de `000007` sin aplicar `000010` (log `closed before its
+reconciliation was recorded`), sigue en `DISPUTED`. Si la liberación falló (log `could not release the held
+batch`), el job de cierre automático la reintenta en su barrido siguiente, cada 15 minutos (log `retrying the release
+of a held batch`): no hace falta intervenir. Si no concilia:
 
 ```bash
 curl -X POST http://<host>:8084/batches/<batch_id>/resolve-dispute -H "$AUTH" \
