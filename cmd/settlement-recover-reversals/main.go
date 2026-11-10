@@ -4,6 +4,10 @@
 //
 // Sin -apply solo lista. Se puede repetir: lo que ya se registró deja de aparecer.
 //
+// Cuando no queda ninguna reversa sin registrar, sea tras un -apply o en una ejecución que no
+// encuentra nada, lo deja en settlement.maintenance_runs. Hasta entonces, el servicio informa
+// posnet_settlement_reversal_recovery_pending en 1 y salta la alerta ReversasSinRecuperar.
+//
 // Ver docs/runbooks/batch-close-failure.md, Escenario E.
 package main
 
@@ -30,7 +34,7 @@ const defaultTimezone = "America/Argentina/Buenos_Aires"
 
 func main() {
 	apply := flag.Bool("apply", false, "registra las reversas; sin esto, solo las lista")
-	operator := flag.String("operator", "", "quién ejecuta, para la auditoría; obligatorio con -apply")
+	operator := flag.String("operator", "", "quién ejecuta, para la auditoría; obligatorio con -apply. Sin -apply, queda como autor del registro si no hay nada que recuperar")
 	reason := flag.String("reason", "", "motivo o ticket, para la auditoría; obligatorio con -apply")
 	limit := flag.Int("limit", 500, "máximo de reversas por ejecución")
 	flag.Parse()
@@ -73,7 +77,7 @@ func run(apply bool, operator, reason string, limit int) error {
 	}
 	if len(found) == 0 {
 		fmt.Println("no reversals to recover")
-		return nil
+		return recordDone(ctx, repo, operator, "dry-run", "Sin reversas anteriores sin descontar")
 	}
 
 	// Sin publicador ni procesador: registrar una reversa no publica ni envía nada.
@@ -96,13 +100,35 @@ func run(apply bool, operator, reason string, limit int) error {
 	}
 
 	if !apply {
-		fmt.Printf("\n%d reversals found. Nothing was changed: run with -apply to register them.\n", len(found))
+		fmt.Printf("\n%d reversals found. Nothing was changed: run with -apply to register them. The recovery stays pending.\n", len(found))
 		return nil
 	}
 	fmt.Printf("\n%d recovered, %d failed.\n", len(found)-failed, failed)
 	if failed > 0 {
 		return fmt.Errorf("%d reversals failed", failed)
 	}
+	// Con -limit puede haber quedado alguna: solo se registra si no queda ninguna.
+	remaining, err := repo.FindUnrecordedReversals(ctx, 1)
+	if err != nil {
+		return err
+	}
+	if len(remaining) > 0 {
+		fmt.Printf("More reversals remain beyond -limit %d: run it again. The recovery stays pending.\n", limit)
+		return nil
+	}
+	return recordDone(ctx, repo, operator, operator, fmt.Sprintf("%d reversas registradas: %s", len(found), reason))
+}
+
+// recordDone registra que no queda ninguna reversa anterior sin descontar. by es quién ejecutó;
+// fallback, si no lo informó.
+func recordDone(ctx context.Context, repo *pginfra.SettlementBatchRepo, by, fallback, details string) error {
+	if by == "" {
+		by = fallback
+	}
+	if err := repo.RecordMaintenanceRun(ctx, repository.MaintenanceReversalRecovery, by, details); err != nil {
+		return fmt.Errorf("nothing left to recover, but it could not be recorded (the alert stays active): %w", err)
+	}
+	fmt.Println("Recorded in settlement.maintenance_runs: the reversal recovery is done in this environment.")
 	return nil
 }
 

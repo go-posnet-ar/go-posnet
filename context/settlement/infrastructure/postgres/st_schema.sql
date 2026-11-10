@@ -135,3 +135,14 @@ CREATE TABLE IF NOT EXISTS settlement.merchant_timezones (
     updated_by  TEXT        NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ─── maintenance_runs (tareas a ejecutar una vez por entorno) ────────────────
+-- Migración 000008. 01-init.sql inserta 'reversal-recovery': una base nueva no tiene reversas
+-- anteriores sin descontar.
+
+CREATE TABLE IF NOT EXISTS settlement.maintenance_runs (
+    name         TEXT        PRIMARY KEY,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_by TEXT        NOT NULL,
+    details      TEXT
+);

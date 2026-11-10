@@ -145,6 +145,7 @@ var requiredTables = []string{
 	"settlement.batch_audit_log",
 	"settlement.reversal_reviews",
 	"settlement.merchant_timezones",
+	"settlement.maintenance_runs",
 }
 
 // requiredColumns son las columnas agregadas por migraciones sobre tablas existentes, como
@@ -891,14 +892,15 @@ func (r *SettlementBatchRepo) CountBatchesNeedingAttention(ctx context.Context, 
 			COUNT(*) FILTER (WHERE b.state = 'CLOSED' AND COALESCE(b.total_count, 0) > 0 AND b.closed_at < $1),
 			COUNT(*) FILTER (WHERE b.state = 'OPEN' AND b.batch_date < ($2::timestamptz AT TIME ZONE COALESCE(m.timezone, $3))::date),
 			(SELECT COUNT(*) FROM settlement.outbox WHERE created_at < $4),
-			(SELECT COUNT(*) FROM settlement.reversal_reviews WHERE resolved_at IS NULL AND created_at < $5)
+			(SELECT COUNT(*) FROM settlement.reversal_reviews WHERE resolved_at IS NULL AND created_at < $5),
+			NOT EXISTS (SELECT 1 FROM settlement.maintenance_runs WHERE name = $6)
 		FROM settlement.settlement_batches b
 		LEFT JOIN settlement.merchant_timezones m ON m.merchant_id = b.merchant_id
 		WHERE b.state IN ('DISPUTED', 'CLOSED', 'OPEN')
 	`
 	var c repository.BatchAttentionCounts
-	err := r.pool.QueryRow(ctx, q, closedBefore, now, defaultTimezone, outboxBefore, reviewBefore).
-		Scan(&c.Disputed, &c.ClosedUnsent, &c.OpenOverdue, &c.OutboxStuck, &c.ReversalsInReview)
+	err := r.pool.QueryRow(ctx, q, closedBefore, now, defaultTimezone, outboxBefore, reviewBefore, repository.MaintenanceReversalRecovery).
+		Scan(&c.Disputed, &c.ClosedUnsent, &c.OpenOverdue, &c.OutboxStuck, &c.ReversalsInReview, &c.RecoveryPending)
 	if err != nil {
 		return repository.BatchAttentionCounts{}, fmt.Errorf("CountBatchesNeedingAttention: %w", err)
 	}

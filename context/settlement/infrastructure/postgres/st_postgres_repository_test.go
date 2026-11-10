@@ -827,15 +827,15 @@ func TestCountBatchesNeedingAttention(t *testing.T) {
 	reviewBefore := now.Add(-15 * time.Minute)
 
 	pool.ExpectQuery("FROM settlement.settlement_batches").
-		WithArgs(closedBefore, now, "UTC", outboxBefore, reviewBefore).
-		WillReturnRows(pgxmock.NewRows([]string{"disputed", "closed", "open", "outbox", "reviews"}).AddRow(int64(3), int64(2), int64(1), int64(4), int64(5)))
+		WithArgs(closedBefore, now, "UTC", outboxBefore, reviewBefore, "reversal-recovery").
+		WillReturnRows(pgxmock.NewRows([]string{"disputed", "closed", "open", "outbox", "reviews", "recovery"}).AddRow(int64(3), int64(2), int64(1), int64(4), int64(5), true))
 
 	got, err := repo.CountBatchesNeedingAttention(context.Background(), now, "UTC", closedBefore, outboxBefore, reviewBefore)
 	if err != nil {
 		t.Fatalf("CountBatchesNeedingAttention() error = %v", err)
 	}
-	if got.Disputed != 3 || got.ClosedUnsent != 2 || got.OpenOverdue != 1 || got.OutboxStuck != 4 || got.ReversalsInReview != 5 {
-		t.Errorf("counts = %+v, want {3 2 1 4 5}", got)
+	if got.Disputed != 3 || got.ClosedUnsent != 2 || got.OpenOverdue != 1 || got.OutboxStuck != 4 || got.ReversalsInReview != 5 || !got.RecoveryPending {
+		t.Errorf("counts = %+v, want {3 2 1 4 5 true}", got)
 	}
 }
 
@@ -844,7 +844,7 @@ func TestCountBatchesNeedingAttention_QueryError(t *testing.T) {
 	repo := postgres.NewSettlementBatchRepo(pool)
 
 	pool.ExpectQuery("FROM settlement.settlement_batches").
-		WithArgs(anyArgs(5)...).
+		WithArgs(anyArgs(6)...).
 		WillReturnError(errors.New("db down"))
 
 	if _, err := repo.CountBatchesNeedingAttention(context.Background(), time.Now(), "UTC", time.Now(), time.Now(), time.Now()); err == nil {
@@ -1456,5 +1456,19 @@ func TestFindByID_ReadsTheReconciliationReference(t *testing.T) {
 	gotCount, gotAmount := b.TerminalTotals()
 	if b.ReconciledWith() != "TERMINAL" || gotCount == nil || *gotCount != 2 || gotAmount == nil || *gotAmount != 1500 {
 		t.Errorf("reference = %q, %v, %v, want TERMINAL, 2, 1500", b.ReconciledWith(), gotCount, gotAmount)
+	}
+}
+
+func TestRecordMaintenanceRun(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectExec("INSERT INTO settlement.maintenance_runs").
+		WithArgs("reversal-recovery", "op-1", "3 reversas registradas").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectCommit()
+	pool.ExpectRollback()
+
+	if err := postgres.NewSettlementBatchRepo(pool).RecordMaintenanceRun(context.Background(), "reversal-recovery", "op-1", "3 reversas registradas"); err != nil {
+		t.Fatalf("RecordMaintenanceRun() error = %v", err)
 	}
 }

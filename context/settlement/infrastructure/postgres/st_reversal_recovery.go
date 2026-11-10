@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/juantevez/go-posnet/pkg/pgutil"
 )
 
 // UnrecordedReversal es una venta revertida en Authorization, sin su reversa en Settlement.
@@ -56,6 +58,22 @@ func (r *SettlementBatchRepo) FindUnrecordedReversals(ctx context.Context, limit
 		return nil, fmt.Errorf("FindUnrecordedReversals: rows: %w", err)
 	}
 	return found, nil
+}
+
+// RecordMaintenanceRun registra que una tarea de mantenimiento quedó hecha en este entorno. Si ya
+// estaba, actualiza quién y cuándo.
+func (r *SettlementBatchRepo) RecordMaintenanceRun(ctx context.Context, name, completedBy, details string) error {
+	return pgutil.WithReadCommitted(ctx, r.pool, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO settlement.maintenance_runs (name, completed_by, details) VALUES ($1, $2, NULLIF($3, ''))
+			ON CONFLICT (name) DO UPDATE
+			SET completed_at = now(), completed_by = EXCLUDED.completed_by, details = EXCLUDED.details`,
+			name, completedBy, details)
+		if err != nil {
+			return fmt.Errorf("RecordMaintenanceRun: %w", err)
+		}
+		return nil
+	})
 }
 
 // FindReversalBatchTx devuelve el lote en el que quedó registrada una reversa y su estado.

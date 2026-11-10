@@ -217,3 +217,16 @@ groups:
           summary: "{{ $value }} reversas en revisión"
           description: "Hay reversas sin compra o que no coinciden con ella. Sus lotes no se envían hasta cerrar la revisión (batch-close-failure.md, Escenario H)."
 
+      # Falta ejecutar settlement-recover-reversals en este entorno: puede haber ventas anuladas
+      # antes de que se guardaran las reversas que siguen sumando. Se apaga sola cuando el comando
+      # registra que no queda ninguna.
+      # Investigar: docs/runbooks/batch-close-failure.md, Escenario E.
+      - alert: ReversasSinRecuperar
+        expr: max(posnet_settlement_reversal_recovery_pending) == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Falta recuperar las reversas anteriores en Settlement"
+          description: "settlement-recover-reversals no se ejecutó en este entorno, o dejó reversas sin registrar. Hasta entonces, ventas anuladas pueden seguir sumando (batch-close-failure.md, Escenario E)."
+

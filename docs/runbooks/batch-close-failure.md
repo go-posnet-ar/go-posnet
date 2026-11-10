@@ -301,6 +301,16 @@ Se puede repetir: lo ya registrado deja de aparecer. Procesa hasta 500 por ejecu
 Cada reversa queda en la auditoría como `RECOVER_REVERSAL`. Si el comando informa `reversal registered but not
 audited`, la reversa está registrada y falta asentarla a mano en el ticket.
 
+**Cuándo queda hecho:** cuando no queda ninguna reversa sin registrar, tras un `-apply` o en una ejecución que no
+encuentra nada, el comando lo deja en `settlement.maintenance_runs` (`Recorded in settlement.maintenance_runs`).
+Hasta entonces, `posnet_settlement_reversal_recovery_pending` vale 1 y salta la alerta `ReversasSinRecuperar`. Si
+quedan más que `-limit`, avisa `More reversals remain`: volvé a ejecutarlo. Una base creada con `01-init.sql` ya
+viene registrada, porque no puede tener reversas anteriores.
+
+```sql
+SELECT name, completed_at, completed_by, details FROM settlement.maintenance_runs;
+```
+
 ---
 
 ## Escenario F — Lotes abiertos de días anteriores

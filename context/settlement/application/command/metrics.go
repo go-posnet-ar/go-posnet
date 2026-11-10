@@ -26,6 +26,7 @@ import (
 //	posnet_settlement_outbox_stuck → posnet_settlement_outbox_stuck
 //	posnet_settlement_reversals_in_review → posnet_settlement_reversals_in_review
 //	posnet_settlement_batch_close_rejected → posnet_settlement_batch_close_rejected_total{reason}
+//	posnet_settlement_reversal_recovery_pending → posnet_settlement_reversal_recovery_pending
 //
 // El label "bc" lo inyecta Prometheus como target label (prometheus.yml).
 type Metrics struct {
@@ -186,6 +187,13 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 	if err != nil {
 		return err
 	}
+	recoveryGauge, err := observability.Meter("posnet.settlement").Int64ObservableGauge(
+		"posnet_settlement_reversal_recovery_pending",
+		metric.WithDescription("1 mientras no se haya registrado la recuperación de reversas anteriores con settlement-recover-reversals."),
+	)
+	if err != nil {
+		return err
+	}
 	_, err = observability.Meter("posnet.settlement").RegisterCallback(
 		func(ctx context.Context, o metric.Observer) error {
 			ctx, cancel := context.WithTimeout(ctx, attentionQueryTimeout)
@@ -205,9 +213,14 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 			observe("open_overdue", counts.OpenOverdue)
 			o.ObserveInt64(outboxGauge, counts.OutboxStuck)
 			o.ObserveInt64(reviewGauge, counts.ReversalsInReview)
+			var pending int64
+			if counts.RecoveryPending {
+				pending = 1
+			}
+			o.ObserveInt64(recoveryGauge, pending)
 			return nil
 		},
-		gauge, outboxGauge, reviewGauge,
+		gauge, outboxGauge, reviewGauge, recoveryGauge,
 	)
 	return err
 }

@@ -251,7 +251,11 @@ type BatchAttentionCounts struct {
 	OpenOverdue       int64 // En OPEN, de un día de negocio anterior
 	OutboxStuck       int64 // Eventos en el outbox desde antes del corte
 	ReversalsInReview int64 // Revisiones de reversas abiertas desde antes del corte
+	RecoveryPending   bool  // Falta registrar la recuperación de reversas anteriores
 }
+
+// MaintenanceReversalRecovery es la tarea de settlement-recover-reversals en maintenance_runs.
+const MaintenanceReversalRecovery = "reversal-recovery"
 
 // BatchAttentionCounter cuenta los lotes que requieren atención. Es un puerto aparte
 // porque solo lo usan las métricas.

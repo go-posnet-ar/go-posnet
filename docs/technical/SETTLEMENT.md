@@ -217,7 +217,9 @@ revisión se reabre con el motivo nuevo en el lote de la compra, que queda reten
 
 **Las reversas anteriores a esta corrección se recuperan con un comando,** que hay que ejecutar en cada entorno:
 se descartaron, y su evento ya figura como procesado. Ver el
-[Escenario E](../runbooks/batch-close-failure.md#escenario-e--reversas-anteriores-sin-descontar).
+[Escenario E](../runbooks/batch-close-failure.md#escenario-e--reversas-anteriores-sin-descontar). Cuando no queda
+ninguna, el comando lo registra en `settlement.maintenance_runs`; hasta entonces salta la alerta
+`ReversasSinRecuperar`. Una base creada con `01-init.sql` ya viene registrada.
 
 ### 5.3 Aprobación después del cierre
 
@@ -659,6 +661,7 @@ hace nada, [`migrations/settlement/`](../../migrations/settlement/) se aplica a 
 | `reversal_reviews` | Reversas que no coinciden con su compra | PK `transaction_id`; FK `batch_id`; índice `created_at` de las abiertas |
 | `batch_audit_log` | Cambios de estado hechos por operadores | PK `id`; FK `batch_id`; índice `(batch_id, created_at)` |
 | `merchant_timezones` | Zona de negocio de los comercios que no usan la general | PK `merchant_id` |
+| `maintenance_runs` | Tareas de mantenimiento ya ejecutadas en el entorno, como la recuperación de reversas | PK `name` |
 
 | Índice | Para qué sirve |
 |---|---|
@@ -671,8 +674,7 @@ Con 2.000 lotes y 400.000 transacciones, cargar un lote pasó de recorrer toda l
 
 ### Aplicar la migración
 
-**Una base existente necesita `000001`, `000003`, `000004`, `000005`, `000006` y `000007` antes de desplegar esta
-versión del servicio.**
+**Una base existente necesita `000001` y de `000003` a `000008` antes de desplegar esta versión del servicio.**
 `01-init.sql` solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
 
 ```bash
@@ -683,6 +685,7 @@ psql "$POSTGRES_DSN" -f migrations/settlement/000004_batch_audit.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000005_reversal_reviews.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000006_merchant_timezones.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000007_release_held_batches.up.sql
+psql "$POSTGRES_DSN" -f migrations/settlement/000008_maintenance_runs.up.sql
 ```
 
 Son idempotentes y no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
@@ -698,7 +701,9 @@ requieren atención. **Sin `000004`, fallan las operaciones de administración.*
 y al agotar los reintentos sus eventos se pierden. Sin `000006` también fallan los cierres. **Sin `000007`, falla cada
 guardado de un lote:** ventas, reversas, cierres y operaciones. Todas se pueden aplicar con el servicio anterior en
 marcha, porque solo agregan tablas o columnas que admiten `NULL`. Los lotes cerrados antes de `000007` no tienen
-referencia de conciliación y no se liberan solos.
+referencia de conciliación y no se liberan solos. **Sin `000008`, `/metrics` deja de informar los lotes que requieren
+atención,** y `/readyz` responde `503`. No inserta ninguna fila: después hay que ejecutar
+`settlement-recover-reversals` (Escenario E), o la alerta `ReversasSinRecuperar` sigue activa.
 
 `000002` crea los índices con `CONCURRENTLY`, sin bloquear las escrituras, y por eso no puede correr dentro de
 una transacción: no usar `psql -1`. Si se interrumpe, puede dejar un índice inválido: hay que borrarlo y volver
@@ -711,7 +716,8 @@ quedan eventos sin publicar: hay que esperar a que salgan. `000004_batch_audit.d
 registros de auditoría, para no perderlos. `000005_reversal_reviews.down.sql` falla si hay revisiones abiertas, y
 exige volver antes a una versión del servicio que no use la tabla. `000006_merchant_timezones.down.sql` exige lo
 mismo: los comercios configurados vuelven a la zona general. `000007_release_held_batches.down.sql` también: se pierde
-la referencia de conciliación de los lotes y la acción de las revisiones.
+la referencia de conciliación de los lotes y la acción de las revisiones. `000008_maintenance_runs.down.sql` también:
+se pierde el registro de la recuperación.
 
 ### Auditoría de operadores
 
@@ -765,6 +771,7 @@ el pool de Postgres.
 | `posnet_settlement_batches_attention` | Gauge | `reason` | Lotes que requieren atención (ver abajo). Consulta la base en cada scrape |
 | `posnet_settlement_outbox_stuck` | Gauge | — | Eventos en el outbox desde hace más de 1 minuto |
 | `posnet_settlement_reversals_in_review` | Gauge | — | Revisiones de reversas abiertas desde hace más de 15 minutos, para dar tiempo a una compra demorada |
+| `posnet_settlement_reversal_recovery_pending` | Gauge | — | 1 mientras no se haya registrado la recuperación de reversas anteriores |
 | `posnet_settlement_batch_close_rejected_total` | Counter | `reason` | Cierres del terminal rechazados por su `batch_date`: `future`, `too_old` o `not_reopened` |
 
 También se exponen métricas del pool de Postgres y de mensajes NATS, incluida
@@ -785,6 +792,7 @@ Si la consulta falla, estas series no se informan en ese scrape, y las alertas q
 | `EventoSettlementPerdido` | Crítica | Un evento agotó las entregas. Sigue activa hasta reiniciar el servicio | [Reprocesar el evento](../runbooks/nats-dlq-reprocess.md) |
 | `OutboxSettlementTrabado` | Warning | Hay eventos en el outbox hace más de 1 minuto, durante 5 min | Revisar NATS y el log `outbox relay`. Se publican solos al resolver la causa |
 | `ReversasEnRevision` | Warning | Hay revisiones abiertas hace más de 15 min, durante 5 min | [Escenario H](../runbooks/batch-close-failure.md#escenario-h--reversas-en-revisión) |
+| `ReversasSinRecuperar` | Warning | Falta registrar la recuperación de reversas anteriores, durante 15 min | [Escenario E](../runbooks/batch-close-failure.md#escenario-e--reversas-anteriores-sin-descontar) |
 | `LotesEnDisputa` | Warning | Hay lotes en disputa durante 15 min | [Escenario A](../runbooks/batch-close-failure.md#escenario-a--lote-en-disputed) |
 | `LotesCerradosSinEnviar` | Warning | `closed_unsent` > 0 durante 15 min | [Escenario C](../runbooks/batch-close-failure.md#escenario-c--lote-en-closed-sin-enviar) |
 | `LotesAbiertosVencidos` | Warning | `open_overdue` > 0 durante 30 min | [Escenario F](../runbooks/batch-close-failure.md#escenario-f--lotes-abiertos-de-días-anteriores) |
@@ -913,7 +921,6 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| Reversas anteriores sin recuperar | El comando las registra, pero hay que ejecutarlo en cada entorno, con aprobación | [Escenario E](../runbooks/batch-close-failure.md#escenario-e--reversas-anteriores-sin-descontar) |
 | Los lotes retenidos antes de `000007` no se liberan solos | No tienen guardado contra qué se conciliaron: siguen `DISPUTED` hasta un `resolve-dispute` o `reopen` | `SettlementBatch.Release` |
 | Una liberación fallida no se reintenta | Si falla después de cerrar la revisión, el lote sigue `DISPUTED`, con el log `could not release the held batch` | `ReleaseHeldBatch` |
 | Sin corrección en un lote ya enviado | `USE_PURCHASE_AMOUNT` y `EXCLUDE` no aplican a un lote `SUBMITTED` o `SETTLED`: el ajuste se hace con el procesador | `applyReviewAction` |

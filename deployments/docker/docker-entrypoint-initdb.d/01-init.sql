@@ -296,6 +296,17 @@ CREATE TABLE IF NOT EXISTS settlement.merchant_timezones (
     updated_by  TEXT        NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Tareas de mantenimiento ya ejecutadas en este entorno. Una base nueva no tiene reversas
+-- anteriores que recuperar: la recuperación queda hecha.
+CREATE TABLE IF NOT EXISTS settlement.maintenance_runs (
+    name         TEXT        PRIMARY KEY,
+    completed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_by TEXT        NOT NULL,
+    details      TEXT
+);
+INSERT INTO settlement.maintenance_runs (name, completed_by, details)
+VALUES ('reversal-recovery', '01-init.sql', 'Base nueva: no hay reversas anteriores sin descontar')
+ON CONFLICT (name) DO NOTHING;
 
 -- notification
 CREATE TABLE IF NOT EXISTS notification.notifications (
