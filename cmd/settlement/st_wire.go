@@ -124,18 +124,23 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	batchHandler.SetReversalReviews(batchRepo)
 	batchHandler.SetMerchantTimezones(batchRepo)
 	batchHandler.SetMaxCloseAge(cfg.Settlement.CloseMaxAgeDays)
+	batchHandler.SetCloseGrace(cfg.Settlement.BatchCloseGrace)
+	batchHandler.SetBatchReopens(batchRepo)
+	batchHandler.SetAuditLog(batchRepo)
 	businessLocation, err := time.LoadLocation(cfg.Settlement.BusinessTimezone)
 	if err != nil {
 		return nil, fmt.Errorf("wire: load business timezone: %w", err)
 	}
 	batchHandler.SetBusinessLocation(businessLocation)
-	if err := command.RegisterBatchAttentionGauge(batchRepo, businessLocation); err != nil {
+	if err := command.RegisterBatchAttentionGauge(batchRepo, businessLocation, cfg.Settlement.BatchCloseGrace); err != nil {
 		return nil, fmt.Errorf("wire: register batch attention gauge: %w", err)
 	}
 	adminHandler := command.NewAdminHandler(batchRepo, processor)
 	adminHandler.ConfigureSettlement(pool, batchRepo, eventPub, outboxStore, cfg.Settlement.MDRPercent)
 	adminHandler.SetReversalReviews(batchRepo)
 	adminHandler.SetMerchantTimezones(batchRepo)
+	adminHandler.SetBusinessLocation(businessLocation)
+	adminHandler.SetBatchReleaser(batchHandler)
 	queryHandler := query.NewBatchQueryHandler(batchRepo)
 	queryHandler.ConfigureReviews(batchRepo)
 	queryHandler.ConfigureTimezones(batchRepo, cfg.Settlement.BusinessTimezone)
@@ -253,7 +258,7 @@ func (a *app) start(ctx context.Context) error {
 	// Tokens de la API — se pueden cambiar sin reiniciar
 	go a.adminTokens.Run(ctx, adminTokensReload)
 
-	// Job de cierre automático de lotes — revisa cada 15 minutos desde BatchCloseHour UTC
+	// Job de cierre automático de lotes — revisa cada 15 minutos, todo el día
 	go a.runBatchCloser(ctx)
 	slog.Info("batch closer job active")
 
@@ -264,13 +269,15 @@ func (a *app) start(ctx context.Context) error {
 // baja o una rotación.
 const adminTokensReload = 30 * time.Second
 
-// batchCloseSweep es cada cuánto se buscan lotes vencidos desde BatchCloseHour. Cada
-// comercio puede tener otra medianoche: hay zonas con desfasajes de 15, 30 y 45 minutos.
+// batchCloseSweep es cada cuánto se buscan lotes vencidos. Corre todo el día porque cada
+// comercio tiene su medianoche, y hay zonas con desfasajes de 15, 30 y 45 minutos.
 const batchCloseSweep = 15 * time.Minute
 
 // runBatchCloser es el job periódico de cierre automático de lotes. Comprueba cada
 // minuto, y también al arrancar, para no perder la corrida si el servicio estaba
-// caído a la hora de cierre. Reintenta mientras la última corrida tenga fallas.
+// caído a la hora de cierre; barre una vez por cada tramo de batchCloseSweep. Reintenta
+// mientras la última corrida tenga fallas. Cada lote se cierra después de la medianoche de su
+// comercio más el plazo configurado: eso lo decide la consulta, no la hora del job.
 func (a *app) runBatchCloser(ctx context.Context) {
 	if a.batchCloseHour == 0 {
 		slog.Info("automatic batch close disabled")
@@ -284,7 +291,7 @@ func (a *app) runBatchCloser(ctx context.Context) {
 	run := func(now time.Time) {
 		utc := now.UTC()
 		sweep := utc.Truncate(batchCloseSweep)
-		if utc.Hour() < a.batchCloseHour || sweep.Equal(lastSweep) {
+		if sweep.Equal(lastSweep) {
 			return
 		}
 

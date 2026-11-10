@@ -55,8 +55,9 @@ func (r *SettlementBatchRepo) SaveTx(ctx context.Context, tx pgx.Tx, b *aggregat
 			id, terminal_id, merchant_id, batch_date, state, currency,
 			total_count, total_amount, purchase_count, purchase_amount,
 			reversal_count, reversal_amount, discrepancies,
-			created_at, closed_at, submitted_at, settled_at, version
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+			created_at, closed_at, submitted_at, settled_at, version,
+			reconciled_with, terminal_count, terminal_amount
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NULLIF($19,''),$20,$21)
 		ON CONFLICT (id) DO UPDATE SET
 			state           = EXCLUDED.state,
 			total_count     = EXCLUDED.total_count,
@@ -69,7 +70,10 @@ func (r *SettlementBatchRepo) SaveTx(ctx context.Context, tx pgx.Tx, b *aggregat
 			closed_at       = EXCLUDED.closed_at,
 			submitted_at    = EXCLUDED.submitted_at,
 			settled_at      = EXCLUDED.settled_at,
-			version         = EXCLUDED.version
+			version         = EXCLUDED.version,
+			reconciled_with = EXCLUDED.reconciled_with,
+			terminal_count  = EXCLUDED.terminal_count,
+			terminal_amount = EXCLUDED.terminal_amount
 		WHERE settlement.settlement_batches.version = EXCLUDED.version - 1
 	`
 
@@ -78,6 +82,7 @@ func (r *SettlementBatchRepo) SaveTx(ctx context.Context, tx pgx.Tx, b *aggregat
 		totalAmount, purchaseAmount, reversalAmount *int64
 	)
 
+	terminalCount, terminalAmount := b.TerminalTotals()
 	if s := b.Summary(); s != nil {
 		tc := s.TotalCount()
 		pc := s.PurchaseCount()
@@ -101,6 +106,7 @@ func (r *SettlementBatchRepo) SaveTx(ctx context.Context, tx pgx.Tx, b *aggregat
 		reversalCount, reversalAmount,
 		b.Discrepancies(),
 		b.CreatedAt(), b.ClosedAt(), b.SubmittedAt(), b.SettledAt(), b.Version()+1,
+		b.ReconciledWith(), terminalCount, terminalAmount,
 	)
 	if err != nil {
 		return fmt.Errorf("SettlementBatchRepo.Save: upsert batch: %w", err)
@@ -141,9 +147,27 @@ var requiredTables = []string{
 	"settlement.merchant_timezones",
 }
 
-// MissingTables devuelve las tablas requeridas que no existen en la base.
+// requiredColumns son las columnas agregadas por migraciones sobre tablas existentes, como
+// "schema.tabla.columna". Sin ellas, cada guardado de un lote falla.
+var requiredColumns = []string{
+	"settlement.settlement_batches.reconciled_with",
+	"settlement.settlement_batches.terminal_count",
+	"settlement.settlement_batches.terminal_amount",
+	"settlement.reversal_reviews.action",
+}
+
+// MissingTables devuelve las tablas y columnas requeridas que no existen en la base.
 func (r *SettlementBatchRepo) MissingTables(ctx context.Context) ([]string, error) {
-	rows, err := r.pool.Query(ctx, `SELECT t FROM unnest($1::text[]) AS t WHERE to_regclass(t) IS NULL ORDER BY t`, requiredTables)
+	const q = `
+		SELECT t FROM unnest($1::text[]) AS t WHERE to_regclass(t) IS NULL
+		UNION ALL
+		SELECT c FROM unnest($2::text[]) AS c
+		WHERE NOT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = split_part(c, '.', 1) AND table_name = split_part(c, '.', 2)
+			  AND column_name = split_part(c, '.', 3))
+		ORDER BY 1`
+	rows, err := r.pool.Query(ctx, q, requiredTables, requiredColumns)
 	if err != nil {
 		return nil, fmt.Errorf("MissingTables: query: %w", err)
 	}
@@ -161,6 +185,18 @@ func (r *SettlementBatchRepo) MissingTables(ctx context.Context) ([]string, erro
 		return nil, fmt.Errorf("MissingTables: rows: %w", err)
 	}
 	return missing, nil
+}
+
+// WasReopened informa si el lote tiene un reopen en la auditoría.
+func (r *SettlementBatchRepo) WasReopened(ctx context.Context, batchID string) (bool, error) {
+	var reopened bool
+	err := r.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM settlement.batch_audit_log WHERE batch_id = $1 AND action = $2)`,
+		batchID, repository.AuditActionReopen).Scan(&reopened)
+	if err != nil {
+		return false, fmt.Errorf("WasReopened: %w", err)
+	}
+	return reopened, nil
 }
 
 // InsertAuditTx guarda un registro de auditoría dentro de tx.
@@ -238,10 +274,11 @@ func (r *SettlementBatchRepo) InsertReversalReviewTx(ctx context.Context, tx pgx
 	return nil
 }
 
-// ReconcileReversalReviewTx compara la compra recién llegada con la reversa que la esperaba.
-func (r *SettlementBatchRepo) ReconcileReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID string, p repository.ReversalPurchase) (string, bool, error) {
+// ReconcileReversalReviewTx compara la compra recién llegada con la reversa que la esperaba, o
+// con la reversa que un operador excluyó sin tener la compra.
+func (r *SettlementBatchRepo) ReconcileReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID, purchaseBatchID string, p repository.ReversalPurchase) (repository.ReviewReconciliation, error) {
 	if err := lockReversalPair(ctx, tx, transactionID); err != nil {
-		return "", false, fmt.Errorf("ReconcileReversalReviewTx: %w", err)
+		return repository.ReviewReconciliation{}, fmt.Errorf("ReconcileReversalReviewTx: %w", err)
 	}
 	const q = `
 		WITH checked AS (
@@ -261,20 +298,93 @@ func (r *SettlementBatchRepo) ReconcileReversalReviewTx(ctx context.Context, tx 
 		    resolution  = CASE WHEN c.mismatch IS NULL THEN 'La compra llegó después y coincide' END
 		FROM checked c
 		WHERE r.transaction_id = c.transaction_id
-		RETURNING r.reason, r.resolved_at IS NOT NULL
+		RETURNING r.reason, r.resolved_at IS NOT NULL, r.batch_id::text
 	`
+	var out repository.ReviewReconciliation
+	err := tx.QueryRow(ctx, q, transactionID, p.MerchantID, p.AmountCents, p.Currency).Scan(&out.Reason, &out.Resolved, &out.BatchID)
+	if err == nil {
+		if out.Resolved {
+			out.Reason = ""
+		}
+		return out, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return repository.ReviewReconciliation{}, fmt.Errorf("ReconcileReversalReviewTx: %w", err)
+	}
+	return r.reconcileExcludedReversalTx(ctx, tx, transactionID, purchaseBatchID, p)
+}
+
+// reconcileExcludedReversalTx trata la compra de una reversa que un operador excluyó porque la
+// compra no estaba. Si coinciden, la reversa vuelve, en el lote de la compra: sin ella, la venta
+// sumaría como si no se hubiera anulado. Si no coinciden, la revisión se reabre en ese lote.
+func (r *SettlementBatchRepo) reconcileExcludedReversalTx(ctx context.Context, tx pgx.Tx, transactionID, purchaseBatchID string, p repository.ReversalPurchase) (repository.ReviewReconciliation, error) {
 	var (
-		reason   string
-		resolved bool
+		merchantID, currency string
+		amount               int64
 	)
-	err := tx.QueryRow(ctx, q, transactionID, p.MerchantID, p.AmountCents, p.Currency).Scan(&reason, &resolved)
+	err := tx.QueryRow(ctx, `
+		SELECT merchant_id::text, reversal_amount, reversal_currency
+		FROM settlement.reversal_reviews
+		WHERE transaction_id = $1 AND reason = 'PURCHASE_NOT_FOUND' AND action = $2 AND resolved_at IS NOT NULL
+		FOR UPDATE`, transactionID, repository.ReviewActionExclude).Scan(&merchantID, &amount, &currency)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
+		return repository.ReviewReconciliation{}, nil
 	}
 	if err != nil {
-		return "", false, fmt.Errorf("ReconcileReversalReviewTx: %w", err)
+		return repository.ReviewReconciliation{}, fmt.Errorf("ReconcileReversalReviewTx: find excluded reversal: %w", err)
 	}
-	return reason, resolved, nil
+
+	var mismatch string
+	switch {
+	case merchantID != p.MerchantID:
+		mismatch = repository.ReversalReviewMerchantMismatch
+	case currency != p.Currency:
+		mismatch = repository.ReversalReviewCurrencyMismatch
+	case amount != p.AmountCents:
+		mismatch = repository.ReversalReviewAmountMismatch
+	}
+
+	if mismatch != "" {
+		if _, err := tx.Exec(ctx, `
+			UPDATE settlement.reversal_reviews
+			SET batch_id = $2, reason = $3, purchase_merchant_id = $4::uuid, purchase_amount = $5, purchase_currency = $6,
+			    resolved_at = NULL, resolved_by = NULL, resolution = NULL
+			WHERE transaction_id = $1`,
+			transactionID, purchaseBatchID, mismatch, p.MerchantID, p.AmountCents, p.Currency); err != nil {
+			return repository.ReviewReconciliation{}, fmt.Errorf("ReconcileReversalReviewTx: reopen review: %w", err)
+		}
+		return repository.ReviewReconciliation{Reason: mismatch, Reopened: true, BatchID: purchaseBatchID}, nil
+	}
+
+	if err := r.InsertReversalTx(ctx, tx, purchaseBatchID, transactionID, amount, currency); err != nil {
+		return repository.ReviewReconciliation{}, fmt.Errorf("ReconcileReversalReviewTx: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE settlement.reversal_reviews
+		SET batch_id = $2, purchase_merchant_id = $3::uuid, purchase_amount = $4, purchase_currency = $5,
+		    resolved_at = now(), resolved_by = 'system', action = $6,
+		    resolution = 'La compra llegó después y coincide: la reversa excluida se restituyó'
+		WHERE transaction_id = $1`,
+		transactionID, purchaseBatchID, p.MerchantID, p.AmountCents, p.Currency, repository.ReviewActionRestore); err != nil {
+		return repository.ReviewReconciliation{}, fmt.Errorf("ReconcileReversalReviewTx: close review: %w", err)
+	}
+	return repository.ReviewReconciliation{Restored: true, BatchID: purchaseBatchID}, nil
+}
+
+// InsertReversalTx vuelve a agregar una reversa excluida a un lote.
+func (r *SettlementBatchRepo) InsertReversalTx(ctx context.Context, tx pgx.Tx, batchID, transactionID string, amountCents int64, currency string) error {
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO settlement.batch_transactions (id, batch_id, transaction_id, amount_cents, currency, tx_type, included_at)
+		VALUES (gen_random_uuid(), $1, $2, $3, $4, 'REVERSAL', now())
+		ON CONFLICT (transaction_id, tx_type) DO NOTHING`,
+		batchID, transactionID, amountCents, currency)
+	if err != nil {
+		return fmt.Errorf("InsertReversalTx: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("InsertReversalTx: reversal %s is already in a batch", transactionID)
+	}
+	return bumpBatchVersion(ctx, tx, batchID)
 }
 
 // CountOpenReversalReviews cuenta las revisiones abiertas de las reversas de un lote.
@@ -293,7 +403,7 @@ const reversalReviewColumns = `
 	r.transaction_id::text, r.batch_id::text, r.reason, r.merchant_id::text,
 	r.reversal_amount, r.reversal_currency,
 	r.purchase_merchant_id::text, r.purchase_amount, r.purchase_currency,
-	b.state, b.discrepancies, r.resolved_at IS NOT NULL, r.created_at`
+	b.state, b.discrepancies, r.resolved_at IS NOT NULL, r.created_at, COALESCE(r.action, '')`
 
 func scanReversalReview(row scanner) (*repository.StoredReversalReview, error) {
 	var (
@@ -305,7 +415,7 @@ func scanReversalReview(row scanner) (*repository.StoredReversalReview, error) {
 		&v.TransactionID, &v.BatchID, &v.Reason, &v.MerchantID,
 		&v.AmountCents, &v.Currency,
 		&purchaseMerchant, &purchaseAmount, &purchaseCurrency,
-		&v.BatchState, &v.Discrepancies, &v.Resolved, &v.CreatedAt,
+		&v.BatchState, &v.Discrepancies, &v.Resolved, &v.CreatedAt, &v.Action,
 	); err != nil {
 		return nil, err
 	}
@@ -412,14 +522,14 @@ func (r *SettlementBatchRepo) DeleteReversalTx(ctx context.Context, tx pgx.Tx, b
 	return bumpBatchVersion(ctx, tx, batchID)
 }
 
-// CloseReversalReviewTx cierra la revisión con el operador y la resolución indicados.
-func (r *SettlementBatchRepo) CloseReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID, operatorID, resolution string) error {
+// CloseReversalReviewTx cierra la revisión con el operador, la resolución y la acción indicados.
+func (r *SettlementBatchRepo) CloseReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID, operatorID, resolution, action string) error {
 	const q = `
 		UPDATE settlement.reversal_reviews
-		SET resolved_at = now(), resolved_by = $2, resolution = $3
+		SET resolved_at = now(), resolved_by = $2, resolution = $3, action = $4
 		WHERE transaction_id = $1 AND resolved_at IS NULL
 	`
-	if _, err := tx.Exec(ctx, q, transactionID, operatorID, resolution); err != nil {
+	if _, err := tx.Exec(ctx, q, transactionID, operatorID, resolution, action); err != nil {
 		return fmt.Errorf("CloseReversalReviewTx: %w", err)
 	}
 	return nil
@@ -438,25 +548,94 @@ func (r *SettlementBatchRepo) MerchantTimezone(ctx context.Context, merchantID s
 	return tz, nil
 }
 
-// SetMerchantTimezone guarda la zona, solo si Postgres la reconoce.
-func (r *SettlementBatchRepo) SetMerchantTimezone(ctx context.Context, merchantID, timezone, operatorID string) error {
-	const q = `
+// SetMerchantTimezone guarda la zona, solo si Postgres la reconoce, y mueve los lotes OPEN del
+// día a la fecha de la zona nueva. Todo en una transacción: si un lote choca con otro OPEN, no
+// cambia nada.
+func (r *SettlementBatchRepo) SetMerchantTimezone(ctx context.Context, merchantID, timezone, defaultTimezone, operatorID string) ([]repository.RedatedBatch, error) {
+	// La zona anterior es la propia del comercio o, si no tenía, la general. Solo se mueve el lote
+	// de hoy: los de días anteriores los cierra el job. now() es el inicio de la transacción.
+	const redateQ = `
+		WITH target AS (
+			SELECT b.id, b.batch_date AS old_date, b.discrepancies
+			FROM settlement.settlement_batches b
+			WHERE b.merchant_id = $1::uuid AND b.state = 'OPEN'
+			  AND b.batch_date = (now() AT TIME ZONE COALESCE(
+			        (SELECT timezone FROM settlement.merchant_timezones WHERE merchant_id = $1::uuid), $3::text))::date
+			  AND b.batch_date <> (now() AT TIME ZONE $2::text)::date
+			FOR UPDATE OF b
+		)
+		UPDATE settlement.settlement_batches b
+		SET batch_date = (now() AT TIME ZONE $2::text)::date, version = b.version + 1
+		FROM target t
+		WHERE b.id = t.id
+		RETURNING b.id::text, t.old_date::text, b.batch_date::text, t.discrepancies
+	`
+	const upsertQ = `
 		INSERT INTO settlement.merchant_timezones (merchant_id, timezone, updated_by)
-		SELECT $1::uuid, $2::text, $3::text
-		WHERE EXISTS (SELECT 1 FROM pg_timezone_names WHERE name = $2::text)
+		VALUES ($1::uuid, $2::text, $3::text)
 		ON CONFLICT (merchant_id) DO UPDATE
 		SET timezone = EXCLUDED.timezone, updated_by = EXCLUDED.updated_by, updated_at = now()
 	`
-	return pgutil.WithReadCommitted(ctx, r.pool, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, q, merchantID, timezone, operatorID)
+	var moved []repository.RedatedBatch
+	err := pgutil.WithReadCommitted(ctx, r.pool, func(tx pgx.Tx) error {
+		moved = nil
+		// Antes de usarla en una consulta: con una zona desconocida, AT TIME ZONE falla.
+		var known bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_timezone_names WHERE name = $1)`, timezone).Scan(&known); err != nil {
+			return fmt.Errorf("SetMerchantTimezone: check timezone: %w", err)
+		}
+		if !known {
+			return repository.ErrUnknownTimezone
+		}
+
+		rows, err := tx.Query(ctx, redateQ, merchantID, timezone, defaultTimezone)
 		if err != nil {
+			return redateError(err)
+		}
+		var discrepancies []int
+		for rows.Next() {
+			var (
+				b repository.RedatedBatch
+				d int
+			)
+			if err := rows.Scan(&b.BatchID, &b.FromDate, &b.ToDate, &d); err != nil {
+				rows.Close()
+				return fmt.Errorf("SetMerchantTimezone: scan: %w", err)
+			}
+			moved, discrepancies = append(moved, b), append(discrepancies, d)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return redateError(err)
+		}
+
+		if _, err := tx.Exec(ctx, upsertQ, merchantID, timezone, operatorID); err != nil {
 			return fmt.Errorf("SetMerchantTimezone: %w", err)
 		}
-		if tag.RowsAffected() == 0 {
-			return repository.ErrUnknownTimezone
+		for i, b := range moved {
+			if err := r.InsertAuditTx(ctx, tx, repository.BatchAuditEntry{
+				BatchID: b.BatchID, Action: repository.AuditActionRedate, OperatorID: operatorID,
+				Reason:    fmt.Sprintf("merchant timezone changed to %s: batch_date %s → %s", timezone, b.FromDate, b.ToDate),
+				FromState: "OPEN", ToState: "OPEN", PreviousDiscrepancies: discrepancies[i],
+			}); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return moved, nil
+}
+
+// redateError traduce el choque con el índice de un solo lote OPEN por terminal, fecha y moneda.
+func redateError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+		return repository.ErrOpenBatchConflict
+	}
+	return fmt.Errorf("SetMerchantTimezone: redate open batches: %w", err)
 }
 
 // ClosedTotalsForTerminalDay suma los totales de los lotes ya cerrados del terminal en la fecha.
@@ -523,7 +702,8 @@ func (r *SettlementBatchRepo) FindByID(ctx context.Context, id string) (*aggrega
 		SELECT id, terminal_id, merchant_id, batch_date, state, currency,
 		       total_count, total_amount, purchase_count, purchase_amount,
 		       reversal_count, reversal_amount, discrepancies,
-		       created_at, closed_at, submitted_at, settled_at, version
+		       created_at, closed_at, submitted_at, settled_at, version,
+		       reconciled_with, terminal_count, terminal_amount
 		FROM settlement.settlement_batches WHERE id = $1
 	`
 	row := r.pool.QueryRow(ctx, q, id)
@@ -551,7 +731,8 @@ func (r *SettlementBatchRepo) FindOpenByTerminal(
 		SELECT id, terminal_id, merchant_id, batch_date, state, currency,
 		       total_count, total_amount, purchase_count, purchase_amount,
 		       reversal_count, reversal_amount, discrepancies,
-		       created_at, closed_at, submitted_at, settled_at, version
+		       created_at, closed_at, submitted_at, settled_at, version,
+		       reconciled_with, terminal_count, terminal_amount
 		FROM settlement.settlement_batches
 		WHERE terminal_id = $1
 		  AND batch_date = $2::date
@@ -671,7 +852,8 @@ func (r *SettlementBatchRepo) ListByMerchantDate(
 		SELECT id, terminal_id, merchant_id, batch_date, state, currency,
 		       total_count, total_amount, purchase_count, purchase_amount,
 		       reversal_count, reversal_amount, discrepancies,
-		       created_at, closed_at, submitted_at, settled_at, version
+		       created_at, closed_at, submitted_at, settled_at, version,
+		       reconciled_with, terminal_count, terminal_amount
 		FROM settlement.settlement_batches
 		WHERE merchant_id = $1 AND batch_date = $2::date
 		ORDER BY created_at ASC
@@ -765,6 +947,9 @@ type rawBatch struct {
 	createdAt                                   time.Time
 	closedAt, submittedAt, settledAt            *time.Time
 	version                                     int
+	reconciledWith                              *string
+	terminalCount                               *int
+	terminalAmount                              *int64
 }
 
 type scanner interface {
@@ -781,6 +966,7 @@ func scanBatch(row scanner) (*rawBatch, error) {
 		&b.reversalCount, &b.reversalAmount,
 		&b.discrepancies,
 		&b.createdAt, &b.closedAt, &b.submittedAt, &b.settledAt, &b.version,
+		&b.reconciledWith, &b.terminalCount, &b.terminalAmount,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -841,6 +1027,12 @@ func toBatchParams(b *rawBatch, txs []*entity.BatchTransaction) aggregate.Recons
 		ClosedAt:      b.closedAt,
 		SubmittedAt:   b.submittedAt,
 		SettledAt:     b.settledAt,
+
+		TerminalCount:  b.terminalCount,
+		TerminalAmount: b.terminalAmount,
+	}
+	if b.reconciledWith != nil {
+		params.ReconciledWith = *b.reconciledWith
 	}
 
 	if b.totalCount != nil && b.totalAmount != nil {

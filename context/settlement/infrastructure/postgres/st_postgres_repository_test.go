@@ -27,7 +27,7 @@ func TestSave_NoSummary_NoTransactions(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(18)...).
+		WithArgs(anyArgs(21)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectCommit()
 	pool.ExpectRollback()
@@ -44,7 +44,7 @@ func TestSave_WithSummaryAndTransactions(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(18)...).
+		WithArgs(anyArgs(21)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectExec("INSERT INTO settlement.batch_transactions").
 		WithArgs(anyArgs(7)...).
@@ -70,7 +70,7 @@ func TestSave_MultipleTransactions(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(18)...).
+		WithArgs(anyArgs(21)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectExec("INSERT INTO settlement.batch_transactions").
 		WithArgs(anyArgs(7)...).
@@ -91,7 +91,7 @@ func TestSave_UpsertBatchError(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(18)...).
+		WithArgs(anyArgs(21)...).
 		WillReturnError(errors.New("connection reset"))
 	pool.ExpectRollback()
 
@@ -111,7 +111,7 @@ func TestSave_InsertBatchTransactionError(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(18)...).
+		WithArgs(anyArgs(21)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectExec("INSERT INTO settlement.batch_transactions").
 		WithArgs(anyArgs(7)...).
@@ -590,11 +590,11 @@ func TestListByMerchantDate_Success(t *testing.T) {
 			AddRow(row1.id, row1.terminalID, row1.merchantID, row1.batchDate, row1.state, row1.currency,
 				row1.totalCount, row1.totalAmount, row1.purchaseCount, row1.purchaseAmount,
 				row1.reversalCount, row1.reversalAmount, row1.discrepancies,
-				row1.createdAt, row1.closedAt, row1.submittedAt, row1.settledAt, row1.version).
+				row1.createdAt, row1.closedAt, row1.submittedAt, row1.settledAt, row1.version, row1.reconciledWith, row1.terminalCount, row1.terminalAmount).
 			AddRow(row2.id, row2.terminalID, row2.merchantID, row2.batchDate, row2.state, row2.currency,
 				row2.totalCount, row2.totalAmount, row2.purchaseCount, row2.purchaseAmount,
 				row2.reversalCount, row2.reversalAmount, row2.discrepancies,
-				row2.createdAt, row2.closedAt, row2.submittedAt, row2.settledAt, row2.version))
+				row2.createdAt, row2.closedAt, row2.submittedAt, row2.settledAt, row2.version, row2.reconciledWith, row2.terminalCount, row2.terminalAmount))
 	pool.ExpectQuery("FROM settlement.batch_transactions").
 		WithArgs(row1.id).
 		WillReturnRows(emptyBatchTxRows())
@@ -745,7 +745,7 @@ func TestSave_StaleVersionReturnsErrStaleBatch(t *testing.T) {
 	b := newOpenBatch(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("WHERE settlement.settlement_batches.version = EXCLUDED.version - 1").
-		WithArgs(anyArgs(18)...).
+		WithArgs(anyArgs(21)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 0))
 	pool.ExpectRollback()
 
@@ -764,7 +764,7 @@ func TestSave_IncrementsVersionOnEachSave(t *testing.T) {
 	repo := postgres.NewSettlementBatchRepo(pool)
 
 	for want := 1; want <= 2; want++ {
-		args := anyArgs(18)
+		args := anyArgs(21)
 		args[17] = want // la versión nueva es el último argumento
 		pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		pool.ExpectExec("INSERT INTO settlement.settlement_batches").
@@ -791,7 +791,7 @@ func TestSave_ReversalUsesConflictOnTransactionAndType(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(18)...).
+		WithArgs(anyArgs(21)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectExec(`ON CONFLICT \(transaction_id, tx_type\) DO NOTHING`).
 		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), int64(750), "ARS", "REVERSAL", pgxmock.AnyArg()).
@@ -862,7 +862,7 @@ func TestSaveTx_UsesCallerTransaction(t *testing.T) {
 
 	pool.ExpectBegin()
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(18)...).
+		WithArgs(anyArgs(21)...).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	pool.ExpectCommit()
 
@@ -1054,26 +1054,79 @@ func TestReconcileReversalReviewTx(t *testing.T) {
 
 	expectReversalLock(pool, "tx-1")
 	pool.ExpectQuery("UPDATE settlement.reversal_reviews").WithArgs("tx-1", "m-1", int64(1000), "ARS").
-		WillReturnRows(pgxmock.NewRows([]string{"reason", "resolved"}).AddRow(repository.ReversalReviewPurchaseNotFound, true))
+		WillReturnRows(pgxmock.NewRows([]string{"reason", "resolved", "batch"}).AddRow(repository.ReversalReviewPurchaseNotFound, true, "b-rev"))
 
-	reason, resolved, err := repo.ReconcileReversalReviewTx(context.Background(), tx, "tx-1",
+	got, err := repo.ReconcileReversalReviewTx(context.Background(), tx, "tx-1", "b-purchase",
 		repository.ReversalPurchase{MerchantID: "m-1", AmountCents: 1000, Currency: "ARS"})
-	if err != nil || !resolved || reason != repository.ReversalReviewPurchaseNotFound {
-		t.Errorf("ReconcileReversalReviewTx() = %q, %v, %v", reason, resolved, err)
+	want := repository.ReviewReconciliation{Resolved: true, BatchID: "b-rev"}
+	if err != nil || got != want {
+		t.Errorf("ReconcileReversalReviewTx() = %+v, %v, want %+v", got, err, want)
 	}
 }
 
-func TestReconcileReversalReviewTx_NoOpenReview(t *testing.T) {
+// expectNoOpenReview simula que no había una revisión abierta esperando la compra.
+func expectNoOpenReview(pool pgxmock.PgxPoolIface) {
+	expectReversalLock(pool, "tx-1")
+	pool.ExpectQuery("UPDATE settlement.reversal_reviews").WithArgs(anyArgs(4)...).WillReturnError(pgx.ErrNoRows)
+}
+
+func TestReconcileReversalReviewTx_NoReview(t *testing.T) {
 	pool := newMockPool(t)
 	repo := postgres.NewSettlementBatchRepo(pool)
 	tx := reviewTx(t, pool)
 
-	expectReversalLock(pool, "tx-1")
-	pool.ExpectQuery("UPDATE settlement.reversal_reviews").WithArgs(anyArgs(4)...).WillReturnError(pgx.ErrNoRows)
+	expectNoOpenReview(pool)
+	pool.ExpectQuery("action = ").WithArgs("tx-1", "EXCLUDE").WillReturnError(pgx.ErrNoRows)
 
-	reason, resolved, err := repo.ReconcileReversalReviewTx(context.Background(), tx, "tx-1", repository.ReversalPurchase{})
-	if err != nil || resolved || reason != "" {
-		t.Errorf("ReconcileReversalReviewTx() = %q, %v, %v, want empty", reason, resolved, err)
+	got, err := repo.ReconcileReversalReviewTx(context.Background(), tx, "tx-1", "b-purchase", repository.ReversalPurchase{})
+	if err != nil || got != (repository.ReviewReconciliation{}) {
+		t.Errorf("ReconcileReversalReviewTx() = %+v, %v, want empty", got, err)
+	}
+}
+
+// Una reversa excluida sin la compra vuelve, en el lote de la compra, si la compra coincide.
+func TestReconcileReversalReviewTx_RestoresExcludedReversal(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	tx := reviewTx(t, pool)
+
+	expectNoOpenReview(pool)
+	pool.ExpectQuery("action = ").WithArgs("tx-1", "EXCLUDE").
+		WillReturnRows(pgxmock.NewRows([]string{"merchant", "amount", "currency"}).AddRow("m-1", int64(1000), "ARS"))
+	pool.ExpectExec("INSERT INTO settlement.batch_transactions").WithArgs("b-purchase", "tx-1", int64(1000), "ARS").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectExec("UPDATE settlement.settlement_batches SET version").WithArgs("b-purchase").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	pool.ExpectExec("UPDATE settlement.reversal_reviews").
+		WithArgs("tx-1", "b-purchase", "m-1", int64(1000), "ARS", "RESTORE").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+	got, err := repo.ReconcileReversalReviewTx(context.Background(), tx, "tx-1", "b-purchase",
+		repository.ReversalPurchase{MerchantID: "m-1", AmountCents: 1000, Currency: "ARS"})
+	want := repository.ReviewReconciliation{Restored: true, BatchID: "b-purchase"}
+	if err != nil || got != want {
+		t.Errorf("ReconcileReversalReviewTx() = %+v, %v, want %+v", got, err, want)
+	}
+}
+
+// Si la compra no coincide con la reversa excluida, la revisión se reabre en el lote de la compra.
+func TestReconcileReversalReviewTx_ReopensExcludedReversal(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	tx := reviewTx(t, pool)
+
+	expectNoOpenReview(pool)
+	pool.ExpectQuery("action = ").WithArgs("tx-1", "EXCLUDE").
+		WillReturnRows(pgxmock.NewRows([]string{"merchant", "amount", "currency"}).AddRow("m-1", int64(1000), "ARS"))
+	pool.ExpectExec("resolved_at = NULL").
+		WithArgs("tx-1", "b-purchase", repository.ReversalReviewAmountMismatch, "m-1", int64(1500), "ARS").
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+
+	got, err := repo.ReconcileReversalReviewTx(context.Background(), tx, "tx-1", "b-purchase",
+		repository.ReversalPurchase{MerchantID: "m-1", AmountCents: 1500, Currency: "ARS"})
+	want := repository.ReviewReconciliation{Reason: repository.ReversalReviewAmountMismatch, Reopened: true, BatchID: "b-purchase"}
+	if err != nil || got != want {
+		t.Errorf("ReconcileReversalReviewTx() = %+v, %v, want %+v", got, err, want)
 	}
 }
 
@@ -1096,7 +1149,7 @@ func TestFindPurchaseTx_LockError(t *testing.T) {
 }
 
 func reviewRows() *pgxmock.Rows {
-	return pgxmock.NewRows([]string{"tx", "batch", "reason", "merchant", "amount", "currency", "pm", "pa", "pc", "state", "disc", "resolved", "created"})
+	return pgxmock.NewRows([]string{"tx", "batch", "reason", "merchant", "amount", "currency", "pm", "pa", "pc", "state", "disc", "resolved", "created", "action"})
 }
 
 func TestListOpenReversalReviews(t *testing.T) {
@@ -1107,8 +1160,8 @@ func TestListOpenReversalReviews(t *testing.T) {
 
 	pool.ExpectQuery("FROM settlement.reversal_reviews r").WithArgs(10).
 		WillReturnRows(reviewRows().
-			AddRow("tx-1", "b-1", repository.ReversalReviewPurchaseNotFound, "m-1", int64(1000), "ARS", (*string)(nil), (*int64)(nil), (*string)(nil), "OPEN", 0, false, created).
-			AddRow("tx-2", "b-1", repository.ReversalReviewAmountMismatch, "m-1", int64(1000), "ARS", &merchant, &amount, &currency, "DISPUTED", 1, false, created))
+			AddRow("tx-1", "b-1", repository.ReversalReviewPurchaseNotFound, "m-1", int64(1000), "ARS", (*string)(nil), (*int64)(nil), (*string)(nil), "OPEN", 0, false, created, "").
+			AddRow("tx-2", "b-1", repository.ReversalReviewAmountMismatch, "m-1", int64(1000), "ARS", &merchant, &amount, &currency, "DISPUTED", 1, false, created, ""))
 
 	got, err := repo.ListOpenReversalReviews(context.Background(), 10)
 	if err != nil {
@@ -1139,7 +1192,7 @@ func TestLockReversalReviewTx_LocksBatchBeforeReview(t *testing.T) {
 	pool.ExpectExec("FROM settlement.settlement_batches WHERE id = .* FOR UPDATE").WithArgs("b-1").
 		WillReturnResult(pgxmock.NewResult("SELECT", 1))
 	pool.ExpectQuery("FOR UPDATE OF r").WithArgs("tx-1").
-		WillReturnRows(reviewRows().AddRow("tx-1", "b-1", repository.ReversalReviewPurchaseNotFound, "m-1", int64(1000), "ARS", (*string)(nil), (*int64)(nil), (*string)(nil), "OPEN", 0, false, time.Now()))
+		WillReturnRows(reviewRows().AddRow("tx-1", "b-1", repository.ReversalReviewPurchaseNotFound, "m-1", int64(1000), "ARS", (*string)(nil), (*int64)(nil), (*string)(nil), "OPEN", 0, false, time.Now(), ""))
 
 	got, err := repo.LockReversalReviewTx(context.Background(), tx, "tx-1")
 	if err != nil || got == nil || got.BatchID != "b-1" {
@@ -1229,13 +1282,64 @@ func TestSetMerchantTimezone_UnknownToDatabase(t *testing.T) {
 	repo := postgres.NewSettlementBatchRepo(pool)
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	pool.ExpectExec("INSERT INTO settlement.merchant_timezones").WithArgs("m-1", "Mars/Base", "op-1").
-		WillReturnResult(pgxmock.NewResult("INSERT", 0))
+	pool.ExpectQuery("FROM pg_timezone_names").WithArgs("Mars/Base").
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(false))
 	pool.ExpectRollback()
 
-	err := repo.SetMerchantTimezone(context.Background(), "m-1", "Mars/Base", "op-1")
+	_, err := repo.SetMerchantTimezone(context.Background(), "m-1", "Mars/Base", "UTC", "op-1")
 	if !errors.Is(err, repository.ErrUnknownTimezone) {
 		t.Fatalf("error = %v, want ErrUnknownTimezone", err)
+	}
+}
+
+// Mueve el lote de hoy, guarda la zona y audita el movimiento, en una transacción.
+func TestSetMerchantTimezone_RedatesTodaysOpenBatch(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectQuery("FROM pg_timezone_names").WithArgs("Asia/Tokyo").
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	pool.ExpectQuery("UPDATE settlement.settlement_batches b").
+		WithArgs("m-1", "Asia/Tokyo", "America/Argentina/Buenos_Aires").
+		WillReturnRows(pgxmock.NewRows([]string{"id", "old_date", "batch_date", "discrepancies"}).
+			AddRow("b-1", "2026-11-08", "2026-11-09", 0))
+	pool.ExpectExec("INSERT INTO settlement.merchant_timezones").WithArgs("m-1", "Asia/Tokyo", "op-1").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectExec("INSERT INTO settlement.batch_audit_log").
+		WithArgs("b-1", "REDATE", "op-1", "merchant timezone changed to Asia/Tokyo: batch_date 2026-11-08 → 2026-11-09",
+			"OPEN", "OPEN", 0, pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectCommit()
+	pool.ExpectRollback()
+
+	moved, err := repo.SetMerchantTimezone(context.Background(), "m-1", "Asia/Tokyo", "America/Argentina/Buenos_Aires", "op-1")
+	if err != nil {
+		t.Fatalf("SetMerchantTimezone() error = %v", err)
+	}
+	want := repository.RedatedBatch{BatchID: "b-1", FromDate: "2026-11-08", ToDate: "2026-11-09"}
+	if len(moved) != 1 || moved[0] != want {
+		t.Errorf("moved = %+v, want [%+v]", moved, want)
+	}
+}
+
+// Si un terminal ya tiene un lote OPEN en la fecha nueva, el índice único rechaza el movimiento
+// y no cambia nada: ni los lotes ni la zona.
+func TestSetMerchantTimezone_OpenBatchConflict(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectQuery("FROM pg_timezone_names").WithArgs("Asia/Tokyo").
+		WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(true))
+	pool.ExpectQuery("UPDATE settlement.settlement_batches b").
+		WithArgs("m-1", "Asia/Tokyo", "UTC").
+		WillReturnError(&pgconn.PgError{Code: "23505", ConstraintName: "uq_settlement_batches_open"})
+	pool.ExpectRollback()
+
+	_, err := repo.SetMerchantTimezone(context.Background(), "m-1", "Asia/Tokyo", "UTC", "op-1")
+	if !errors.Is(err, repository.ErrOpenBatchConflict) {
+		t.Fatalf("error = %v, want ErrOpenBatchConflict", err)
 	}
 }
 
@@ -1257,7 +1361,7 @@ func TestClosedTotalsForTerminalDay(t *testing.T) {
 
 func TestMissingTables(t *testing.T) {
 	pool := newMockPool(t)
-	pool.ExpectQuery("to_regclass").WithArgs(pgxmock.AnyArg()).
+	pool.ExpectQuery("to_regclass").WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).
 		WillReturnRows(pgxmock.NewRows([]string{"t"}).AddRow("settlement.outbox").AddRow("settlement.merchant_timezones"))
 
 	got, err := postgres.NewSettlementBatchRepo(pool).MissingTables(context.Background())
@@ -1271,7 +1375,7 @@ func TestMissingTables(t *testing.T) {
 
 func TestMissingTables_QueryError(t *testing.T) {
 	pool := newMockPool(t)
-	pool.ExpectQuery("to_regclass").WithArgs(pgxmock.AnyArg()).WillReturnError(errors.New("db down"))
+	pool.ExpectQuery("to_regclass").WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg()).WillReturnError(errors.New("db down"))
 
 	if _, err := postgres.NewSettlementBatchRepo(pool).MissingTables(context.Background()); err == nil {
 		t.Fatal("MissingTables() error = nil, want error")
@@ -1302,5 +1406,55 @@ func TestRequiredTables_MatchSchema(t *testing.T) {
 		if !required[table] {
 			t.Errorf("%s is in st_schema.sql but /readyz does not check it", table)
 		}
+	}
+}
+
+// Toda columna requerida debe estar en st_schema.sql, para que el schema y /readyz no se
+// separen.
+func TestRequiredColumns_MatchSchema(t *testing.T) {
+	schema, err := os.ReadFile("st_schema.sql")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	for _, col := range postgres.RequiredColumns() {
+		parts := strings.Split(col, ".")
+		table := regexp.MustCompile(`(?s)CREATE TABLE (?:IF NOT EXISTS )?` + regexp.QuoteMeta(parts[0]+"."+parts[1]) + ` \((.*?)\n\);`).FindSubmatch(schema)
+		if table == nil || !regexp.MustCompile(`(?m)^\s+`+parts[2]+`\s`).Match(table[1]) {
+			t.Errorf("%s is required but not in st_schema.sql", col)
+		}
+	}
+}
+
+func TestWasReopened(t *testing.T) {
+	for _, want := range []bool{true, false} {
+		pool := newMockPool(t)
+		pool.ExpectQuery("SELECT EXISTS \\(SELECT 1 FROM settlement.batch_audit_log").
+			WithArgs("batch-1", "REOPEN").
+			WillReturnRows(pgxmock.NewRows([]string{"exists"}).AddRow(want))
+
+		got, err := postgres.NewSettlementBatchRepo(pool).WasReopened(context.Background(), "batch-1")
+		if err != nil || got != want {
+			t.Errorf("WasReopened() = %v, %v, want %v, nil", got, err, want)
+		}
+	}
+}
+
+// La referencia de conciliación se lee de la base: sin ella, un lote retenido no se libera.
+func TestFindByID_ReadsTheReconciliationReference(t *testing.T) {
+	pool := newMockPool(t)
+	row := newBatchRow()
+	with, count, amount := "TERMINAL", 2, int64(1500)
+	row.reconciledWith, row.terminalCount, row.terminalAmount = &with, &count, &amount
+
+	pool.ExpectQuery("WHERE id =").WithArgs(row.id).WillReturnRows(row.rows())
+	pool.ExpectQuery("FROM settlement.batch_transactions").WithArgs(row.id).WillReturnRows(emptyBatchTxRows())
+
+	b, err := postgres.NewSettlementBatchRepo(pool).FindByID(context.Background(), row.id)
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	gotCount, gotAmount := b.TerminalTotals()
+	if b.ReconciledWith() != "TERMINAL" || gotCount == nil || *gotCount != 2 || gotAmount == nil || *gotAmount != 1500 {
+		t.Errorf("reference = %q, %v, %v, want TERMINAL, 2, 1500", b.ReconciledWith(), gotCount, gotAmount)
 	}
 }

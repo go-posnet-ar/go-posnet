@@ -34,8 +34,11 @@ func (f *fakeReviewLog) FindPurchaseTx(context.Context, pgx.Tx, string) (*reposi
 func (f *fakeReviewLog) InsertReversalReviewTx(context.Context, pgx.Tx, repository.ReversalReview) error {
 	return nil
 }
-func (f *fakeReviewLog) ReconcileReversalReviewTx(context.Context, pgx.Tx, string, repository.ReversalPurchase) (string, bool, error) {
-	return "", false, nil
+func (f *fakeReviewLog) ReconcileReversalReviewTx(context.Context, pgx.Tx, string, string, repository.ReversalPurchase) (repository.ReviewReconciliation, error) {
+	return repository.ReviewReconciliation{}, nil
+}
+func (f *fakeReviewLog) InsertReversalTx(context.Context, pgx.Tx, string, string, int64, string) error {
+	return nil
 }
 func (f *fakeReviewLog) CountOpenReversalReviews(context.Context, string) (int, error) { return 0, nil }
 func (f *fakeReviewLog) ListOpenReversalReviews(context.Context, int) ([]repository.StoredReversalReview, error) {
@@ -48,7 +51,7 @@ func (f *fakeReviewLog) UpdateReversalAmountTx(context.Context, pgx.Tx, string, 
 	return nil
 }
 func (f *fakeReviewLog) DeleteReversalTx(context.Context, pgx.Tx, string, string) error { return nil }
-func (f *fakeReviewLog) CloseReversalReviewTx(context.Context, pgx.Tx, string, string, string) error {
+func (f *fakeReviewLog) CloseReversalReviewTx(context.Context, pgx.Tx, string, string, string, string) error {
 	f.closed++
 	return nil
 }
@@ -66,8 +69,8 @@ type fakeTimezoneStore struct {
 func (f *fakeTimezoneStore) MerchantTimezone(context.Context, string) (string, error) {
 	return f.timezone, f.err
 }
-func (f *fakeTimezoneStore) SetMerchantTimezone(context.Context, string, string, string) error {
-	return f.setErr
+func (f *fakeTimezoneStore) SetMerchantTimezone(context.Context, string, string, string, string) ([]repository.RedatedBatch, error) {
+	return nil, f.setErr
 }
 
 func reviewMux(t *testing.T, reviews *fakeReviewLog, timezones *fakeTimezoneStore, expectTx bool) *http.ServeMux {
@@ -190,18 +193,20 @@ func TestGetMerchantTimezone(t *testing.T) {
 func TestSetMerchantTimezone_HTTP(t *testing.T) {
 	merchant := domain.NewMerchantID().String()
 	cases := []struct {
-		name string
-		body string
-		want int
+		name   string
+		body   string
+		setErr error
+		want   int
 	}{
-		{"válida", `{"timezone":"Asia/Tokyo","operator_id":"op"}`, 200},
-		{"zona inválida", `{"timezone":"Mars/Base","operator_id":"op"}`, 400},
-		{"sin operador", `{"timezone":"Asia/Tokyo"}`, 400},
-		{"cuerpo inválido", `{`, 400},
+		{"válida", `{"timezone":"Asia/Tokyo","operator_id":"op"}`, nil, 200},
+		{"zona inválida", `{"timezone":"Mars/Base","operator_id":"op"}`, nil, 400},
+		{"sin operador", `{"timezone":"Asia/Tokyo"}`, nil, 400},
+		{"cuerpo inválido", `{`, nil, 400},
+		{"choca con un lote abierto", `{"timezone":"Asia/Tokyo","operator_id":"op"}`, repository.ErrOpenBatchConflict, 409},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rec := serve(reviewMux(t, &fakeReviewLog{}, &fakeTimezoneStore{}, false), http.MethodPut, "/merchants/"+merchant+"/timezone", tc.body)
+			rec := serve(reviewMux(t, &fakeReviewLog{}, &fakeTimezoneStore{setErr: tc.setErr}, false), http.MethodPut, "/merchants/"+merchant+"/timezone", tc.body)
 			if rec.Code != tc.want {
 				t.Errorf("got %d %s, want %d", rec.Code, rec.Body, tc.want)
 			}

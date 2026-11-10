@@ -197,6 +197,24 @@ dejan en `DISPUTED`, aunque los totales coincidan. `resubmit` lo pasa a `DISPUTE
 `400`: primero hay que cerrar la revisión. La revisión se cierra con
 [`POST /reversal-reviews/{transaction_id}/resolve`](#revisiones-de-reversas).
 
+**Al cerrarse la última revisión de un lote `DISPUTED`, el lote se vuelve a conciliar,** con sus transacciones
+actuales, haya cerrado la revisión el sistema o un operador. El cierre guarda contra qué se concilió:
+
+| El lote se cerró | Se compara con | Si coincide | Si no |
+|---|---|---|---|
+| Por el terminal | Los totales que informó el terminal | Pasa a `CLOSED` y se envía | Sigue `DISPUTED`, con las discrepancias recalculadas |
+| Por el job, `force-close` o `resolve-dispute` | Nada: no hay totales del terminal | Pasa a `CLOSED` y se envía | — |
+| Antes de `000007` | No se sabe | No se libera: `resolve-dispute` o `reopen` | — |
+
+La liberación queda en la auditoría como `AUTO_RELEASE`, con `operator_id` `system`. Corre después de cerrar la
+revisión, en su propia transacción: si falla, la revisión ya está cerrada y el lote sigue `DISPUTED`, con un log
+`could not release the held batch`. La alerta `LotesEnDisputa` lo muestra, y se resuelve con `resolve-dispute`.
+
+**Una reversa excluida vuelve si llega su compra.** `EXCLUDE` sobre una revisión `PURCHASE_NOT_FOUND` saca la
+reversa porque la compra no estaba. Si la compra llega después y coincide, la reversa se agrega al lote de la compra,
+que queda con el monto neto, y la revisión queda resuelta por `system` con la acción `RESTORE`. Si no coincide, la
+revisión se reabre con el motivo nuevo en el lote de la compra, que queda retenido hasta que un operador decida.
+
 **Las reversas anteriores a esta corrección se recuperan con un comando,** que hay que ejecutar en cada entorno:
 se descartaron, y su evento ya figura como procesado. Ver el
 [Escenario E](../runbooks/batch-close-failure.md#escenario-e--reversas-anteriores-sin-descontar).
@@ -245,27 +263,36 @@ Los lotes se agrupan por día de negocio, en la zona del comercio. Sin una zona 
 pertenece a ese día, aunque en UTC ya sea el siguiente.
 
 La zona propia se define con [`PUT /merchants/{merchant_id}/timezone`](#zona-horaria-de-un-comercio) y rige para las
-operaciones siguientes: los lotes ya creados conservan su fecha. Conviene cambiarla fuera del horario de venta del
-comercio, porque una venta posterior puede abrir otro lote con otra fecha.
+operaciones siguientes. **Los lotes `OPEN` del comercio fechados hoy en la zona anterior pasan a hoy en la nueva,** en
+la misma transacción, para que la venta siguiente no abra otro lote. Los de días anteriores conservan su fecha y los
+cierra el job. Si un terminal ya tiene un lote `OPEN` en la fecha nueva, el cambio responde `409` y no cambia nada.
 
 El cierre usa el `batch_date` que informa el terminal. Sin él, usa el día de negocio del pedido. Terminal
 Gateway rechaza una moneda o una fecha inválidas.
 
-**Settlement rechaza un `batch_date` futuro o más antiguo que `SETTLEMENT_CLOSE_MAX_AGE_DAYS`** (7 por defecto), medido
-desde el día de negocio del pedido. El evento se descarta sin reintentos, con un log `permanent error`, y el terminal
-no recibe respuesta: Terminal Gateway ya respondió `202`.
+El día que se puede cerrar, medido desde el día de negocio del pedido:
+
+| `batch_date` | Resultado |
+|---|---|
+| Hoy o ayer | Se cierra. Ayer es el caso del terminal que cierra después de medianoche, antes que el job |
+| Anterior a ayer, de un lote que un operador reabrió con `reopen` | Se cierra: es la [vuelta a cerrar](#57-disputas) de una disputa |
+| Anterior a ayer, de un lote que nadie reabrió | Se rechaza (`not_reopened`): el terminal se equivocó de día, y sus totales darían una disputa falsa |
+| Futuro (`future`) o más antiguo que `SETTLEMENT_CLOSE_MAX_AGE_DAYS` (`too_old`, 7 días por defecto) | Se rechaza |
+
+Un rechazo descarta el evento sin reintentos, con un log `permanent error` y la métrica
+`posnet_settlement_batch_close_rejected_total{reason}`. El terminal no recibe respuesta: Terminal Gateway ya
+respondió `202`. Si no hay un lote `OPEN` para esa fecha, no se rechaza: se confirma sin hacer nada, como siempre.
 
 Las fechas de los lotes creados antes del día de negocio siguen en UTC.
 
 ### 5.6 Cierre automático
 
-Con `SETTLEMENT_BATCH_CLOSE_HOUR` en 3 (00:00 en Argentina), el job revisa **cada 15 minutos desde las 03:00 UTC y
-hasta el fin del día UTC**, para alcanzar la medianoche de cada comercio. Esa hora es **UTC**. Un comercio cuya
-medianoche cae antes de esa hora espera hasta ella: con el valor 3, le pasa a las zonas UTC-1 y UTC-2. También
-corre al arrancar, por si el servicio estaba caído. Con el valor `0` queda desactivado.
+El job revisa **cada 15 minutos, todo el día**, y al arrancar, por si el servicio estaba caído. Cada lote vence a
+la **medianoche de su comercio más `SETTLEMENT_BATCH_CLOSE_GRACE`** (30 min por defecto): es el plazo para que el
+terminal lo cierre él y concilie. Con `SETTLEMENT_BATCH_CLOSE_HOUR=0` queda desactivado.
 
-1. Busca los lotes `OPEN` de **días de negocio anteriores**, en la zona de cada comercio. No toca el lote del
-   día, porque sigue recibiendo ventas.
+1. Busca los lotes `OPEN` de **días de negocio anteriores** que ya vencieron, en la zona de cada comercio. No
+   toca el lote del día, porque sigue recibiendo ventas.
 2. Los cierra con los totales del backend: **no hay conciliación**, porque el terminal no informó los
    suyos, y por eso tampoco hay discrepancias.
 3. Encola `batch-closed` en la misma transacción y envía el lote al procesador. Un lote vacío solo se cierra.
@@ -283,7 +310,8 @@ siguiente.
 | `resolve-dispute` | `DISPUTED` → `CLOSED`. Recalcula con las transacciones actuales y deja las discrepancias en 0 | El backend es correcto y los totales del terminal no |
 
 **Para volver a cerrar un lote de otro día,** el pedido debe informar su `batch_date`, dentro de
-`SETTLEMENT_CLOSE_MAX_AGE_DAYS`. Si no llega ninguno, lo cierra el job automático al día siguiente, sin conciliar.
+`SETTLEMENT_CLOSE_MAX_AGE_DAYS`. Un lote anterior a ayer solo se puede cerrar así si se reabrió con `reopen`. Si no
+llega ningún pedido, lo cierra el job automático al día siguiente, sin conciliar.
 
 **`reopen` falla si ya hay otro lote `OPEN`** de ese terminal, día y moneda, porque solo puede haber uno. En
 ese caso, usar `resolve-dispute`.
@@ -520,21 +548,28 @@ el estado actual del lote.
 | `EXCLUDE` | Quita la reversa del lote | Si el lote está en `OPEN` o `DISPUTED` |
 
 Fuera de esos casos, o si la revisión ya está cerrada, responde `400` y no cambia nada. La corrección, el cierre de
-la revisión y la [auditoría](#auditoría-de-operadores) son atómicos. `resolved_by` es el operador. Los totales del lote se recalculan al volver a cerrarlo: **cerrar la revisión no libera el lote,** hay
-que usar `resolve-dispute` o `reopen`.
+la revisión y la [auditoría](#auditoría-de-operadores) son atómicos. `resolved_by` es el operador, y la acción queda
+en `reversal_reviews.action`. Si era la última revisión de un lote `DISPUTED`, después
+[se vuelve a conciliar](#52-reversa) y, si coincide, se libera y se envía.
+
+**Una revisión reabierta de una reversa excluida** (su compra llegó y no coincide) tiene la reversa fuera de todo
+lote: `ACCEPT` la deja excluida, `USE_PURCHASE_AMOUNT` la vuelve a agregar con el monto de la compra, y `EXCLUDE`
+responde `400`.
 
 ### Zona horaria de un comercio
 
 `PUT /merchants/{merchant_id}/timezone` responde `{"status": "updated"}`. Una zona que no reconozcan el servicio o
-Postgres responde `400`:
+Postgres responde `400`. Si mover el lote de hoy chocaría con otro lote `OPEN` de un terminal en la fecha nueva,
+responde `409` (`OPEN_BATCH_CONFLICT`) y no cambia nada: hay que cerrar antes ese lote. Ver
+[§5.5](#55-día-de-negocio):
 
 ```json
 { "timezone": "America/Mexico_City", "operator_id": "soporte-juan" }
 ```
 
 `GET` responde `{"merchant_id": "...", "timezone": "...", "source": "merchant"}`, o `"source": "default"` si el
-comercio usa la zona general. Quién hizo el cambio queda en `merchant_timezones.updated_by` y en los logs, no en
-`batch_audit_log`, que registra operaciones sobre lotes.
+comercio usa la zona general. Quién hizo el cambio queda en `merchant_timezones.updated_by` y en los logs. Cada lote
+movido queda además en `batch_audit_log`, con la acción `REDATE` y las dos fechas en `reason`.
 
 ### Confirmar la liquidación
 
@@ -636,8 +671,8 @@ Con 2.000 lotes y 400.000 transacciones, cargar un lote pasó de recorrer toda l
 
 ### Aplicar la migración
 
-**Una base existente necesita `000001`, `000003`, `000004`, `000005` y `000006` antes de desplegar esta versión del
-servicio.**
+**Una base existente necesita `000001`, `000003`, `000004`, `000005`, `000006` y `000007` antes de desplegar esta
+versión del servicio.**
 `01-init.sql` solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
 
 ```bash
@@ -647,20 +682,23 @@ psql "$POSTGRES_DSN" -f migrations/settlement/000003_outbox.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000004_batch_audit.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000005_reversal_reviews.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000006_merchant_timezones.up.sql
+psql "$POSTGRES_DSN" -f migrations/settlement/000007_release_held_batches.up.sql
 ```
 
 Son idempotentes y no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
 coincide con el de una base nueva.
 
-**Con una tabla faltante, `/readyz` responde `503` con `database schema incomplete`,** y el log `required tables are
-missing` la nombra. El `healthcheck` de Docker Compose usa `/readyz`, así que el contenedor queda `unhealthy`. Verifica
-las tablas, no las columnas: no detecta si falta `000001`. **`unhealthy` no reinicia el servicio ni frena el consumo de
+**Con una tabla faltante, o una columna de `000007`, `/readyz` responde `503` con `database schema incomplete`,** y el
+log `required tables are missing` la nombra. El `healthcheck` de Docker Compose usa `/readyz`, así que el contenedor
+queda `unhealthy`. Las columnas que verifica son solo las de `000007`: no detecta si falta `000001`. **`unhealthy` no reinicia el servicio ni frena el consumo de
 eventos:** mientras falte una tabla, los que la usen fallan y, al agotar los reintentos, se pierden.
 
 **Sin `000003`, fallan los cierres y las liquidaciones,** y `/metrics` deja de informar los lotes que
 requieren atención. **Sin `000004`, fallan las operaciones de administración.** **Sin `000005` o `000006`, fallan todas las ventas y reversas,**
-y al agotar los reintentos sus eventos se pierden. Sin `000006` también fallan los cierres. Las cuatro se pueden
-aplicar con el servicio anterior en marcha, porque solo agregan una tabla.
+y al agotar los reintentos sus eventos se pierden. Sin `000006` también fallan los cierres. **Sin `000007`, falla cada
+guardado de un lote:** ventas, reversas, cierres y operaciones. Todas se pueden aplicar con el servicio anterior en
+marcha, porque solo agregan tablas o columnas que admiten `NULL`. Los lotes cerrados antes de `000007` no tienen
+referencia de conciliación y no se liberan solos.
 
 `000002` crea los índices con `CONCURRENTLY`, sin bloquear las escrituras, y por eso no puede correr dentro de
 una transacción: no usar `psql -1`. Si se interrumpe, puede dejar un índice inválido: hay que borrarlo y volver
@@ -672,7 +710,8 @@ decisión financiera, y el script no los borra. `000003_outbox.down.sql` tambié
 quedan eventos sin publicar: hay que esperar a que salgan. `000004_batch_audit.down.sql` falla si hay
 registros de auditoría, para no perderlos. `000005_reversal_reviews.down.sql` falla si hay revisiones abiertas, y
 exige volver antes a una versión del servicio que no use la tabla. `000006_merchant_timezones.down.sql` exige lo
-mismo: los comercios configurados vuelven a la zona general.
+mismo: los comercios configurados vuelven a la zona general. `000007_release_held_batches.down.sql` también: se pierde
+la referencia de conciliación de los lotes y la acción de las revisiones.
 
 ### Auditoría de operadores
 
@@ -682,7 +721,7 @@ lote no cambia.
 
 | Columna | Contenido |
 |---|---|
-| `action` | `FORCE_CLOSE`, `RESUBMIT`, `RESUBMIT_BLOCKED`, `REOPEN`, `RESOLVE_DISPUTE` o `SETTLE` |
+| `action` | `FORCE_CLOSE`, `RESUBMIT`, `RESUBMIT_BLOCKED`, `REOPEN`, `RESOLVE_DISPUTE` o `SETTLE`; `REVIEW_*` al cerrar una revisión; `REDATE` y `AUTO_RELEASE`, del sistema |
 | `operator_id` | El `name` del token. Con `SETTLEMENT_ADMIN_API_KEY`, lo que declaró quien llama |
 | `reason` | Lo que declaró quien llama. Solo existe en `reopen`, `resolve-dispute` y las revisiones |
 | `from_state`, `to_state` | Estado antes y después |
@@ -699,7 +738,8 @@ ORDER BY created_at;
 ```
 
 **No se auditan** las operaciones rechazadas, porque no cambian nada, ni los cierres del terminal o del job
-automático, que no los hace un operador. Las operaciones anteriores a `000004` solo están en los logs.
+automático, que no los hace un operador. Sí se auditan dos cambios del sistema que siguen a un operador: el lote que
+movió un cambio de zona (`REDATE`) y el que liberó el cierre de una revisión (`AUTO_RELEASE`, `operator_id` `system`). Las operaciones anteriores a `000004` solo están en los logs.
 
 ### Costo por aprobación
 
@@ -725,6 +765,7 @@ el pool de Postgres.
 | `posnet_settlement_batches_attention` | Gauge | `reason` | Lotes que requieren atención (ver abajo). Consulta la base en cada scrape |
 | `posnet_settlement_outbox_stuck` | Gauge | — | Eventos en el outbox desde hace más de 1 minuto |
 | `posnet_settlement_reversals_in_review` | Gauge | — | Revisiones de reversas abiertas desde hace más de 15 minutos, para dar tiempo a una compra demorada |
+| `posnet_settlement_batch_close_rejected_total` | Counter | `reason` | Cierres del terminal rechazados por su `batch_date`: `future`, `too_old` o `not_reopened` |
 
 También se exponen métricas del pool de Postgres y de mensajes NATS, incluida
 `posnet_nats_messages_failed_total{kind="exhausted"}` para los eventos que agotaron las entregas.
@@ -733,7 +774,7 @@ También se exponen métricas del pool de Postgres y de mensajes NATS, incluida
 |---|---|
 | `disputed` | Lotes en `DISPUTED` |
 | `closed_unsent` | Lotes con transacciones en `CLOSED` hace más de 1 hora |
-| `open_overdue` | Lotes `OPEN` de días de negocio anteriores |
+| `open_overdue` | Lotes `OPEN` de días de negocio anteriores, pasado `SETTLEMENT_BATCH_CLOSE_GRACE` desde la medianoche de su comercio: los que el job ya debería haber cerrado |
 
 Si la consulta falla, estas series no se informan en ese scrape, y las alertas que dependen de ellas no se evalúan.
 
@@ -788,7 +829,8 @@ conciliar, y `no settlement processor configured` los lotes que quedaron sin env
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `otel-collector:4317` | Sí |
 | `ENVIRONMENT` | `development` | Sí |
 | `SETTLEMENT_MDR_PERCENT` | `2.5` | Sí; se usa para calcular el neto. Fuera de 0–10, el servicio no arranca |
-| `SETTLEMENT_BATCH_CLOSE_HOUR` | `3` | Sí; hora UTC desde la que revisa el cierre automático, y `0` lo desactiva. Fuera de 0–23, el servicio no arranca |
+| `SETTLEMENT_BATCH_CLOSE_GRACE` | `30m` | Sí; plazo tras la medianoche de cada comercio para el cierre automático. Fuera de 0–12h, o si no es una duración, el servicio no arranca |
+| `SETTLEMENT_BATCH_CLOSE_HOUR` | `3` | Solo `0`, que desactiva el cierre automático. Ya no es una hora: con otro valor configurado, el arranque deja un `WARN`. Fuera de 0–23, el servicio no arranca |
 | `SETTLEMENT_PROCESSOR` | `none` | Sí; `none` o `mock`. Docker Compose usa `mock`. Con otro valor, el servicio no arranca |
 | `SETTLEMENT_BUSINESS_TIMEZONE` | `America/Argentina/Buenos_Aires` | Sí; zona IANA del día de negocio, para los comercios sin una propia. Si es inválida, el servicio no arranca |
 | `SETTLEMENT_CLOSE_MAX_AGE_DAYS` | `7` | Sí; antigüedad máxima del `batch_date` de un cierre. `0` no limita. Si es negativo, el servicio no arranca |
@@ -872,12 +914,10 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
 | Reversas anteriores sin recuperar | El comando las registra, pero hay que ejecutarlo en cada entorno, con aprobación | [Escenario E](../runbooks/batch-close-failure.md#escenario-e--reversas-anteriores-sin-descontar) |
-| Un lote retenido no se libera solo | Si la revisión se cierra sola porque la compra llegó tarde, o la cierra un operador, el lote sigue en `DISPUTED` hasta un `resolve-dispute` o `reopen` | `ProcessBatchClose` |
-| Excluir una reversa no es reversible | Si después llega su compra, la venta suma sin descuento: no queda revisión que la compare | `EXCLUDE` |
+| Los lotes retenidos antes de `000007` no se liberan solos | No tienen guardado contra qué se conciliaron: siguen `DISPUTED` hasta un `resolve-dispute` o `reopen` | `SettlementBatch.Release` |
+| Una liberación fallida no se reintenta | Si falla después de cerrar la revisión, el lote sigue `DISPUTED`, con el log `could not release the held batch` | `ReleaseHeldBatch` |
 | Sin corrección en un lote ya enviado | `USE_PURCHASE_AMOUNT` y `EXCLUDE` no aplican a un lote `SUBMITTED` o `SETTLED`: el ajuste se hace con el procesador | `applyReviewAction` |
-| `batch_date` no valida días anteriores con precisión | Dentro de `SETTLEMENT_CLOSE_MAX_AGE_DAYS`, un terminal puede pedir el cierre de cualquier día con un lote `OPEN`. Si los totales no coinciden, da `DISPUTED` | `closeDate` |
-| El cambio de zona no mueve lotes | Los lotes ya creados conservan su fecha, y la venta siguiente puede abrir otro lote | `SetMerchantTimezone` |
-| Comercios con medianoche antes de `SETTLEMENT_BATCH_CLOSE_HOUR` | Sus lotes se cierran a esa hora UTC y pueden disparar `LotesAbiertosVencidos`. Con el valor 3, afecta a UTC-1 y UTC-2 | `runBatchCloser` |
+| Una venta simultánea al cambio de zona puede abrir otro lote | Si leyó la zona anterior justo antes del cambio, busca el lote en la fecha vieja, que ya se movió, y abre uno nuevo. La ventana es de milisegundos | `SetMerchantTimezone`, `RegisterApproval` |
 
 ### Ciclo de vida del lote
 

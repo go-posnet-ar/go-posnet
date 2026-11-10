@@ -73,6 +73,8 @@ const (
 	AuditActionResolveDispute  = "RESOLVE_DISPUTE"
 	AuditActionSettle          = "SETTLE"
 	AuditActionRecoverReversal = "RECOVER_REVERSAL"
+	AuditActionRedate          = "REDATE"       // El cambio de zona del comercio movió el lote a otra fecha
+	AuditActionAutoRelease     = "AUTO_RELEASE" // Se cerró la última revisión y el lote concilia: pasa a CLOSED
 
 	AuditActionReviewAccept            = "REVIEW_ACCEPT"
 	AuditActionReviewUsePurchaseAmount = "REVIEW_USE_PURCHASE_AMOUNT"
@@ -97,6 +99,12 @@ type BatchAuditEntry struct {
 // el cambio: sin registro, el cambio no se confirma.
 type BatchAuditLog interface {
 	InsertAuditTx(ctx context.Context, tx pgx.Tx, entry BatchAuditEntry) error
+}
+
+// BatchReopens informa si un operador reabrió un lote: es lo que permite que un terminal lo
+// vuelva a cerrar aunque sea de un día anterior a ayer.
+type BatchReopens interface {
+	WasReopened(ctx context.Context, batchID string) (bool, error)
 }
 
 // Motivos por los que una reversa queda en revisión.
@@ -143,6 +151,27 @@ type StoredReversalReview struct {
 	Discrepancies int
 	Resolved      bool
 	CreatedAt     time.Time
+	// Action es la última acción de un operador, o RESTORE si el sistema restituyó una reversa
+	// excluida. Con ReviewActionExclude, la reversa no está en ningún lote.
+	Action string
+}
+
+// ReviewActionRestore registra que el sistema restituyó una reversa excluida al llegar su compra.
+const ReviewActionRestore = "RESTORE"
+
+// ReviewReconciliation es lo que pasó con la revisión de una transacción al llegar su compra.
+type ReviewReconciliation struct {
+	// Reason es el motivo si la revisión sigue o vuelve a quedar abierta; vacío si no hay.
+	Reason string
+	// Resolved indica que la compra coincide y la revisión se cerró. BatchID es el lote que
+	// retenía, que puede liberarse.
+	Resolved bool
+	BatchID  string
+	// Restored indica que la reversa estaba excluida y se restituyó en el lote de la compra.
+	Restored bool
+	// Reopened indica que la reversa estaba excluida, la compra no coincide, y la revisión se
+	// reabrió en el lote de la compra.
+	Reopened bool
 }
 
 // ReversalReviewLog valida las reversas contra sus compras y gestiona sus revisiones.
@@ -155,11 +184,13 @@ type ReversalReviewLog interface {
 	// InsertReversalReviewTx abre la revisión. Una transacción tiene una sola revisión.
 	InsertReversalReviewTx(ctx context.Context, tx pgx.Tx, review ReversalReview) error
 
-	// ReconcileReversalReviewTx actualiza la revisión de una reversa que llegó antes que
-	// su compra: la cierra si coinciden o cambia el motivo si no. Devuelve el resultado
-	// (vacío si no había revisión abierta, o el motivo vigente) y si quedó cerrada. Se
-	// serializa con FindPurchaseTx por transacción.
-	ReconcileReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID string, purchase ReversalPurchase) (reason string, resolved bool, err error)
+	// ReconcileReversalReviewTx compara la compra recién llegada con la reversa que la esperaba.
+	//   - Revisión abierta: la cierra si coinciden o cambia el motivo si no.
+	//   - Reversa excluida por un operador sin la compra: si coinciden, la restituye en
+	//     purchaseBatchID, el lote de la compra, y cierra la revisión; si no, la reabre en ese
+	//     lote, que queda retenido hasta que un operador decida.
+	// Se serializa con FindPurchaseTx por transacción.
+	ReconcileReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID, purchaseBatchID string, purchase ReversalPurchase) (ReviewReconciliation, error)
 
 	// CountOpenReversalReviews cuenta las revisiones abiertas de las reversas de un lote.
 	CountOpenReversalReviews(ctx context.Context, batchID string) (int, error)
@@ -178,8 +209,11 @@ type ReversalReviewLog interface {
 	// DeleteReversalTx quita la reversa de su lote. Avanza la versión, igual que UpdateReversalAmountTx.
 	DeleteReversalTx(ctx context.Context, tx pgx.Tx, batchID, transactionID string) error
 
-	// CloseReversalReviewTx cierra la revisión con el operador y la resolución indicados.
-	CloseReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID, operatorID, resolution string) error
+	// InsertReversalTx vuelve a agregar una reversa excluida a un lote. Avanza la versión.
+	InsertReversalTx(ctx context.Context, tx pgx.Tx, batchID, transactionID string, amountCents int64, currency string) error
+
+	// CloseReversalReviewTx cierra la revisión con el operador, la resolución y la acción indicados.
+	CloseReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID, operatorID, resolution, action string) error
 }
 
 // MerchantTimezones guarda la zona del día de negocio de cada comercio.
@@ -187,13 +221,28 @@ type MerchantTimezones interface {
 	// MerchantTimezone devuelve la zona del comercio, o vacío si no tiene una propia.
 	MerchantTimezone(ctx context.Context, merchantID string) (string, error)
 
-	// SetMerchantTimezone guarda la zona. Retorna ErrUnknownTimezone si Postgres no la
-	// reconoce: las consultas por día de negocio fallarían para todos los comercios.
-	SetMerchantTimezone(ctx context.Context, merchantID, timezone, operatorID string) error
+	// SetMerchantTimezone guarda la zona y, en la misma transacción, mueve los lotes OPEN del
+	// comercio fechados hoy en la zona anterior a hoy en la nueva, con su auditoría.
+	// defaultTimezone es la zona anterior si el comercio no tenía una propia. Retorna
+	// ErrUnknownTimezone si Postgres no la reconoce: las consultas por día de negocio fallarían
+	// para todos los comercios. Retorna ErrOpenBatchConflict si un terminal ya tiene un lote
+	// OPEN en la fecha nueva; en los dos casos no cambia nada.
+	SetMerchantTimezone(ctx context.Context, merchantID, timezone, defaultTimezone, operatorID string) ([]RedatedBatch, error)
+}
+
+// RedatedBatch es un lote que el cambio de zona movió de fecha.
+type RedatedBatch struct {
+	BatchID  string
+	FromDate string
+	ToDate   string
 }
 
 // ErrUnknownTimezone indica que la base de datos no reconoce la zona horaria.
 var ErrUnknownTimezone = errors.New("timezone is not known to the database")
+
+// ErrOpenBatchConflict indica que mover un lote a su fecha nueva chocaría con otro lote OPEN
+// del mismo terminal, fecha y moneda.
+var ErrOpenBatchConflict = errors.New("an open batch already exists for the new business date")
 
 // BatchAttentionCounts son los lotes que requieren atención de un operador.
 type BatchAttentionCounts struct {

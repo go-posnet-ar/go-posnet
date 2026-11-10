@@ -16,7 +16,7 @@ var optionalEnvKeys = []string{
 	"POSTGRES_MAX_CONN_LIFETIME", "POSTGRES_MAX_CONN_IDLE", "MIGRATIONS_DIR",
 	"NATS_NKEY_PATH", "NATS_TLS_CERT", "NATS_TLS_KEY", "NATS_TLS_CA",
 	"OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION", "OTEL_EXPORTER_OTLP_ENDPOINT", "ENVIRONMENT",
-	"SETTLEMENT_MDR_PERCENT", "SETTLEMENT_BATCH_CLOSE_HOUR",
+	"SETTLEMENT_MDR_PERCENT", "SETTLEMENT_BATCH_CLOSE_HOUR", "SETTLEMENT_BATCH_CLOSE_GRACE",
 	"SETTLEMENT_SUBMIT_RETRIES", "SETTLEMENT_SUBMIT_TIMEOUT", "SETTLEMENT_PROCESSOR", "SETTLEMENT_BUSINESS_TIMEZONE", "SETTLEMENT_ADMIN_API_KEY",
 }
 
@@ -456,6 +456,69 @@ func TestValidate_TLS(t *testing.T) {
 			cfg := Config{OTEL: OTELConfig{Environment: tc.env}, Settlement: tc.set}
 			if err := cfg.validate(); (err != nil) != tc.wantErr {
 				t.Errorf("validate() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoad_BatchCloseGrace(t *testing.T) {
+	tests := []struct {
+		name, value string
+		want        time.Duration
+		wantErr     string
+	}{
+		{"default", "", 30 * time.Minute, ""},
+		{"custom", "45m", 45 * time.Minute, ""},
+		{"zero closes at midnight", "0s", 0, ""},
+		{"not a duration", "30", 0, "SETTLEMENT_BATCH_CLOSE_GRACE"},
+		{"negative", "-1m", 0, "out of range"},
+		{"too long", "13h", 0, "out of range"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			clearOptionalEnv(t)
+			setRequiredEnv(t)
+			t.Setenv("SETTLEMENT_BATCH_CLOSE_GRACE", tc.value)
+
+			cfg, err := Load()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("Load() error = %v, want it to contain %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Settlement.BatchCloseGrace != tc.want {
+				t.Errorf("BatchCloseGrace = %v, want %v", cfg.Settlement.BatchCloseGrace, tc.want)
+			}
+		})
+	}
+}
+
+// SETTLEMENT_BATCH_CLOSE_HOUR ya no es una hora: solo 0 tiene efecto, y otro valor avisa.
+func TestLoad_BatchCloseHourIsDeprecated(t *testing.T) {
+	tests := []struct {
+		value          string
+		wantDeprecated bool
+	}{
+		{"", false},
+		{"0", false},
+		{"3", true},
+	}
+	for _, tc := range tests {
+		t.Run("value="+tc.value, func(t *testing.T) {
+			clearOptionalEnv(t)
+			setRequiredEnv(t)
+			t.Setenv("SETTLEMENT_BATCH_CLOSE_HOUR", tc.value)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Settlement.BatchCloseHourDeprecated != tc.wantDeprecated {
+				t.Errorf("BatchCloseHourDeprecated = %v, want %v", cfg.Settlement.BatchCloseHourDeprecated, tc.wantDeprecated)
 			}
 		})
 	}

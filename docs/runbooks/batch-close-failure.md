@@ -76,8 +76,10 @@ El Relay publica el evento a NATS por separado, con reintentos.
   combinación en otros estados: un terminal que sigue vendiendo tras un cierre abre un lote nuevo.
 - El día de negocio se calcula con la zona del comercio o, si no tiene una, con `SETTLEMENT_BUSINESS_TIMEZONE`
   (Argentina por defecto). Se consulta con `GET /merchants/{merchant_id}/timezone`.
-- El cierre usa el `batch_date` del pedido. Sin él, usa el día de negocio del pedido. Un `batch_date` futuro o más
-  antiguo que `SETTLEMENT_CLOSE_MAX_AGE_DAYS` se descarta: en el log, `permanent error` y `batch_date ...`.
+- El cierre usa el `batch_date` del pedido. Sin él, usa el día de negocio del pedido. Se descarta un `batch_date`
+  futuro, más antiguo que `SETTLEMENT_CLOSE_MAX_AGE_DAYS`, o anterior a ayer de un lote que nadie reabrió: en el
+  log, `permanent error` y `batch_date ...`, y la métrica `posnet_settlement_batch_close_rejected_total{reason}`.
+  Para que el terminal vuelva a cerrar un lote de hace días, primero hay que reabrirlo con `reopen`.
 - Un lote con una reversa en revisión no se envía: queda en `DISPUTED`.
 - `terminal_count` cuenta compras y reversas, y `terminal_amount` es el monto neto.
 
@@ -306,8 +308,9 @@ audited`, la reversa está registrada y falta asentarla a mano en el ticket.
 **Síntoma:** lotes `OPEN` con `batch_date` pasada. Lo normal es que no persistan: el job automático los
 cierra.
 
-**Cómo funciona el job:** revisa cada 15 minutos desde las **03:00 UTC (00:00 en Argentina)** hasta el fin del día
-UTC, y al arrancar el servicio. Cierra los lotes de días de negocio anteriores, en la zona de cada comercio, con los totales del backend, **sin conciliar con el terminal**,
+**Cómo funciona el job:** revisa cada 15 minutos, todo el día, y al arrancar el servicio. Cierra los lotes de días
+de negocio anteriores una vez pasada la **medianoche de su comercio más `SETTLEMENT_BATCH_CLOSE_GRACE`** (30 min por
+defecto), con los totales del backend, **sin conciliar con el terminal**,
 encola `batch-closed` y los envía al procesador. Log: `batch closed automatically without terminal
 totals`.
 
@@ -330,8 +333,7 @@ docker logs posnet-settlement 2>&1 | grep -E 'automatic batch close'
 
 | Si el lote sigue `OPEN` | Causa probable |
 |---|---|
-| Antes de las 03:00 UTC | El job no revisa en esa franja: le pasa a los comercios en UTC-1 y UTC-2 |
-| `automatic batch close finished` sin este lote | Todavía no es el día siguiente en la zona de su comercio |
+| `automatic batch close finished` sin este lote | Todavía no pasó la medianoche más el plazo en la zona de su comercio. La alerta tampoco lo cuenta hasta entonces |
 | `SETTLEMENT_BATCH_CLOSE_HOUR=0` | El job está desactivado |
 | `automatic batch close failed` | Error de cierre: el job reintenta cada minuto |
 | Se reabrió hoy con `reopen` | El job ya lo marcó en la corrida de hoy: lo cierra al día siguiente |
@@ -396,11 +398,18 @@ curl -X POST http://<host>:8084/reversal-reviews/<transaction_id>/resolve -H "$A
   -d '{"operator_id":"<tu_usuario>","resolution":"<qué se hizo, ticket>","action":"USE_PURCHASE_AMOUNT"}'
 ```
 
-`USE_PURCHASE_AMOUNT` y `EXCLUDE` solo funcionan si el lote está en `OPEN` o `DISPUTED`. **`EXCLUDE` no se deshace:** si
-después llega la compra, suma sin descuento. Con un lote en `CLOSED`, un `resubmit` lo pasa a `DISPUTED`. Con uno
-`SUBMITTED` o `SETTLED`, el dinero ya salió: usá `ACCEPT` y ajustalo con el procesador.
+`USE_PURCHASE_AMOUNT` y `EXCLUDE` solo funcionan si el lote está en `OPEN` o `DISPUTED`. Con un lote en `CLOSED`, un
+`resubmit` lo pasa a `DISPUTED`. Con uno `SUBMITTED` o `SETTLED`, el dinero ya salió: usá `ACCEPT` y ajustalo con el
+procesador.
 
-**Cerrar la revisión no libera el lote.** Sigue en `DISPUTED`, también si la revisión se cerró sola. Después:
+**Si `EXCLUDE` fue por `PURCHASE_NOT_FOUND` y la compra llega después,** la reversa vuelve sola si coincide (log
+`excluded reversal restored`). Si no coincide, la revisión se reabre en el lote de la compra (log `excluded reversal
+does not match`): ahí `ACCEPT` la deja excluida y `USE_PURCHASE_AMOUNT` la agrega con el monto de la compra.
+
+**Al cerrar la última revisión, el lote se libera solo si concilia:** pasa a `CLOSED` y se envía (log `held batch
+released`, auditoría `AUTO_RELEASE`). Si no concilia (log `still does not reconcile`, por ejemplo porque el terminal
+había contado la reversa que excluiste) o se cerró antes de `000007` (log `closed before its reconciliation was
+recorded`), sigue en `DISPUTED`. Entonces:
 
 ```bash
 curl -X POST http://<host>:8084/batches/<batch_id>/resolve-dispute -H "$AUTH" \

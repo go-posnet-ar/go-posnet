@@ -37,6 +37,13 @@ type SettlementBatch struct {
 	// Discrepancias detectadas en la conciliación
 	discrepancies int
 
+	// reconciledWith dice contra qué se concilió el cierre, para poder repetirlo al cerrar una
+	// revisión de reversa. terminalCount y terminalAmount son los totales del terminal, solo con
+	// ReconciledWithTerminal.
+	reconciledWith string
+	terminalCount  *int
+	terminalAmount *int64
+
 	// Versión persistida, para el bloqueo optimista
 	version int
 
@@ -152,6 +159,8 @@ func (b *SettlementBatch) Close(terminalCount int, terminalAmount int64) error {
 	b.summary = &summary
 	now := time.Now().UTC()
 	b.closedAt = &now
+	b.reconciledWith = ReconciledWithTerminal
+	b.terminalCount, b.terminalAmount = &terminalCount, &terminalAmount
 
 	b.record(event.NewBatchClosed(b.id, b.terminalID, b.merchantID, summary, b.discrepancies))
 	return nil
@@ -167,7 +176,11 @@ func (b *SettlementBatch) CloseWithBackendTotals() error {
 	if err != nil {
 		return err
 	}
-	return b.Close(count, amount)
+	if err := b.Close(count, amount); err != nil {
+		return err
+	}
+	b.reconciledWith, b.terminalCount, b.terminalAmount = ReconciledWithBackend, nil, nil
+	return nil
 }
 
 // Reopen devuelve un lote en disputa a OPEN para que acepte transacciones y
@@ -179,6 +192,7 @@ func (b *SettlementBatch) Reopen() error {
 	b.summary = nil
 	b.closedAt = nil
 	b.discrepancies = 0
+	b.reconciledWith, b.terminalCount, b.terminalAmount = "", nil, nil
 	return nil
 }
 
@@ -197,7 +211,52 @@ func (b *SettlementBatch) ResolveDispute() error {
 	b.discrepancies = 0
 	now := time.Now().UTC()
 	b.closedAt = &now
+	// El operador aceptó los totales del backend: son la referencia desde ahora.
+	b.reconciledWith = ReconciledWithBackend
 	return nil
+}
+
+// Contra qué se concilió un cierre. Un lote cerrado antes de que se guardara no tiene ninguno.
+const (
+	ReconciledWithTerminal = "TERMINAL" // Los totales que informó el terminal
+	ReconciledWithBackend  = "BACKEND"  // Sin terminal: el job, force-close o resolve-dispute
+)
+
+// Release vuelve a conciliar un lote DISPUTED con sus transacciones actuales. Se usa cuando se
+// cierra su última revisión de reversa, que pudo cambiar los totales.
+//
+//   - Conciliado contra el terminal: compara con los totales que informó. Si coinciden, pasa a
+//     CLOSED; si no, sigue DISPUTED con las discrepancias recalculadas.
+//   - Conciliado contra el backend: no hay con qué comparar, y pasa a CLOSED.
+//   - Sin referencia, de antes de que se guardara: no hace nada. Lo resuelve un operador.
+//
+// changed indica que el lote cambió y hay que guardarlo.
+func (b *SettlementBatch) Release() (released, changed bool, err error) {
+	if b.state != valueobject.BatchStateDisputed || b.reconciledWith == "" {
+		return false, false, nil
+	}
+	summary, count, amount, err := b.calculateSummary()
+	if err != nil {
+		return false, false, err
+	}
+	discrepancies := 0
+	if b.reconciledWith == ReconciledWithTerminal && b.terminalCount != nil && b.terminalAmount != nil {
+		if *b.terminalCount != count || *b.terminalAmount != amount {
+			discrepancies = max(abs(*b.terminalCount-count), 1)
+		}
+	}
+	if discrepancies > 0 {
+		changed = discrepancies != b.discrepancies || b.summary == nil || *b.summary != summary
+		b.summary, b.discrepancies = &summary, discrepancies
+		return false, changed, nil
+	}
+	if err := b.transition(valueobject.BatchStateClosed); err != nil {
+		return false, false, err
+	}
+	b.summary, b.discrepancies = &summary, 0
+	now := time.Now().UTC()
+	b.closedAt = &now
+	return true, true, nil
 }
 
 // BackendTotals devuelve la cantidad y el monto neto de las transacciones actuales del lote.
@@ -314,6 +373,8 @@ func (b *SettlementBatch) Currency() string                         { return b.c
 func (b *SettlementBatch) Transactions() []*entity.BatchTransaction { return b.transactions }
 func (b *SettlementBatch) Summary() *valueobject.BatchSummary       { return b.summary }
 func (b *SettlementBatch) Discrepancies() int                       { return b.discrepancies }
+func (b *SettlementBatch) ReconciledWith() string                   { return b.reconciledWith }
+func (b *SettlementBatch) TerminalTotals() (*int, *int64)           { return b.terminalCount, b.terminalAmount }
 func (b *SettlementBatch) CreatedAt() time.Time                     { return b.createdAt }
 func (b *SettlementBatch) ClosedAt() *time.Time                     { return b.closedAt }
 func (b *SettlementBatch) SubmittedAt() *time.Time                  { return b.submittedAt }

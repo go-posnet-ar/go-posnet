@@ -25,6 +25,10 @@ type ReconstituteParams struct {
 	ClosedAt      *time.Time
 	SubmittedAt   *time.Time
 	SettledAt     *time.Time
+
+	ReconciledWith string // ReconciledWithTerminal, ReconciledWithBackend o vacío
+	TerminalCount  *int
+	TerminalAmount *int64
 }
 
 // Reconstitute reconstruye un SettlementBatch desde Postgres.
@@ -45,5 +49,9 @@ func Reconstitute(p ReconstituteParams) *SettlementBatch {
 		closedAt:      p.ClosedAt,
 		submittedAt:   p.SubmittedAt,
 		settledAt:     p.SettledAt,
+
+		reconciledWith: p.ReconciledWith,
+		terminalCount:  p.TerminalCount,
+		terminalAmount: p.TerminalAmount,
 	}
 }

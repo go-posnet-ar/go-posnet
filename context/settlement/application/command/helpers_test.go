@@ -42,6 +42,7 @@ type fakeBatchRepo struct {
 
 	staleIDs []string
 	staleErr error
+	staleNow time.Time // el now que recibió FindStaleOpenIDs
 
 	priorCount  int
 	priorAmount int64
@@ -97,7 +98,8 @@ func (f *fakeBatchRepo) ListByMerchantDate(context.Context, domain.MerchantID, t
 	return f.listResult, f.listErr
 }
 
-func (f *fakeBatchRepo) FindStaleOpenIDs(context.Context, time.Time, string) ([]string, error) {
+func (f *fakeBatchRepo) FindStaleOpenIDs(_ context.Context, now time.Time, _ string) ([]string, error) {
+	f.staleNow = now
 	return f.staleIDs, f.staleErr
 }
 

@@ -39,6 +39,26 @@ type BatchHandler struct {
 	reviews     repository.ReversalReviewLog // opcional; nil = no valida las reversas
 	timezones   repository.MerchantTimezones // opcional; nil = una sola zona para todos
 	maxCloseAge int                          // días; 0 = no limita la antigüedad de batch_date
+	closeGrace  time.Duration                // plazo tras la medianoche del comercio para el cierre automático
+	reopens     repository.BatchReopens      // opcional; nil = acepta cualquier día dentro de maxCloseAge
+	audit       repository.BatchAuditLog     // opcional; nil = la liberación de un lote no se audita
+}
+
+// SetAuditLog habilita la auditoría de lo que el sistema hace sobre un lote retenido.
+func (h *BatchHandler) SetAuditLog(audit repository.BatchAuditLog) {
+	h.audit = audit
+}
+
+// SetBatchReopens limita los cierres de días anteriores a ayer a los lotes que un operador
+// reabrió.
+func (h *BatchHandler) SetBatchReopens(reopens repository.BatchReopens) {
+	h.reopens = reopens
+}
+
+// SetCloseGrace define cuánto después de la medianoche del comercio se cierra
+// automáticamente el lote del día anterior.
+func (h *BatchHandler) SetCloseGrace(d time.Duration) {
+	h.closeGrace = d
 }
 
 // SetMerchantTimezones habilita la zona de negocio por comercio.
@@ -158,12 +178,11 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 	}
 
 	var (
-		batchID        string
-		reviewReason   string
-		reviewResolved bool
+		batchID string
+		review  repository.ReviewReconciliation
 	)
 	err = retryOnStale(ctx, func() error {
-		batchID, reviewReason, reviewResolved = "", "", false
+		batchID, review = "", repository.ReviewReconciliation{}
 		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
 			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
 			if err != nil {
@@ -189,7 +208,7 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 				return nil
 			}
 			// La reversa pudo llegar antes: si la estaba esperando, se compara ahora.
-			reviewReason, reviewResolved, err = h.reviews.ReconcileReversalReviewTx(ctx, tx, txID.String(), repository.ReversalPurchase{
+			review, err = h.reviews.ReconcileReversalReviewTx(ctx, tx, txID.String(), batchID, repository.ReversalPurchase{
 				MerchantID: merchantID.String(), AmountCents: cmd.AmountCents, Currency: cmd.Currency,
 			})
 			return err
@@ -200,10 +219,20 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 		return fmt.Errorf("RegisterApproval: %w", err)
 	}
 
-	if reviewResolved {
+	switch {
+	case review.Restored:
+		log.Warn("excluded reversal restored — its purchase arrived and matches", slog.String("batch_id", review.BatchID))
+	case review.Reopened:
+		log.Warn("excluded reversal does not match the purchase that arrived — review reopened, batch held",
+			slog.String("batch_id", review.BatchID), slog.String("reason", review.Reason))
+	case review.Resolved:
 		log.Info("reversal review resolved — the purchase arrived and matches")
-	} else if reviewReason != "" {
-		log.Warn("reversal does not match the purchase that arrived later", slog.String("reason", reviewReason))
+		// Era la revisión que retenía el lote de la reversa: si era la última, se libera.
+		if err := h.ReleaseHeldBatch(ctx, review.BatchID); err != nil {
+			log.Error("could not release the held batch — it stays DISPUTED", slog.String("batch_id", review.BatchID), slog.String("error", err.Error()))
+		}
+	case review.Reason != "":
+		log.Warn("reversal does not match the purchase that arrived later", slog.String("reason", review.Reason))
 	}
 	if batchID != "" {
 		h.metrics.RecordAuthApproved(ctx)
@@ -359,7 +388,7 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 		return pkgerrors.NewValidationError("invalid currency")
 	}
 
-	closeDate, err := h.closeDate(ctx, cmd)
+	closeDate, beforeYesterday, err := h.closeDate(ctx, cmd)
 	if err != nil {
 		return fmt.Errorf("ProcessBatchClose: %w", err)
 	}
@@ -377,6 +406,11 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 		}
 		if batch == nil {
 			return nil
+		}
+		if beforeYesterday {
+			if err := h.checkReopened(ctx, batch, cmd.BatchDate); err != nil {
+				return err
+			}
 		}
 		terminalCount, terminalAmount, err := h.pendingTerminalTotals(ctx, batch, cmd)
 		if err != nil {
@@ -457,6 +491,90 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 
 	// Sin discrepancias → enviar al procesador externo
 	return h.submitBatch(ctx, batch)
+}
+
+// ReleaseHeldBatch vuelve a conciliar un lote DISPUTED cuando ya no tiene revisiones de reversa
+// abiertas (ver SettlementBatch.Release). Si concilia, pasa a CLOSED, con auditoría, y se envía
+// al procesador. No hace nada si el lote no está DISPUTED o le quedan revisiones. Lo llaman el
+// cierre de una revisión, por el sistema o por un operador: si falla, el lote sigue DISPUTED y
+// un operador lo resuelve con resolve-dispute o reopen.
+func (h *BatchHandler) ReleaseHeldBatch(ctx context.Context, batchID string) error {
+	log := observability.FromContext(ctx).With(slog.String("batch_id", batchID))
+	var (
+		batch    *aggregate.SettlementBatch
+		released bool
+	)
+	err := retryOnStale(ctx, func() error {
+		batch, released = nil, false
+		loaded, err := h.batchRepo.FindByID(ctx, batchID)
+		var notFound *pkgerrors.NotFoundError
+		if errors.As(err, &notFound) || (err == nil && loaded == nil) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("find batch: %w", err)
+		}
+		if loaded.State() != valueobject.BatchStateDisputed {
+			return nil
+		}
+		open, err := h.openReviews(ctx, batchID)
+		if err != nil {
+			return fmt.Errorf("count open reviews: %w", err)
+		}
+		if open > 0 {
+			return nil
+		}
+		previous := loaded.Discrepancies()
+		rel, changed, err := loaded.Release()
+		if err != nil {
+			return fmt.Errorf("release: %w", err)
+		}
+		if !changed {
+			batch = loaded
+			return nil
+		}
+		err = pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
+			if err := h.batchRepo.SaveTx(ctx, tx, loaded); err != nil {
+				return err
+			}
+			if !rel || h.audit == nil {
+				return nil
+			}
+			return h.audit.InsertAuditTx(ctx, tx, repository.BatchAuditEntry{
+				BatchID: batchID, Action: repository.AuditActionAutoRelease, OperatorID: "system",
+				Reason:    "last reversal review closed and the batch reconciles against " + loaded.ReconciledWith(),
+				FromState: valueobject.BatchStateDisputed.String(), ToState: loaded.State().String(),
+				PreviousDiscrepancies: previous,
+			})
+		})
+		if err != nil {
+			return err
+		}
+		batch, released = loaded, rel
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("ReleaseHeldBatch: %w", err)
+	}
+	switch {
+	case batch == nil:
+		return nil
+	case !released && batch.ReconciledWith() == "":
+		log.Warn("batch has no open reviews but was closed before its reconciliation was recorded — resolve it with resolve-dispute or reopen")
+		return nil
+	case !released:
+		log.Warn("batch has no open reviews but still does not reconcile — stays DISPUTED", slog.Int("discrepancies", batch.Discrepancies()))
+		return nil
+	}
+	log.Warn("held batch released — no open reviews and it reconciles", slog.String("reconciled_with", batch.ReconciledWith()))
+	if len(batch.Transactions()) == 0 {
+		return nil
+	}
+	// Ya quedó CLOSED: si el envío falla, se reintenta con ResubmitBatch, como tras un cierre.
+	if err := h.submitBatch(ctx, batch); err != nil {
+		log.Error("submit after release failed — batch stays CLOSED", slog.String("error", err.Error()))
+	}
+	return nil
 }
 
 // disputeReasonReversalReview es el motivo de disputa de un lote con reversas en revisión.
@@ -540,31 +658,57 @@ func retryOnStale(ctx context.Context, fn func() error) error {
 // closeDate resuelve qué día cierra el terminal: el que informó o, si no informó uno
 // válido, el día de negocio del pedido. Rechaza un día futuro, o más antiguo que maxCloseAge:
 // reintentarlo no lo arregla, y un lote así lo cierra el job automático o un operador.
-func (h *BatchHandler) closeDate(ctx context.Context, cmd port.ProcessBatchCloseCommand) (time.Time, error) {
+//
+// beforeYesterday indica un día anterior a ayer. Hoy y ayer son los casos normales: el cierre
+// del día, o el de ayer pedido después de medianoche. Uno más viejo solo vale para un lote que
+// un operador reabrió (ver checkReopened).
+func (h *BatchHandler) closeDate(ctx context.Context, cmd port.ProcessBatchCloseCommand) (date time.Time, beforeYesterday bool, err error) {
 	requestedAt, err := time.Parse(time.RFC3339, cmd.RequestedAt)
 	if err != nil {
 		requestedAt = time.Now()
 	}
 	today, err := h.requestBusinessDate(ctx, cmd.MerchantID, requestedAt)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, false, err
 	}
 
-	date, err := time.Parse("2006-01-02", cmd.BatchDate)
+	date, err = time.Parse("2006-01-02", cmd.BatchDate)
 	if err != nil {
-		return today, nil
+		return today, false, nil
 	}
 	if date.After(today) {
-		return time.Time{}, pkgerrors.NewValidationError(
+		h.metrics.RecordCloseRejected(ctx, closeRejectedFuture)
+		return time.Time{}, false, pkgerrors.NewValidationError(
 			fmt.Sprintf("batch_date %s is after the business date %s", cmd.BatchDate, today.Format("2006-01-02")),
 		)
 	}
 	if h.maxCloseAge > 0 && date.Before(today.AddDate(0, 0, -h.maxCloseAge)) {
-		return time.Time{}, pkgerrors.NewValidationError(
+		h.metrics.RecordCloseRejected(ctx, closeRejectedTooOld)
+		return time.Time{}, false, pkgerrors.NewValidationError(
 			fmt.Sprintf("batch_date %s is more than %d days old", cmd.BatchDate, h.maxCloseAge),
 		)
 	}
-	return date, nil
+	return date, date.Before(today.AddDate(0, 0, -1)), nil
+}
+
+// checkReopened rechaza el cierre de un lote anterior a ayer que ningún operador reabrió: el
+// terminal se equivocó de día, y sus totales darían una disputa falsa sobre un lote que el job
+// automático ya iba a cerrar.
+func (h *BatchHandler) checkReopened(ctx context.Context, batch *aggregate.SettlementBatch, batchDate string) error {
+	if h.reopens == nil {
+		return nil
+	}
+	reopened, err := h.reopens.WasReopened(ctx, batch.ID())
+	if err != nil {
+		return fmt.Errorf("check reopened: %w", err)
+	}
+	if reopened {
+		return nil
+	}
+	h.metrics.RecordCloseRejected(ctx, closeRejectedNotReopened)
+	return pkgerrors.NewValidationError(fmt.Sprintf(
+		"batch_date %s is before yesterday and batch %s was not reopened by an operator", batchDate, batch.ID(),
+	))
 }
 
 // requestBusinessDate calcula el día de negocio de un pedido cuyo comercio puede no ser
@@ -578,14 +722,16 @@ func (h *BatchHandler) requestBusinessDate(ctx context.Context, merchantID strin
 }
 
 // CloseStaleBatches cierra los batches OPEN de días de negocio anteriores a now, para los
-// que el terminal nunca pidió el cierre. No toca el lote del día: cerrarlo dejaría
-// afuera las ventas posteriores. Un error en un batch no frena a los demás.
+// que el terminal nunca pidió el cierre, una vez pasado closeGrace desde la medianoche de su
+// comercio. No toca el lote del día: cerrarlo dejaría afuera las ventas posteriores. Un error
+// en un batch no frena a los demás.
 func (h *BatchHandler) CloseStaleBatches(ctx context.Context, now time.Time) (closed, failed int, err error) {
 	ctx, span := observability.StartSpan(ctx, "command.CloseStaleBatches")
 	defer span.End()
 
 	loc := h.defaultLocation()
-	ids, err := h.batchRepo.FindStaleOpenIDs(ctx, now, loc.String())
+	// Un lote vence cuando now − closeGrace ya es otro día en la zona de su comercio.
+	ids, err := h.batchRepo.FindStaleOpenIDs(ctx, now.Add(-h.closeGrace), loc.String())
 	if err != nil {
 		return 0, 0, fmt.Errorf("CloseStaleBatches: find batches: %w", err)
 	}

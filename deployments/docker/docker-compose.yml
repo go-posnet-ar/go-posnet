@@ -299,7 +299,7 @@ services:
       OTEL_SERVICE_NAME: posnet-settlement
       SETTLEMENT_TRUSTED_PROXIES: "172.30.0.10/32" # el gateway, en la red edge
       SETTLEMENT_PROCESSOR: mock # Sin envío real, como acquirer-mock. El default del código es "none".
-      SETTLEMENT_BATCH_CLOSE_HOUR: "3" # 03:00 UTC = 00:00 en Argentina.
+      SETTLEMENT_BATCH_CLOSE_GRACE: "30m" # El lote de ayer se cierra 30 min después de la medianoche de cada comercio.
     depends_on:
       postgres:
         condition: service_healthy

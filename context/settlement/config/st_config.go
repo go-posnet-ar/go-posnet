@@ -53,11 +53,19 @@ type SettlementConfig struct {
 	// Ej: 2.5 = 2.5%. Se aplica al calcular el NetAmount en SettlementCompleted.
 	MDRPercent float64
 
-	// BatchCloseHour es la hora UTC desde la que corre el cierre automático, que
-	// alcanza a los lotes OPEN de días de negocio anteriores. Default: 3 = 00:00 en
-	// Argentina. Desde esa hora, y hasta el fin del día UTC, revisa cada 15 minutos.
-	// Si es 0, el cierre es solo por pedido del terminal o de un operador.
+	// BatchCloseHour solo activa o desactiva el cierre automático: con 0, el cierre es solo
+	// por pedido del terminal o de un operador. Antes era la hora UTC desde la que corría; ya
+	// no tiene efecto como hora, y BatchCloseHourDeprecated avisa si se lo configura.
 	BatchCloseHour int
+
+	// BatchCloseHourDeprecated indica que SETTLEMENT_BATCH_CLOSE_HOUR está configurada con un
+	// valor distinto de 0, que ya no define una hora.
+	BatchCloseHourDeprecated bool
+
+	// BatchCloseGrace es cuánto después de la medianoche del comercio se cierra
+	// automáticamente el lote del día anterior: el plazo para que el terminal lo cierre él.
+	// El job revisa cada 15 minutos todo el día. La alerta de lotes vencidos usa el mismo plazo.
+	BatchCloseGrace time.Duration
 
 	// SubmitRetries es la cantidad de reintentos al enviar el archivo de remesa
 	// al procesador externo antes de marcar el batch como DISPUTED.
@@ -142,9 +150,11 @@ func Load() (*Config, error) {
 		Settlement: SettlementConfig{
 			MDRPercent:     envFloat("SETTLEMENT_MDR_PERCENT", 2.5),
 			BatchCloseHour: envInt("SETTLEMENT_BATCH_CLOSE_HOUR", 3),
-			SubmitRetries:  envInt("SETTLEMENT_SUBMIT_RETRIES", 3),
-			SubmitTimeout:  envDuration("SETTLEMENT_SUBMIT_TIMEOUT", 30*time.Second),
-			Processor:      envStr("SETTLEMENT_PROCESSOR", ProcessorNone),
+			BatchCloseHourDeprecated: os.Getenv("SETTLEMENT_BATCH_CLOSE_HOUR") != "" &&
+				os.Getenv("SETTLEMENT_BATCH_CLOSE_HOUR") != "0",
+			SubmitRetries: envInt("SETTLEMENT_SUBMIT_RETRIES", 3),
+			SubmitTimeout: envDuration("SETTLEMENT_SUBMIT_TIMEOUT", 30*time.Second),
+			Processor:     envStr("SETTLEMENT_PROCESSOR", ProcessorNone),
 
 			BusinessTimezone: envStr("SETTLEMENT_BUSINESS_TIMEZONE", "America/Argentina/Buenos_Aires"),
 			CloseMaxAgeDays:  envInt("SETTLEMENT_CLOSE_MAX_AGE_DAYS", 7),
@@ -156,6 +166,12 @@ func Load() (*Config, error) {
 			TLSExternal:      envStr("SETTLEMENT_TLS_EXTERNAL", "") == "true",
 		},
 	}
+
+	grace, err := strictDuration("SETTLEMENT_BATCH_CLOSE_GRACE", defaultBatchCloseGrace)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Settlement.BatchCloseGrace = grace
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -172,6 +188,9 @@ func (c *Config) validate() error {
 	if c.Settlement.BatchCloseHour < 0 || c.Settlement.BatchCloseHour > 23 {
 		return fmt.Errorf("config: SETTLEMENT_BATCH_CLOSE_HOUR %d out of range [0, 23]",
 			c.Settlement.BatchCloseHour)
+	}
+	if g := c.Settlement.BatchCloseGrace; g < 0 || g > maxBatchCloseGrace {
+		return fmt.Errorf("config: SETTLEMENT_BATCH_CLOSE_GRACE %s out of range [0, %s]", g, maxBatchCloseGrace)
 	}
 	if c.Settlement.CloseMaxAgeDays < 0 {
 		return fmt.Errorf("config: SETTLEMENT_CLOSE_MAX_AGE_DAYS %d cannot be negative", c.Settlement.CloseMaxAgeDays)
@@ -249,6 +268,27 @@ func envFloat(key string, defaultVal float64) float64 {
 		}
 	}
 	return defaultVal
+}
+
+// Plazo después de la medianoche del comercio para el cierre automático. Más de 12 horas
+// dejaría el lote de ayer abierto durante buena parte del día siguiente.
+const (
+	defaultBatchCloseGrace = 30 * time.Minute
+	maxBatchCloseGrace     = 12 * time.Hour
+)
+
+// strictDuration lee una duración y, a diferencia de envDuration, falla si el valor no se
+// puede interpretar, en lugar de usar el default sin avisar.
+func strictDuration(key string, defaultVal time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("config: %s %q is not a duration (e.g. 30m): %w", key, v, err)
+	}
+	return d, nil
 }
 
 func envDuration(key string, defaultVal time.Duration) time.Duration {

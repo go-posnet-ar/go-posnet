@@ -31,7 +31,13 @@ CREATE TABLE settlement.settlement_batches (
     settled_at      TIMESTAMPTZ,
 
     -- Bloqueo optimista
-    version         INTEGER     NOT NULL DEFAULT 0
+    version         INTEGER     NOT NULL DEFAULT 0,
+
+    -- Contra qué se concilió el cierre (TERMINAL o BACKEND) y, con TERMINAL, sus totales.
+    -- Migración 000007.
+    reconciled_with VARCHAR(10),
+    terminal_count  INTEGER,
+    terminal_amount BIGINT
 );
 
 -- Garantiza un solo batch OPEN por terminal, día y moneda
@@ -115,7 +121,8 @@ CREATE TABLE IF NOT EXISTS settlement.reversal_reviews (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     resolved_at          TIMESTAMPTZ,
     resolved_by          TEXT,
-    resolution           TEXT
+    resolution           TEXT,
+    action               VARCHAR(30) -- Acción del operador. Migración 000007
 );
 CREATE INDEX IF NOT EXISTS idx_reversal_reviews_open ON settlement.reversal_reviews (created_at)
     WHERE resolved_at IS NULL;

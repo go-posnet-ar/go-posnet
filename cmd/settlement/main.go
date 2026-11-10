@@ -64,8 +64,13 @@ func run() error {
 		slog.String("version", cfg.OTEL.ServiceVersion),
 		slog.String("env", cfg.OTEL.Environment),
 		slog.Float64("mdr_percent", cfg.Settlement.MDRPercent),
-		slog.Int("batch_close_hour_utc", cfg.Settlement.BatchCloseHour),
+		slog.Bool("batch_close_auto", cfg.Settlement.BatchCloseHour != 0),
+		slog.Duration("batch_close_grace", cfg.Settlement.BatchCloseGrace),
 	)
+	if cfg.Settlement.BatchCloseHourDeprecated {
+		log.Warn("SETTLEMENT_BATCH_CLOSE_HOUR no longer sets an hour: each batch closes at its merchant's midnight plus SETTLEMENT_BATCH_CLOSE_GRACE. Only 0, which disables the automatic close, still has an effect",
+			slog.Int("value", cfg.Settlement.BatchCloseHour))
+	}
 
 	// ── 6. Wiring de dependencias ──────────────────────────────────────────────
 	app, err := wire(ctx, cfg)

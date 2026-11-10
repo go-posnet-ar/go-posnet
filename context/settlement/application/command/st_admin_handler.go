@@ -33,6 +33,24 @@ type AdminHandler struct {
 	mdrPercent float64
 	reviews    repository.ReversalReviewLog // opcional; nil = no considera las revisiones
 	timezones  repository.MerchantTimezones // opcional
+	location   *time.Location               // zona de los comercios sin una propia; nil = UTC
+	releaser   BatchReleaser                // opcional; nil = cerrar una revisión no libera el lote
+}
+
+// BatchReleaser libera un lote retenido cuando se cierra su última revisión de reversa.
+type BatchReleaser interface {
+	ReleaseHeldBatch(ctx context.Context, batchID string) error
+}
+
+// SetBatchReleaser habilita la liberación de los lotes retenidos al cerrar una revisión.
+func (h *AdminHandler) SetBatchReleaser(r BatchReleaser) {
+	h.releaser = r
+}
+
+// SetBusinessLocation define la zona de los comercios sin una propia: es la zona anterior al
+// cambiar la de un comercio que no tenía.
+func (h *AdminHandler) SetBusinessLocation(loc *time.Location) {
+	h.location = loc
 }
 
 // SetReversalReviews habilita las revisiones de reversas: frenan el envío de sus lotes.
@@ -429,8 +447,9 @@ var reviewAuditActions = map[string]string{
 }
 
 // ResolveReversalReview cierra la revisión de una reversa y, si corresponde, corrige el
-// lote. Solo se corrige un lote que no se envió: en OPEN o DISPUTED. Los totales se
-// recalculan al volver a cerrarlo. La corrección, el cierre y la auditoría son atómicos.
+// lote. Solo se corrige un lote que no se envió: en OPEN o DISPUTED. La corrección, el cierre
+// y la auditoría son atómicos. Si era la última revisión de un lote DISPUTED, después se lo
+// vuelve a conciliar y, si coincide, se libera y se envía (ver BatchHandler.ReleaseHeldBatch).
 func (h *AdminHandler) ResolveReversalReview(ctx context.Context, cmd port.ResolveReversalReviewCommand) error {
 	ctx, span := observability.StartSpan(ctx, "command.ResolveReversalReview")
 	defer span.End()
@@ -470,7 +489,12 @@ func (h *AdminHandler) ResolveReversalReview(ctx context.Context, cmd port.Resol
 		if err := h.applyReviewAction(ctx, tx, review, cmd.Action); err != nil {
 			return err
 		}
-		if err := h.reviews.CloseReversalReviewTx(ctx, tx, cmd.TransactionID, cmd.OperatorID, cmd.Resolution); err != nil {
+		// ACCEPT sobre una reversa excluida la deja excluida: la acción guardada lo sigue diciendo.
+		storedAction := cmd.Action
+		if review.Action == repository.ReviewActionExclude && cmd.Action == repository.ReviewActionAccept {
+			storedAction = repository.ReviewActionExclude
+		}
+		if err := h.reviews.CloseReversalReviewTx(ctx, tx, cmd.TransactionID, cmd.OperatorID, cmd.Resolution, storedAction); err != nil {
 			return err
 		}
 		return h.audit.InsertAuditTx(ctx, tx, repository.BatchAuditEntry{
@@ -488,10 +512,20 @@ func (h *AdminHandler) ResolveReversalReview(ctx context.Context, cmd port.Resol
 		slog.String("operator_id", cmd.OperatorID),
 		slog.String("action", cmd.Action),
 	)
+	if h.releaser != nil {
+		if err := h.releaser.ReleaseHeldBatch(ctx, batchID); err != nil {
+			observability.FromContext(ctx).Error("could not release the held batch — it stays DISPUTED",
+				slog.String("batch_id", batchID), slog.String("error", err.Error()))
+		}
+	}
 	return nil
 }
 
 // applyReviewAction corrige la reversa en el lote, si la acción lo pide y el lote lo permite.
+//
+// Una revisión reabierta de una reversa excluida, porque su compra llegó y no coincide, tiene
+// la reversa fuera de todo lote: ACCEPT la deja así, USE_PURCHASE_AMOUNT la vuelve a agregar
+// con el monto de la compra, y EXCLUDE no aplica.
 func (h *AdminHandler) applyReviewAction(ctx context.Context, tx pgx.Tx, review *repository.StoredReversalReview, action string) error {
 	if action == repository.ReviewActionAccept {
 		return nil
@@ -501,7 +535,11 @@ func (h *AdminHandler) applyReviewAction(ctx context.Context, tx pgx.Tx, review 
 			"batch must be OPEN or DISPUTED to correct it, current state is %s; use ACCEPT and adjust it with the processor", review.BatchState,
 		))
 	}
+	excluded := review.Action == repository.ReviewActionExclude
 	if action == repository.ReviewActionExclude {
+		if excluded {
+			return pkgerrors.NewValidationError("the reversal is already excluded; use ACCEPT to keep it that way")
+		}
 		return h.reviews.DeleteReversalTx(ctx, tx, review.BatchID, review.TransactionID)
 	}
 	if review.Reason != repository.ReversalReviewAmountMismatch || review.Purchase == nil {
@@ -509,11 +547,16 @@ func (h *AdminHandler) applyReviewAction(ctx context.Context, tx pgx.Tx, review 
 			"%s only applies to %s, this review is %s", repository.ReviewActionUsePurchaseAmount, repository.ReversalReviewAmountMismatch, review.Reason,
 		))
 	}
+	if excluded {
+		return h.reviews.InsertReversalTx(ctx, tx, review.BatchID, review.TransactionID, review.Purchase.AmountCents, review.Purchase.Currency)
+	}
 	return h.reviews.UpdateReversalAmountTx(ctx, tx, review.BatchID, review.TransactionID, review.Purchase.AmountCents)
 }
 
 // SetMerchantTimezone define la zona del día de negocio de un comercio. Rige para las
-// operaciones siguientes: los lotes ya creados conservan su fecha.
+// operaciones siguientes. Los lotes OPEN fechados hoy en la zona anterior pasan a hoy en la
+// nueva, para que la venta siguiente no abra otro lote; los de días anteriores conservan su
+// fecha y los cierra el job.
 func (h *AdminHandler) SetMerchantTimezone(ctx context.Context, cmd port.SetMerchantTimezoneCommand) error {
 	ctx, span := observability.StartSpan(ctx, "command.SetMerchantTimezone")
 	defer span.End()
@@ -532,18 +575,31 @@ func (h *AdminHandler) SetMerchantTimezone(ctx context.Context, cmd port.SetMerc
 	if h.timezones == nil {
 		return fmt.Errorf("SetMerchantTimezone: timezones are not configured")
 	}
-	err = h.timezones.SetMerchantTimezone(ctx, merchantID.String(), cmd.Timezone, cmd.OperatorID)
+	defaultTZ := "UTC"
+	if h.location != nil {
+		defaultTZ = h.location.String()
+	}
+	moved, err := h.timezones.SetMerchantTimezone(ctx, merchantID.String(), cmd.Timezone, defaultTZ, cmd.OperatorID)
 	if errors.Is(err, repository.ErrUnknownTimezone) {
 		return pkgerrors.NewValidationError("timezone must be a valid IANA name")
 	}
 	if err != nil {
 		return fmt.Errorf("SetMerchantTimezone: %w", err)
 	}
-	observability.FromContext(ctx).Warn("merchant business timezone changed by operator",
+	log := observability.FromContext(ctx)
+	log.Warn("merchant business timezone changed by operator",
 		slog.String("merchant_id", merchantID.String()),
 		slog.String("timezone", cmd.Timezone),
 		slog.String("operator_id", cmd.OperatorID),
+		slog.Int("batches_redated", len(moved)),
 	)
+	for _, b := range moved {
+		log.Warn("open batch moved to the new business date",
+			slog.String("batch_id", b.BatchID),
+			slog.String("from", b.FromDate),
+			slog.String("to", b.ToDate),
+		)
+	}
 	return nil
 }
 

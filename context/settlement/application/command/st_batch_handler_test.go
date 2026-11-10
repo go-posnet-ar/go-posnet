@@ -707,6 +707,21 @@ func TestCloseStaleBatches_FindError(t *testing.T) {
 	}
 }
 
+// El lote de ayer se cierra recién pasado el plazo: la búsqueda recibe now − closeGrace.
+func TestCloseStaleBatches_AppliesTheCloseGrace(t *testing.T) {
+	repo := &fakeBatchRepo{}
+	h := newHandler(newMockPool(t), repo, &fakePublisher{}, &fakeProcessor{})
+	h.SetCloseGrace(30 * time.Minute)
+	now := time.Date(2026, 11, 9, 3, 10, 0, 0, time.UTC)
+
+	if _, _, err := h.CloseStaleBatches(context.Background(), now); err != nil {
+		t.Fatalf("CloseStaleBatches() error = %v", err)
+	}
+	if want := now.Add(-30 * time.Minute); !repo.staleNow.Equal(want) {
+		t.Errorf("FindStaleOpenIDs now = %v, want %v", repo.staleNow, want)
+	}
+}
+
 func TestCloseStaleBatches_ClosesPublishesAndSubmits(t *testing.T) {
 	batch := closableFoundBatch(t)
 	repo := &fakeBatchRepo{staleIDs: []string{batch.ID()}, findByIDResult: batch}
@@ -1111,10 +1126,10 @@ type fakeReviews struct {
 	inserted  []repository.ReversalReview
 	insertErr error
 
-	reconcileReason   string
-	reconcileResolved bool
-	reconcileErr      error
-	reconciled        []repository.ReversalPurchase
+	reconcileResult repository.ReviewReconciliation
+	reconcileErr    error
+	reconciled      []repository.ReversalPurchase
+	reconcileBatch  string // purchaseBatchID que recibió ReconcileReversalReviewTx
 
 	openCount int
 	openErr   error
@@ -1126,6 +1141,9 @@ type fakeReviews struct {
 	deleteCalls  int
 	closedBy     string
 	closedNote   string
+	closedAction string
+
+	insertedReversals []string // "batch|tx|amount|currency" de InsertReversalTx
 }
 
 func (f *fakeReviews) CountOpenReversalReviews(context.Context, string) (int, error) {
@@ -1151,8 +1169,13 @@ func (f *fakeReviews) DeleteReversalTx(context.Context, pgx.Tx, string, string) 
 	return nil
 }
 
-func (f *fakeReviews) CloseReversalReviewTx(_ context.Context, _ pgx.Tx, _, operator, resolution string) error {
-	f.closedBy, f.closedNote = operator, resolution
+func (f *fakeReviews) CloseReversalReviewTx(_ context.Context, _ pgx.Tx, _, operator, resolution, action string) error {
+	f.closedBy, f.closedNote, f.closedAction = operator, resolution, action
+	return nil
+}
+
+func (f *fakeReviews) InsertReversalTx(_ context.Context, _ pgx.Tx, batchID, txID string, amount int64, currency string) error {
+	f.insertedReversals = append(f.insertedReversals, fmt.Sprintf("%s|%s|%d|%s", batchID, txID, amount, currency))
 	return nil
 }
 
@@ -1165,9 +1188,10 @@ func (f *fakeReviews) InsertReversalReviewTx(_ context.Context, _ pgx.Tx, r repo
 	return f.insertErr
 }
 
-func (f *fakeReviews) ReconcileReversalReviewTx(_ context.Context, _ pgx.Tx, _ string, p repository.ReversalPurchase) (string, bool, error) {
+func (f *fakeReviews) ReconcileReversalReviewTx(_ context.Context, _ pgx.Tx, _, purchaseBatchID string, p repository.ReversalPurchase) (repository.ReviewReconciliation, error) {
 	f.reconciled = append(f.reconciled, p)
-	return f.reconcileReason, f.reconcileResolved, f.reconcileErr
+	f.reconcileBatch = purchaseBatchID
+	return f.reconcileResult, f.reconcileErr
 }
 
 func TestRegisterReversal_Review(t *testing.T) {
@@ -1256,7 +1280,7 @@ func TestRegisterApproval_ReconcilesPendingReview(t *testing.T) {
 	repo := &fakeBatchRepo{findOrCreateResult: newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())}
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
-	reviews := &fakeReviews{reconcileReason: repository.ReversalReviewPurchaseNotFound, reconcileResolved: true}
+	reviews := &fakeReviews{reconcileResult: repository.ReviewReconciliation{Resolved: true}}
 	h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
 	h.SetReversalReviews(reviews)
 	cmd := validApprovalCmd()

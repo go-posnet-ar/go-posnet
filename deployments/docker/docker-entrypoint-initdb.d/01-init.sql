@@ -216,7 +216,11 @@ CREATE TABLE IF NOT EXISTS settlement.settlement_batches (
     closed_at       TIMESTAMPTZ,
     submitted_at    TIMESTAMPTZ,
     settled_at      TIMESTAMPTZ,
-    version         INTEGER     NOT NULL DEFAULT 0
+    version         INTEGER     NOT NULL DEFAULT 0,
+    -- Contra qué se concilió el cierre (TERMINAL o BACKEND) y los totales del terminal.
+    reconciled_with VARCHAR(10),
+    terminal_count  INTEGER,
+    terminal_amount BIGINT
 );
 -- Un solo lote abierto por terminal, fecha y moneda.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_settlement_batches_open
@@ -281,7 +285,8 @@ CREATE TABLE IF NOT EXISTS settlement.reversal_reviews (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     resolved_at          TIMESTAMPTZ,
     resolved_by          TEXT,
-    resolution           TEXT
+    resolution           TEXT,
+    action               VARCHAR(30)
 );
 CREATE INDEX IF NOT EXISTS idx_reversal_reviews_open ON settlement.reversal_reviews (created_at)
     WHERE resolved_at IS NULL;

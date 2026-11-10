@@ -3,6 +3,7 @@ package command_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -320,15 +321,48 @@ type fakeTimezones struct {
 	err        error
 	setErr     error
 	set        []string
+	moved      []repository.RedatedBatch
 }
 
 func (f *fakeTimezones) MerchantTimezone(_ context.Context, merchantID string) (string, error) {
 	return f.byMerchant[merchantID], f.err
 }
 
-func (f *fakeTimezones) SetMerchantTimezone(_ context.Context, merchantID, timezone, operatorID string) error {
-	f.set = append(f.set, merchantID+"|"+timezone+"|"+operatorID)
-	return f.setErr
+func (f *fakeTimezones) SetMerchantTimezone(_ context.Context, merchantID, timezone, defaultTimezone, operatorID string) ([]repository.RedatedBatch, error) {
+	f.set = append(f.set, merchantID+"|"+timezone+"|"+defaultTimezone+"|"+operatorID)
+	return f.moved, f.setErr
+}
+
+// La zona anterior de un comercio sin zona propia es la general: el repositorio la necesita
+// para saber qué lote es el de hoy.
+func TestSetMerchantTimezone_PassesTheDefaultZone(t *testing.T) {
+	loc, _ := time.LoadLocation("America/Argentina/Buenos_Aires")
+	merchant := domain.NewMerchantID().String()
+	timezones := &fakeTimezones{moved: []repository.RedatedBatch{{BatchID: "b1", FromDate: "2026-11-08", ToDate: "2026-11-09"}}}
+	h := command.NewAdminHandler(&fakeBatchRepo{}, &fakeProcessor{})
+	h.SetMerchantTimezones(timezones)
+	h.SetBusinessLocation(loc)
+
+	cmd := port.SetMerchantTimezoneCommand{MerchantID: merchant, Timezone: "Asia/Tokyo", OperatorID: "op"}
+	if err := h.SetMerchantTimezone(context.Background(), cmd); err != nil {
+		t.Fatalf("error = %v", err)
+	}
+	if want := merchant + "|Asia/Tokyo|America/Argentina/Buenos_Aires|op"; len(timezones.set) != 1 || timezones.set[0] != want {
+		t.Errorf("set = %v, want [%s]", timezones.set, want)
+	}
+}
+
+// Un choque con otro lote OPEN se propaga sin envolverlo como validación: el HTTP responde 409.
+func TestSetMerchantTimezone_OpenBatchConflict(t *testing.T) {
+	h := command.NewAdminHandler(&fakeBatchRepo{}, &fakeProcessor{})
+	h.SetMerchantTimezones(&fakeTimezones{setErr: repository.ErrOpenBatchConflict})
+
+	err := h.SetMerchantTimezone(context.Background(), port.SetMerchantTimezoneCommand{
+		MerchantID: domain.NewMerchantID().String(), Timezone: "Asia/Tokyo", OperatorID: "op",
+	})
+	if !errors.Is(err, repository.ErrOpenBatchConflict) {
+		t.Fatalf("error = %v, want ErrOpenBatchConflict", err)
+	}
 }
 
 func TestRegisterApproval_UsesMerchantTimezone(t *testing.T) {
@@ -470,5 +504,87 @@ func TestProcessBatchClose_BatchDateUsesMerchantTimezone(t *testing.T) {
 	}
 	if got := repo.findOpenDate.Format("2006-01-02"); got != "2026-11-06" {
 		t.Errorf("close date = %s", got)
+	}
+}
+
+// ─── Días anteriores: solo ayer, o un lote reabierto ─────────────────────────
+
+type fakeReopens struct {
+	reopened bool
+	err      error
+	asked    []string
+}
+
+func (f *fakeReopens) WasReopened(_ context.Context, batchID string) (bool, error) {
+	f.asked = append(f.asked, batchID)
+	return f.reopened, f.err
+}
+
+func TestProcessBatchClose_PastDaysNeedAReopen(t *testing.T) {
+	requested := time.Date(2026, 11, 9, 15, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		date      string
+		reopened  bool
+		wantClose bool
+		wantAsked bool
+	}{
+		{"today", "2026-11-09", false, true, false},
+		{"yesterday, closed after midnight", "2026-11-08", false, true, false},
+		{"three days ago, not reopened", "2026-11-06", false, false, true},
+		{"three days ago, reopened by an operator", "2026-11-06", true, true, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			batch := closableFoundBatch(t)
+			repo := &fakeBatchRepo{findOpenResult: batch}
+			pool := newMockPool(t)
+			if tc.wantClose {
+				expectClaimedWithEvent(pool)
+			}
+			reopens := &fakeReopens{reopened: tc.reopened}
+			h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+			h.SetMaxCloseAge(7)
+			h.SetBatchReopens(reopens)
+
+			cmd := closeCmd(batch.TerminalID(), 2, 3000)
+			cmd.BatchDate, cmd.RequestedAt = tc.date, requested.Format(time.RFC3339)
+			err := h.ProcessBatchClose(context.Background(), cmd)
+
+			if (len(reopens.asked) > 0) != tc.wantAsked {
+				t.Errorf("asked about a reopen = %v, want %v", reopens.asked, tc.wantAsked)
+			}
+			if !tc.wantClose {
+				wantValidation(t, err)
+				if !strings.Contains(err.Error(), "was not reopened") {
+					t.Errorf("error = %v, want it to explain the batch was not reopened", err)
+				}
+				if batch.State() != valueobject.BatchStateOpen || repo.saveCallCount != 0 {
+					t.Errorf("state = %s, saves = %d, want OPEN and nothing saved", batch.State(), repo.saveCallCount)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ProcessBatchClose() error = %v", err)
+			}
+			if batch.State() == valueobject.BatchStateOpen {
+				t.Error("batch still OPEN, want it closed")
+			}
+		})
+	}
+}
+
+// Un error al consultar la auditoría es transitorio: el cierre se reintenta.
+func TestProcessBatchClose_ReopenCheckErrorIsTransient(t *testing.T) {
+	batch := closableFoundBatch(t)
+	h := newHandler(newMockPool(t), &fakeBatchRepo{findOpenResult: batch}, &fakePublisher{}, &fakeProcessor{})
+	h.SetBatchReopens(&fakeReopens{err: errors.New("connection reset")})
+
+	cmd := closeCmd(batch.TerminalID(), 2, 3000)
+	cmd.BatchDate, cmd.RequestedAt = "2026-11-06", time.Date(2026, 11, 9, 15, 0, 0, 0, time.UTC).Format(time.RFC3339)
+	err := h.ProcessBatchClose(context.Background(), cmd)
+	var ve *pkgerrors.ValidationError
+	if err == nil || errors.As(err, &ve) {
+		t.Fatalf("error = %v, want a transient error", err)
 	}
 }

@@ -25,6 +25,7 @@ import (
 //	posnet_settlement_batches_attention → posnet_settlement_batches_attention{reason}
 //	posnet_settlement_outbox_stuck → posnet_settlement_outbox_stuck
 //	posnet_settlement_reversals_in_review → posnet_settlement_reversals_in_review
+//	posnet_settlement_batch_close_rejected → posnet_settlement_batch_close_rejected_total{reason}
 //
 // El label "bc" lo inyecta Prometheus como target label (prometheus.yml).
 type Metrics struct {
@@ -33,7 +34,15 @@ type Metrics struct {
 	batches       metric.Int64Counter
 	batchDuration metric.Float64Histogram
 	submissions   metric.Int64Counter
+	closeRejected metric.Int64Counter
 }
+
+// Valores del label reason de posnet_settlement_batch_close_rejected_total.
+const (
+	closeRejectedFuture      = "future"       // batch_date posterior al día de negocio
+	closeRejectedTooOld      = "too_old"      // más antiguo que SETTLEMENT_CLOSE_MAX_AGE_DAYS
+	closeRejectedNotReopened = "not_reopened" // anterior a ayer, de un lote que nadie reabrió
+)
 
 // Valores del label result de posnet_settlement_submissions_total.
 const (
@@ -90,12 +99,19 @@ func NewMetrics() (*Metrics, error) {
 		return nil, err
 	}
 
+	closeRejected, err := m.Int64Counter("posnet_settlement_batch_close_rejected",
+		metric.WithDescription("Pedidos de cierre de un terminal rechazados por su batch_date, por reason. El terminal no recibe respuesta."))
+	if err != nil {
+		return nil, err
+	}
+
 	return &Metrics{
 		authApproved:  authApproved,
 		reversals:     reversals,
 		batches:       batches,
 		batchDuration: batchDuration,
 		submissions:   submissions,
+		closeRejected: closeRejected,
 	}, nil
 }
 
@@ -105,6 +121,14 @@ func (m *Metrics) RecordSubmission(ctx context.Context, result string) {
 		return
 	}
 	m.submissions.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
+}
+
+// RecordCloseRejected cuenta un pedido de cierre rechazado por su batch_date. Nil-safe.
+func (m *Metrics) RecordCloseRejected(ctx context.Context, reason string) {
+	if m == nil {
+		return
+	}
+	m.closeRejected.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
 }
 
 func (m *Metrics) RecordAuthApproved(ctx context.Context) {
@@ -137,7 +161,10 @@ func (m *Metrics) RecordBatchClosed(ctx context.Context, currency, state string,
 // base en cada scrape. Loc es la zona de los comercios sin una propia, igual que en el cierre
 // automático.
 // Si la consulta falla, la serie no se informa en ese scrape: un cero ocultaría los lotes.
-func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *time.Location) error {
+//
+// closeGrace es el plazo del cierre automático: un lote OPEN cuenta como vencido recién
+// cuando el job ya debería haberlo cerrado.
+func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *time.Location, closeGrace time.Duration) error {
 	gauge, err := observability.Meter("posnet.settlement").Int64ObservableGauge(
 		"posnet_settlement_batches_attention",
 		metric.WithDescription("Lotes que requieren atención, por reason: disputed, closed_unsent u open_overdue."),
@@ -165,7 +192,7 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 			defer cancel()
 
 			now := time.Now()
-			counts, err := counter.CountBatchesNeedingAttention(ctx, now, loc.String(), now.Add(-closedUnsentAfter), now.Add(-outboxStuckAfter), now.Add(-reversalReviewAfter))
+			counts, err := counter.CountBatchesNeedingAttention(ctx, now.Add(-closeGrace), loc.String(), now.Add(-closedUnsentAfter), now.Add(-outboxStuckAfter), now.Add(-reversalReviewAfter))
 			if err != nil {
 				slog.ErrorContext(ctx, "failed to count batches needing attention", slog.String("error", err.Error()))
 				return nil

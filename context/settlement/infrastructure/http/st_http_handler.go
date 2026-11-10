@@ -348,6 +348,11 @@ func (h *Handler) writeAdminResult(w http.ResponseWriter, r *http.Request, err e
 		writeJSON(w, http.StatusConflict, errResp("CONFLICT", "batch was modified concurrently; retry"))
 		return
 	}
+	if errors.Is(err, repository.ErrOpenBatchConflict) {
+		writeJSON(w, http.StatusConflict, errResp("OPEN_BATCH_CONFLICT",
+			"a terminal of this merchant already has an OPEN batch for the new business date: close it first; nothing was changed"))
+		return
+	}
 	observability.RecordError(r.Context(), err)
 	writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", "internal error"))
 }

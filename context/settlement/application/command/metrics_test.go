@@ -132,7 +132,7 @@ func TestBatchAttentionGauge_ReportsEveryReason(t *testing.T) {
 	reader := newTestReader(t)
 	counter := &fakeAttentionCounter{counts: repository.BatchAttentionCounts{Disputed: 2, OpenOverdue: 1, OutboxStuck: 4, ReversalsInReview: 5}}
 	loc := time.FixedZone("BA", -3*60*60)
-	if err := command.RegisterBatchAttentionGauge(counter, loc); err != nil {
+	if err := command.RegisterBatchAttentionGauge(counter, loc, 0); err != nil {
 		t.Fatalf("RegisterBatchAttentionGauge() error = %v", err)
 	}
 
@@ -171,10 +171,28 @@ func TestBatchAttentionGauge_ReportsEveryReason(t *testing.T) {
 	}
 }
 
+// Un lote OPEN de ayer cuenta como vencido recién cuando pasó el plazo del cierre automático:
+// el conteo usa la misma hora corrida que el job.
+func TestBatchAttentionGauge_OverdueUsesTheCloseGrace(t *testing.T) {
+	reader := newTestReader(t)
+	counter := &fakeAttentionCounter{}
+	if err := command.RegisterBatchAttentionGauge(counter, time.UTC, 30*time.Minute); err != nil {
+		t.Fatalf("RegisterBatchAttentionGauge() error = %v", err)
+	}
+	before := time.Now()
+	collectMetrics(t, reader)
+	if got := before.Sub(counter.now); got < 29*time.Minute || got > 31*time.Minute {
+		t.Errorf("now passed to the count = %v before the scrape, want about 30m", got)
+	}
+	if counter.outboxBefore.After(before.Add(-time.Minute + time.Second)) {
+		t.Errorf("outboxBefore = %v, want about one minute ago: the grace only applies to open_overdue", counter.outboxBefore)
+	}
+}
+
 func TestBatchAttentionGauge_QueryErrorOmitsSeries(t *testing.T) {
 	reader := newTestReader(t)
 	counter := &fakeAttentionCounter{err: errors.New("db down")}
-	if err := command.RegisterBatchAttentionGauge(counter, time.UTC); err != nil {
+	if err := command.RegisterBatchAttentionGauge(counter, time.UTC, 0); err != nil {
 		t.Fatalf("RegisterBatchAttentionGauge() error = %v", err)
 	}
 
