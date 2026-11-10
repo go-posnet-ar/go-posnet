@@ -29,7 +29,7 @@ COPY --from=builder /app/bin/settlement .
 RUN addgroup -S posnet && adduser -S posnet -G posnet
 USER posnet
 
-EXPOSE 8084 9093
+EXPOSE 8084
 
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \

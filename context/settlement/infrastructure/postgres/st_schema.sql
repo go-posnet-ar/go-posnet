@@ -65,7 +65,7 @@ CREATE TABLE settlement.batch_transactions (
     transaction_id  UUID        NOT NULL,
     amount_cents    BIGINT      NOT NULL,
     currency        CHAR(3)     NOT NULL,
-    tx_type         VARCHAR(20) NOT NULL,        -- PURCHASE | REVERSAL | OFFLINE | ADJUSTMENT (con signo)
+    tx_type         VARCHAR(20) NOT NULL,        -- PURCHASE | REVERSAL | ADJUSTMENT (con signo)
     included_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

@@ -58,7 +58,6 @@ type BatchTransactionType string
 const (
 	BatchTxPurchase BatchTransactionType = "PURCHASE" // Compra aprobada
 	BatchTxReversal BatchTransactionType = "REVERSAL" // Anulación procesada
-	BatchTxOffline  BatchTransactionType = "OFFLINE"  // Transacción aprobada offline
 	// BatchTxAdjustment corrige un lote ya enviado, en el lote abierto siguiente del terminal.
 	// Su monto tiene signo: positivo devuelve al comercio, negativo le descuenta. El terminal no
 	// lo conoce, así que no entra en la conciliación.
@@ -67,7 +66,7 @@ const (
 
 func ParseBatchTransactionType(s string) (BatchTransactionType, error) {
 	switch BatchTransactionType(s) {
-	case BatchTxPurchase, BatchTxReversal, BatchTxOffline, BatchTxAdjustment:
+	case BatchTxPurchase, BatchTxReversal, BatchTxAdjustment:
 		return BatchTransactionType(s), nil
 	}
 	return "", fmt.Errorf("unknown batch transaction type %q", s)

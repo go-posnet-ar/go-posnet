@@ -35,7 +35,7 @@ de cada servicio está en [`docs/technical/`](../technical/).
 | Authorization | `posnet-authorization` | 8080 | 9090 |
 | Terminal Gateway | `posnet-terminal-gateway` | 8081 | 9091 |
 | Fraud Detection | `posnet-fraud-detection` | 8083 | 9092 |
-| Settlement | `posnet-settlement` | 8084 | 9093 |
+| Settlement | `posnet-settlement` | 8084 | — |
 | Notification | `posnet-notification` | 8085 | 9094 |
 
 Son los puertos de Docker Compose. Fuera de Docker, los defaults del código son distintos: Fraud

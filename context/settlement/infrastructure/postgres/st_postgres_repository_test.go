@@ -14,6 +14,7 @@ import (
 	"github.com/pashagolub/pgxmock/v4"
 
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/settlement/domain/entity"
 	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	"github.com/juantevez/go-posnet/context/settlement/infrastructure/postgres"
@@ -373,9 +374,6 @@ func TestFindOrCreateOpen_ExistingBatch(t *testing.T) {
 	pool.ExpectQuery("WHERE id =").
 		WithArgs(row.id).
 		WillReturnRows(row.rows())
-	pool.ExpectQuery("FROM settlement.batch_transactions").
-		WithArgs(row.id).
-		WillReturnRows(emptyBatchTxRows())
 	pool.ExpectCommit()
 	pool.ExpectRollback()
 
@@ -454,9 +452,6 @@ func TestFindOrCreateOpen_ConcurrentConflict_ReloadsWinner(t *testing.T) {
 	pool.ExpectQuery("WHERE id =").
 		WithArgs(row.id).
 		WillReturnRows(row.rows())
-	pool.ExpectQuery("FROM settlement.batch_transactions").
-		WithArgs(row.id).
-		WillReturnRows(emptyBatchTxRows())
 	pool.ExpectCommit()
 	pool.ExpectRollback()
 
@@ -1585,5 +1580,105 @@ func TestCountTerminalDayBatches(t *testing.T) {
 	n, err := postgres.NewSettlementBatchRepo(pool).CountTerminalDayBatches(context.Background(), terminal, time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC), "ARS")
 	if err != nil || n != 2 {
 		t.Errorf("CountTerminalDayBatches() = %d, %v, want 2", n, err)
+	}
+}
+
+// Una venta en un lote grande inserta solo la venta: las transacciones cargadas ya están.
+func TestSave_InsertsOnlyNewTransactions(t *testing.T) {
+	pool := newMockPool(t)
+	repo := postgres.NewSettlementBatchRepo(pool)
+	var loaded []*entity.BatchTransaction
+	for range 3 {
+		loaded = append(loaded, entity.ReconstituteBatchTransaction(domain.NewTransactionID().String(), "batch-1",
+			domain.NewTransactionID(), 100, "ARS", valueobject.BatchTxPurchase, time.Now()))
+	}
+	b := aggregate.Reconstitute(aggregate.ReconstituteParams{
+		ID: "batch-1", TerminalID: domain.NewTerminalID(), MerchantID: domain.NewMerchantID(),
+		State: valueobject.BatchStateOpen, Currency: "ARS", Version: 3, Transactions: loaded,
+	})
+	sale := domain.NewTransactionID()
+	if err := b.AddTransaction(sale, 500, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
+		WithArgs(anyArgs(23)...).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	// Una sola: pgxmock falla ante un insert no esperado.
+	pool.ExpectExec("INSERT INTO settlement.batch_transactions").
+		WithArgs(pgxmock.AnyArg(), "batch-1", sale.String(), int64(500), "ARS", "PURCHASE", pgxmock.AnyArg()).
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	pool.ExpectCommit()
+	pool.ExpectRollback()
+	if err := repo.Save(context.Background(), b); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	// Guardado: un segundo Save no inserta ninguna.
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
+		WithArgs(anyArgs(23)...).
+		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
+	pool.ExpectCommit()
+	pool.ExpectRollback()
+	if err := repo.Save(context.Background(), b); err != nil {
+		t.Fatalf("second Save() error = %v", err)
+	}
+}
+
+// FindOrCreateOpen no carga las transacciones: el lote sirve para agregar una, no para cerrarlo.
+func TestFindOrCreateOpen_DoesNotLoadTransactions(t *testing.T) {
+	pool := newMockPool(t)
+	row := newBatchRow()
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.Serializable})
+	pool.ExpectQuery("SELECT id FROM settlement.settlement_batches").
+		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg()).
+		WillReturnRows(pgxmock.NewRows([]string{"id"}).AddRow(row.id))
+	pool.ExpectQuery("WHERE id =").
+		WithArgs(row.id).
+		WillReturnRows(row.rows())
+	pool.ExpectCommit()
+	pool.ExpectRollback()
+
+	b, err := postgres.NewSettlementBatchRepo(pool).FindOrCreateOpen(context.Background(), domain.NewTerminalID(), domain.NewMerchantID(), time.Now(), "ARS")
+	if err != nil {
+		t.Fatalf("FindOrCreateOpen() error = %v", err)
+	}
+	if len(b.Transactions()) != 0 {
+		t.Errorf("Transactions() = %d, want none loaded", len(b.Transactions()))
+	}
+	if _, _, err := b.BackendTotals(); !errors.Is(err, aggregate.ErrTransactionsNotLoaded) {
+		t.Errorf("BackendTotals() error = %v, want ErrTransactionsNotLoaded", err)
+	}
+}
+
+// Un lote con una transacción que no se puede leer no se carga: sin ella, los totales estarían mal.
+func TestFindByID_IncompleteTransactionsFail(t *testing.T) {
+	tests := []struct {
+		name string
+		rows func(batchID string) *pgxmock.Rows
+		want string
+	}{
+		{"unknown type", func(id string) *pgxmock.Rows {
+			return pgxmock.NewRows(batchTxColumns).AddRow(id+"-tx1", id, domain.NewTransactionID().String(),
+				int64(1000), "ARS", "OFFLINE", time.Now())
+		}, "unknown batch transaction type"},
+		{"read cut", func(id string) *pgxmock.Rows {
+			return oneBatchTxRow(id).RowError(0, errors.New("connection reset"))
+		}, "connection reset"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newMockPool(t)
+			row := newBatchRow()
+			pool.ExpectQuery("WHERE id =").WithArgs(row.id).WillReturnRows(row.rows())
+			pool.ExpectQuery("FROM settlement.batch_transactions").WithArgs(row.id).WillReturnRows(tc.rows(row.id))
+
+			_, err := postgres.NewSettlementBatchRepo(pool).FindByID(context.Background(), row.id)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("FindByID() error = %v, want it to mention %q", err, tc.want)
+			}
+		})
 	}
 }

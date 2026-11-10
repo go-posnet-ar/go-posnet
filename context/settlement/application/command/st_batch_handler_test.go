@@ -24,7 +24,7 @@ import (
 )
 
 func newHandler(pool pgutil.PgxPool, batchRepo repository.SettlementBatchRepository, publisher service.EventPublisher, processor service.SettlementProcessor) *command.BatchHandler {
-	return command.NewBatchHandler(batchRepo, publisher, outbox.NewStore(idempotencySchema), processor, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool, 2.5)
+	return command.NewBatchHandler(batchRepo, publisher, outbox.NewStore(idempotencySchema), processor, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool)
 }
 
 // ─── RegisterApproval ──────────────────────────────────────────────────────────

@@ -92,7 +92,6 @@ func run() error {
 
 	log.Info("settlement BC ready — waiting for messages",
 		slog.Int("http_port", cfg.HTTPPort),
-		slog.Int("grpc_port", cfg.GRPCPort),
 	)
 
 	// ── 8. Graceful shutdown ───────────────────────────────────────────────────

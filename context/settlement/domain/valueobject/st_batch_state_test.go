@@ -150,7 +150,8 @@ func TestParseBatchTransactionType(t *testing.T) {
 	}{
 		{"PURCHASE", valueobject.BatchTxPurchase, false},
 		{"REVERSAL", valueobject.BatchTxReversal, false},
-		{"OFFLINE", valueobject.BatchTxOffline, false},
+		{"ADJUSTMENT", valueobject.BatchTxAdjustment, false},
+		{"OFFLINE", "", true},
 		{"purchase", "", true},
 		{"", "", true},
 		{"UNKNOWN", "", true},

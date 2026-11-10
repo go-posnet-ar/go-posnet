@@ -12,7 +12,6 @@ import (
 
 // Config contiene toda la configuración del BC Settlement.
 type Config struct {
-	GRPCPort int
 	HTTPPort int
 
 	Postgres   PostgresConfig
@@ -118,7 +117,6 @@ const (
 // Load carga la configuración desde variables de entorno.
 func Load() (*Config, error) {
 	cfg := &Config{
-		GRPCPort: envInt("GRPC_PORT", 9093),
 		HTTPPort: envInt("HTTP_PORT", 8083),
 
 		Postgres: PostgresConfig{

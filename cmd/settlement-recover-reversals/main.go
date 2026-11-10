@@ -81,7 +81,7 @@ func run(apply bool, operator, reason string, limit int) error {
 	}
 
 	// Sin publicador ni procesador: registrar una reversa no publica ni envía nada.
-	handler := command.NewBatchHandler(repo, nil, nil, nil, natsutil.NewIdempotencyStore(pool, "settlement"), pool, 0)
+	handler := command.NewBatchHandler(repo, nil, nil, nil, natsutil.NewIdempotencyStore(pool, "settlement"), pool)
 	handler.SetBusinessLocation(location)
 	handler.SetMerchantTimezones(repo)
 	handler.SetReversalReviews(repo)

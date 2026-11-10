@@ -91,9 +91,6 @@ func TestReconstitute(t *testing.T) {
 	if b.SettledAt() == nil || !b.SettledAt().Equal(settledAt) {
 		t.Errorf("SettledAt() = %v, want %v", b.SettledAt(), settledAt)
 	}
-	if len(b.DomainEvents()) != 0 {
-		t.Errorf("DomainEvents() len = %d, want 0 (Reconstitute does not emit events)", len(b.DomainEvents()))
-	}
 }
 
 func TestReconstitute_NilOptionalFields(t *testing.T) {

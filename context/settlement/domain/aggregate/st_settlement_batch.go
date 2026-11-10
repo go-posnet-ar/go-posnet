@@ -2,14 +2,17 @@
 package aggregate
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/juantevez/go-posnet/context/settlement/domain/entity"
-	"github.com/juantevez/go-posnet/context/settlement/domain/event"
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
+
+// ErrTransactionsNotLoaded es calcular los totales de un lote cargado sin sus transacciones.
+var ErrTransactionsNotLoaded = errors.New("batch loaded without its transactions")
 
 // SettlementBatch es el Aggregate Root del BC Settlement.
 // Representa el lote de transacciones de un terminal en un día.
@@ -22,8 +25,12 @@ type SettlementBatch struct {
 	state      valueobject.BatchState
 	currency   string
 
-	// Transacciones incluidas en el lote
+	// Transacciones incluidas en el lote. persistedTxs cuenta las que ya están guardadas: Save
+	// inserta solo las siguientes. Con txsLoaded en false el lote se cargó sin sus transacciones,
+	// para agregarle una: transactions tiene solo las nuevas y no se pueden calcular totales.
 	transactions []*entity.BatchTransaction
+	persistedTxs int
+	txsLoaded    bool
 
 	// Resumen calculado al cierre (nil mientras OPEN)
 	summary *valueobject.BatchSummary
@@ -46,9 +53,6 @@ type SettlementBatch struct {
 
 	// Versión persistida, para el bloqueo optimista
 	version int
-
-	// Eventos pendientes
-	domainEvents []event.DomainEvent
 }
 
 // NewSettlementBatch crea un lote nuevo en estado OPEN.
@@ -77,9 +81,9 @@ func NewSettlementBatch(
 		state:      valueobject.BatchStateOpen,
 		currency:   currency,
 		createdAt:  time.Now().UTC(),
+		txsLoaded:  true,
 	}
 
-	b.record(event.NewBatchOpened(id, terminalID, merchantID, batchDate))
 	return b, nil
 }
 
@@ -131,7 +135,6 @@ func (b *SettlementBatch) RequestClose() error {
 	if err := b.transition(valueobject.BatchStatePendingClose); err != nil {
 		return err
 	}
-	b.record(event.NewBatchCloseRequested(b.id, b.terminalID, b.merchantID))
 	return nil
 }
 
@@ -160,7 +163,6 @@ func (b *SettlementBatch) Close(terminalCount int, terminalAmount int64) error {
 	b.reconciledWith = ReconciledWithTerminal
 	b.terminalCount, b.terminalAmount = &terminalCount, &terminalAmount
 
-	b.record(event.NewBatchClosed(b.id, b.terminalID, b.merchantID, summary, b.discrepancies))
 	return nil
 }
 
@@ -313,12 +315,15 @@ func (b *SettlementBatch) BackendTotals() (int, int64, error) {
 // resumen, con los ajustes en el monto total, y la cantidad y el monto comparables con el
 // terminal, sin los ajustes.
 func (b *SettlementBatch) calculateSummary() (valueobject.BatchSummary, int, int64, error) {
+	if !b.txsLoaded {
+		return valueobject.BatchSummary{}, 0, 0, fmt.Errorf("settlement_batch %s: %w", b.id, ErrTransactionsNotLoaded)
+	}
 	var purchaseCount, reversalCount, adjustmentCount int
 	var purchaseAmount, reversalAmount, adjustmentAmount int64
 
 	for _, tx := range b.transactions {
 		switch tx.Type() {
-		case valueobject.BatchTxPurchase, valueobject.BatchTxOffline:
+		case valueobject.BatchTxPurchase:
 			purchaseCount++
 			purchaseAmount += tx.AmountCents()
 		case valueobject.BatchTxReversal:
@@ -373,7 +378,6 @@ func (b *SettlementBatch) MarkSettled() error {
 	}
 	now := time.Now().UTC()
 	b.settledAt = &now
-	b.record(event.NewBatchSettled(b.id, b.terminalID, b.merchantID, *b.summary))
 	return nil
 }
 
@@ -382,7 +386,6 @@ func (b *SettlementBatch) MarkDisputed(reason string) error {
 	if err := b.transition(valueobject.BatchStateDisputed); err != nil {
 		return err
 	}
-	b.record(event.NewBatchDisputed(b.id, b.terminalID, reason))
 	return nil
 }
 
@@ -396,10 +399,6 @@ func (b *SettlementBatch) transition(next valueobject.BatchState) error {
 	return nil
 }
 
-func (b *SettlementBatch) record(e event.DomainEvent) {
-	b.domainEvents = append(b.domainEvents, e)
-}
-
 func abs(x int) int {
 	if x < 0 {
 		return -x
@@ -407,9 +406,10 @@ func abs(x int) int {
 	return x
 }
 
-// MarkPersisted registra que el repositorio guardó esta versión.
+// MarkPersisted registra que el repositorio guardó esta versión y sus transacciones nuevas.
 func (b *SettlementBatch) MarkPersisted() {
 	b.version++
+	b.persistedTxs = len(b.transactions)
 }
 
 // ─── Getters ──────────────────────────────────────────────────────────────────
@@ -430,5 +430,8 @@ func (b *SettlementBatch) ClosedAt() *time.Time                     { return b.c
 func (b *SettlementBatch) SubmittedAt() *time.Time                  { return b.submittedAt }
 func (b *SettlementBatch) SettledAt() *time.Time                    { return b.settledAt }
 func (b *SettlementBatch) Version() int                             { return b.version }
-func (b *SettlementBatch) DomainEvents() []event.DomainEvent        { return b.domainEvents }
-func (b *SettlementBatch) ClearDomainEvents()                       { b.domainEvents = nil }
+
+// NewTransactions son las transacciones agregadas desde que se cargó o guardó el lote.
+func (b *SettlementBatch) NewTransactions() []*entity.BatchTransaction {
+	return b.transactions[b.persistedTxs:]
+}

@@ -54,7 +54,7 @@ func (l *logRecorder) last() slog.Record {
 // ─── builders ────────────────────────────────────────────────────────────────
 
 func newTestBatchHandler(pool pgutil.PgxPool, repo *fakeBatchRepo, publisher *fakeDomainPublisher, processor *fakeProcessor) *command.BatchHandler {
-	return command.NewBatchHandler(repo, publisher, outbox.NewStore(idempotencySchema), processor, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool, 2.5)
+	return command.NewBatchHandler(repo, publisher, outbox.NewStore(idempotencySchema), processor, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool)
 }
 
 func newEnvelopeMsg(t *testing.T, subject, aggregateID string, payload any) *natsclient.Msg {

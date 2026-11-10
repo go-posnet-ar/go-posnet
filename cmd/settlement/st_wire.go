@@ -14,7 +14,6 @@ import (
 	"github.com/juantevez/go-posnet/context/settlement/application/query"
 	"github.com/juantevez/go-posnet/context/settlement/config"
 	"github.com/juantevez/go-posnet/context/settlement/domain/service"
-	grpcserver "github.com/juantevez/go-posnet/context/settlement/infrastructure/grpc/server"
 	httpinfra "github.com/juantevez/go-posnet/context/settlement/infrastructure/http"
 	natsinfra "github.com/juantevez/go-posnet/context/settlement/infrastructure/nats"
 	pginfra "github.com/juantevez/go-posnet/context/settlement/infrastructure/postgres"
@@ -30,8 +29,6 @@ type app struct {
 	pool       *pgxpool.Pool
 	natsConn   *natsclient.Conn
 	subscriber *natsinfra.Subscriber
-	grpcSrv    *grpcserver.SettlementServer
-	grpcPort   int
 	httpSrv    *http.Server
 
 	batchHandler   *command.BatchHandler
@@ -114,7 +111,6 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		processor,
 		idempotency,
 		pool,
-		cfg.Settlement.MDRPercent,
 	)
 	settlementMetrics, err := command.NewMetrics()
 	if err != nil {
@@ -155,9 +151,6 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		return nil, fmt.Errorf("wire: dead letter gauge: %w", err)
 	}
 
-	// gRPC Server — placeholder
-	grpcSrv := grpcserver.NewSettlementServer()
-
 	// HTTP Server — healthz, readyz, metrics, gestión de batches (operaciones)
 	adminTokens, err := httpinfra.NewTokenStore(cfg.Settlement.AdminAPIKey, cfg.Settlement.AdminTokensFile)
 	if err != nil {
@@ -197,8 +190,6 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		pool:       pool,
 		natsConn:   natsConn,
 		subscriber: subscriber,
-		grpcSrv:    grpcSrv,
-		grpcPort:   cfg.GRPCPort,
 		httpSrv:    httpSrv,
 
 		batchHandler:   batchHandler,
@@ -238,14 +229,6 @@ func (a *app) start(ctx context.Context) error {
 		a.outboxRelay.Run(ctx)
 	}()
 	slog.Info("outbox relay active")
-
-	// gRPC server
-	go func() {
-		if err := grpcserver.Start(a.grpcSrv, a.grpcPort); err != nil {
-			slog.Error("gRPC server stopped", slog.String("error", err.Error()))
-		}
-	}()
-	slog.Info("gRPC server starting", slog.Int("port", a.grpcPort))
 
 	// HTTP server
 	go func() {
@@ -357,10 +340,6 @@ func (a *app) closeResources() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = a.httpSrv.Shutdown(ctx)
-	}
-
-	if a.grpcSrv != nil {
-		a.grpcSrv.Stop()
 	}
 
 	// El contexto ya se canceló: el Relay termina su ciclo y sale.

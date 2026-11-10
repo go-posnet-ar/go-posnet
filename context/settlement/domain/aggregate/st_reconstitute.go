@@ -29,10 +29,14 @@ type ReconstituteParams struct {
 	ReconciledWith string // ReconciledWithTerminal, ReconciledWithBackend o vacío
 	TerminalCount  *int
 	TerminalAmount *int64
+
+	// TransactionsNotLoaded carga el lote sin sus transacciones, para agregarle una: Transactions
+	// tiene que estar vacío, y el lote no puede calcular totales.
+	TransactionsNotLoaded bool
 }
 
 // Reconstitute reconstruye un SettlementBatch desde Postgres.
-// No emite eventos de dominio ni valida invariantes de creación.
+// No valida invariantes de creación.
 func Reconstitute(p ReconstituteParams) *SettlementBatch {
 	return &SettlementBatch{
 		id:            p.ID,
@@ -42,6 +46,8 @@ func Reconstitute(p ReconstituteParams) *SettlementBatch {
 		state:         p.State,
 		currency:      p.Currency,
 		transactions:  p.Transactions,
+		persistedTxs:  len(p.Transactions),
+		txsLoaded:     !p.TransactionsNotLoaded,
 		summary:       p.Summary,
 		discrepancies: p.Discrepancies,
 		version:       p.Version,

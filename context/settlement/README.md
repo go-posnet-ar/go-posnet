@@ -23,7 +23,6 @@ Transacción individual dentro del lote:
 |---|---|
 | `PURCHASE` | Venta aprobada |
 | `REVERSAL` | Reversa de una compra |
-| `OFFLINE` | Transacción capturada sin conexión |
 
 ### `BatchSummary` (Value Object)
 
@@ -91,7 +90,6 @@ config/
 
 | Variable | Default | Descripción |
 |---|---|---|
-| `GRPC_PORT` | `9093` | Puerto gRPC |
 | `HTTP_PORT` | `8083` | Puerto health/admin |
 | `POSTGRES_DSN` | — | Cadena de conexión PostgreSQL |
 | `NATS_URL` | — | URL NATS JetStream |

@@ -37,7 +37,7 @@ func NewSettlementBatchRepo(pool pgxPool) *SettlementBatchRepo {
 	return &SettlementBatchRepo{pool: pool}
 }
 
-// Save persiste el batch y sus transacciones nuevas en una sola transacción.
+// Save persiste el batch y las transacciones agregadas desde que se cargó, en una sola transacción.
 //
 // Usa bloqueo optimista: solo actualiza si la versión de la base es la que se cargó.
 // Sin esto, una venta concurrente con un cierre devolvía a OPEN el lote cerrado, o el
@@ -125,14 +125,15 @@ func (r *SettlementBatchRepo) SaveTx(ctx context.Context, tx pgx.Tx, b *aggregat
 		return fmt.Errorf("SettlementBatchRepo.Save: batch %s: %w", b.ID(), repository.ErrStaleBatch)
 	}
 
-	// Insertar solo las transacciones nuevas (ON CONFLICT DO NOTHING por UNIQUE)
+	// Solo las transacciones agregadas desde la carga: las demás ya están. ON CONFLICT descarta
+	// una transacción que ya está en otro lote.
 	const insertTx = `
 		INSERT INTO settlement.batch_transactions
 			(id, batch_id, transaction_id, amount_cents, currency, tx_type, included_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7)
 		ON CONFLICT (transaction_id, tx_type) DO NOTHING
 	`
-	for _, t := range b.Transactions() {
+	for _, t := range b.NewTransactions() {
 		if _, err := tx.Exec(ctx, insertTx,
 			t.ID(), t.BatchID(), t.TransactionID().String(),
 			t.AmountCents(), t.Currency(), t.Type().String(), t.IncludedAt(),
@@ -794,19 +795,31 @@ func (r *SettlementBatchRepo) MerchantDayBatchesTx(ctx context.Context, tx pgx.T
 	return batches, nil
 }
 
+const findBatchByIDQuery = `
+	SELECT id, terminal_id, merchant_id, batch_date, state, currency,
+	       total_count, total_amount, purchase_count, purchase_amount,
+	       reversal_count, reversal_amount, discrepancies,
+	       created_at, closed_at, submitted_at, settled_at, version,
+	       reconciled_with, terminal_count, terminal_amount,
+	       adjustment_count, adjustment_amount
+	FROM settlement.settlement_batches WHERE id = $1
+`
+
+// findForAppend recupera un batch sin sus transacciones, para agregarle una: cargarlas haría
+// crecer el costo de cada venta con el tamaño del lote. El lote no puede calcular totales.
+func (r *SettlementBatchRepo) findForAppend(ctx context.Context, id string) (*aggregate.SettlementBatch, error) {
+	batch, err := scanBatch(r.pool.QueryRow(ctx, findBatchByIDQuery, id))
+	if err != nil {
+		return nil, err
+	}
+	params := toBatchParams(batch, nil)
+	params.TransactionsNotLoaded = true
+	return aggregate.Reconstitute(params), nil
+}
+
 // FindByID recupera un batch completo con sus transacciones.
 func (r *SettlementBatchRepo) FindByID(ctx context.Context, id string) (*aggregate.SettlementBatch, error) {
-	const q = `
-		SELECT id, terminal_id, merchant_id, batch_date, state, currency,
-		       total_count, total_amount, purchase_count, purchase_amount,
-		       reversal_count, reversal_amount, discrepancies,
-		       created_at, closed_at, submitted_at, settled_at, version,
-		       reconciled_with, terminal_count, terminal_amount,
-		       adjustment_count, adjustment_amount
-		FROM settlement.settlement_batches WHERE id = $1
-	`
-	row := r.pool.QueryRow(ctx, q, id)
-	batch, err := scanBatch(row)
+	batch, err := scanBatch(r.pool.QueryRow(ctx, findBatchByIDQuery, id))
 	if err != nil {
 		return nil, err
 	}
@@ -858,8 +871,8 @@ func (r *SettlementBatchRepo) FindOpenByTerminal(
 	return aggregate.Reconstitute(toBatchParams(batch, txs)), nil
 }
 
-// FindOrCreateOpen recupera o crea el batch OPEN del terminal para ese día.
-// Usa SERIALIZABLE para evitar condiciones de carrera.
+// FindOrCreateOpen recupera o crea el batch OPEN del terminal para ese día, sin sus
+// transacciones: es para agregarle una. Usa SERIALIZABLE para evitar condiciones de carrera.
 func (r *SettlementBatchRepo) FindOrCreateOpen(
 	ctx context.Context,
 	terminalID domain.TerminalID,
@@ -884,8 +897,7 @@ func (r *SettlementBatchRepo) FindOrCreateOpen(
 		}
 
 		if existingID != "" {
-			// Ya existe — cargar completo
-			batch, err := r.FindByID(ctx, existingID)
+			batch, err := r.findForAppend(ctx, existingID)
 			if err != nil {
 				return err
 			}
@@ -922,7 +934,7 @@ func (r *SettlementBatchRepo) FindOrCreateOpen(
 			).Scan(&concurrentID); err != nil {
 				return fmt.Errorf("FindOrCreateOpen: reload after conflict: %w", err)
 			}
-			batch, err := r.FindByID(ctx, concurrentID)
+			batch, err := r.findForAppend(ctx, concurrentID)
 			if err != nil {
 				return err
 			}
@@ -1105,11 +1117,19 @@ func (r *SettlementBatchRepo) loadTransactions(ctx context.Context, batchID stri
 		}
 
 		parsedTxID, _ := domain.ParseTransactionID(txID)
-		parsedType, _ := valueobject.ParseBatchTransactionType(txType)
+		// Un tipo desconocido no entra en ningún total: cargar el lote sin él lo cerraría con
+		// totales equivocados.
+		parsedType, err := valueobject.ParseBatchTransactionType(txType)
+		if err != nil {
+			return nil, fmt.Errorf("loadTransactions: transaction %s: %w", id, err)
+		}
 
 		txs = append(txs, entity.ReconstituteBatchTransaction(id, bid, parsedTxID, amountCents, currency, parsedType, includedAt))
 	}
-
+	// Sin esto, un corte a mitad de la lectura devuelve el lote incompleto, y sus totales mal.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("loadTransactions: %w", err)
+	}
 	return txs, nil
 }
 

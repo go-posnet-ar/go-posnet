@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
-	"github.com/juantevez/go-posnet/context/settlement/domain/event"
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
@@ -22,7 +21,6 @@ func newOpenBatch(t *testing.T) *aggregate.SettlementBatch {
 	if err != nil {
 		t.Fatalf("NewSettlementBatch() error = %v", err)
 	}
-	b.ClearDomainEvents()
 	return b
 }
 
@@ -67,24 +65,6 @@ func TestNewSettlementBatch_Success(t *testing.T) {
 	}
 	if b.ClosedAt() != nil || b.SubmittedAt() != nil || b.SettledAt() != nil {
 		t.Error("ClosedAt/SubmittedAt/SettledAt should be nil right after creation")
-	}
-
-	events := b.DomainEvents()
-	if len(events) != 1 {
-		t.Fatalf("DomainEvents() len = %d, want 1", len(events))
-	}
-	opened, ok := events[0].(event.BatchOpened)
-	if !ok {
-		t.Fatalf("event type = %T, want event.BatchOpened", events[0])
-	}
-	if opened.BatchID != b.ID() {
-		t.Errorf("BatchOpened.BatchID = %q, want %q", opened.BatchID, b.ID())
-	}
-	if !opened.TerminalID.Equals(terminalID) {
-		t.Errorf("BatchOpened.TerminalID = %v, want %v", opened.TerminalID, terminalID)
-	}
-	if !opened.BatchDate.Equal(batchDate) {
-		t.Errorf("BatchOpened.BatchDate = %v, want %v", opened.BatchDate, batchDate)
 	}
 }
 
@@ -134,7 +114,7 @@ func TestAddTransaction_Success(t *testing.T) {
 	if err := b.AddTransaction(tx1, 1000, valueobject.BatchTxPurchase); err != nil {
 		t.Fatalf("AddTransaction() error = %v", err)
 	}
-	if err := b.AddTransaction(tx2, 2000, valueobject.BatchTxOffline); err != nil {
+	if err := b.AddTransaction(tx2, 2000, valueobject.BatchTxAdjustment); err != nil {
 		t.Fatalf("AddTransaction() error = %v", err)
 	}
 
@@ -145,8 +125,8 @@ func TestAddTransaction_Success(t *testing.T) {
 	if !txs[0].TransactionID().Equals(tx1) || txs[0].AmountCents() != 1000 || txs[0].Type() != valueobject.BatchTxPurchase {
 		t.Errorf("txs[0] = %+v, want tx1/1000/PURCHASE", txs[0])
 	}
-	if !txs[1].TransactionID().Equals(tx2) || txs[1].AmountCents() != 2000 || txs[1].Type() != valueobject.BatchTxOffline {
-		t.Errorf("txs[1] = %+v, want tx2/2000/OFFLINE", txs[1])
+	if !txs[1].TransactionID().Equals(tx2) || txs[1].AmountCents() != 2000 || txs[1].Type() != valueobject.BatchTxAdjustment {
+		t.Errorf("txs[1] = %+v, want tx2/2000/ADJUSTMENT", txs[1])
 	}
 	if txs[0].Currency() != "ARS" {
 		t.Errorf("txs[0].Currency() = %q, want %q", txs[0].Currency(), "ARS")
@@ -228,14 +208,6 @@ func TestRequestClose_Success(t *testing.T) {
 	if b.State() != valueobject.BatchStatePendingClose {
 		t.Errorf("State() = %v, want %v", b.State(), valueobject.BatchStatePendingClose)
 	}
-
-	events := b.DomainEvents()
-	if len(events) != 1 {
-		t.Fatalf("DomainEvents() len = %d, want 1", len(events))
-	}
-	if _, ok := events[0].(event.BatchCloseRequested); !ok {
-		t.Fatalf("event type = %T, want event.BatchCloseRequested", events[0])
-	}
 }
 
 func TestRequestClose_InvalidTransition(t *testing.T) {
@@ -267,7 +239,6 @@ func closableBatch(t *testing.T) *aggregate.SettlementBatch {
 	if err := b.RequestClose(); err != nil {
 		t.Fatalf("RequestClose() error = %v", err)
 	}
-	b.ClearDomainEvents()
 	return b
 }
 
@@ -309,18 +280,6 @@ func TestClose_Success_NoDiscrepancy(t *testing.T) {
 	}
 	if summary.ReversalAmount().Cents() != 1 {
 		t.Errorf("Summary.ReversalAmount().Cents() = %d, want 1", summary.ReversalAmount().Cents())
-	}
-
-	events := b.DomainEvents()
-	if len(events) != 1 {
-		t.Fatalf("DomainEvents() len = %d, want 1", len(events))
-	}
-	closed, ok := events[0].(event.BatchClosed)
-	if !ok {
-		t.Fatalf("event type = %T, want event.BatchClosed", events[0])
-	}
-	if closed.Discrepancies != 0 {
-		t.Errorf("BatchClosed.Discrepancies = %d, want 0", closed.Discrepancies)
 	}
 }
 
@@ -423,7 +382,6 @@ func TestMarkSettled_Success(t *testing.T) {
 	if err := b.Submit(); err != nil {
 		t.Fatalf("Submit() error = %v", err)
 	}
-	b.ClearDomainEvents()
 
 	if err := b.MarkSettled(); err != nil {
 		t.Fatalf("MarkSettled() error = %v", err)
@@ -433,18 +391,6 @@ func TestMarkSettled_Success(t *testing.T) {
 	}
 	if b.SettledAt() == nil {
 		t.Fatal("SettledAt() is nil, want it set")
-	}
-
-	events := b.DomainEvents()
-	if len(events) != 1 {
-		t.Fatalf("DomainEvents() len = %d, want 1", len(events))
-	}
-	settled, ok := events[0].(event.BatchSettled)
-	if !ok {
-		t.Fatalf("event type = %T, want event.BatchSettled", events[0])
-	}
-	if settled.Summary.TotalCount() != b.Summary().TotalCount() {
-		t.Errorf("BatchSettled.Summary.TotalCount() = %d, want %d", settled.Summary.TotalCount(), b.Summary().TotalCount())
 	}
 }
 
@@ -463,25 +409,12 @@ func TestMarkDisputed_FromPendingClose(t *testing.T) {
 	if err := b.RequestClose(); err != nil {
 		t.Fatalf("RequestClose() error = %v", err)
 	}
-	b.ClearDomainEvents()
 
 	if err := b.MarkDisputed("manual review requested"); err != nil {
 		t.Fatalf("MarkDisputed() error = %v", err)
 	}
 	if b.State() != valueobject.BatchStateDisputed {
 		t.Errorf("State() = %v, want %v", b.State(), valueobject.BatchStateDisputed)
-	}
-
-	events := b.DomainEvents()
-	if len(events) != 1 {
-		t.Fatalf("DomainEvents() len = %d, want 1", len(events))
-	}
-	disputed, ok := events[0].(event.BatchDisputed)
-	if !ok {
-		t.Fatalf("event type = %T, want event.BatchDisputed", events[0])
-	}
-	if disputed.Reason != "manual review requested" {
-		t.Errorf("BatchDisputed.Reason = %q, want %q", disputed.Reason, "manual review requested")
 	}
 }
 
@@ -527,23 +460,6 @@ func TestMarkDisputed_InvalidTransition(t *testing.T) {
 	err := b.MarkDisputed("reason")
 	if err == nil || !strings.Contains(err.Error(), "invalid transition") {
 		t.Fatalf("error = %v, want it to mention the invalid transition", err)
-	}
-}
-
-// ─── ClearDomainEvents ──────────────────────────────────────────────────────────
-
-func TestClearDomainEvents(t *testing.T) {
-	b := newOpenBatch(t)
-	if err := b.RequestClose(); err != nil {
-		t.Fatalf("RequestClose() error = %v", err)
-	}
-	if len(b.DomainEvents()) == 0 {
-		t.Fatal("DomainEvents() is empty before ClearDomainEvents(), want at least 1")
-	}
-
-	b.ClearDomainEvents()
-	if len(b.DomainEvents()) != 0 {
-		t.Errorf("DomainEvents() len = %d after ClearDomainEvents(), want 0", len(b.DomainEvents()))
 	}
 }
 

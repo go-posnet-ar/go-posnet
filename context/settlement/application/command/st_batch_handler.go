@@ -24,8 +24,7 @@ import (
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 )
 
-// BatchHandler implementa port.BatchService.
-// Orquesta el ciclo de vida de los batches de liquidación.
+// BatchHandler orquesta el ciclo de vida de los batches de liquidación.
 type BatchHandler struct {
 	batchRepo   repository.SettlementBatchRepository
 	publisher   service.EventPublisher
@@ -33,7 +32,6 @@ type BatchHandler struct {
 	outbox      *outbox.Store
 	idempotency *natsutil.IdempotencyStore
 	pool        pgutil.PgxPool
-	mdrPercent  float64
 	metrics     *Metrics // opcional; nil = sin instrumentación (tests)
 	location    *time.Location
 	reviews     repository.ReversalReviewLog  // opcional; nil = no valida las reversas
@@ -152,7 +150,6 @@ func NewBatchHandler(
 	processor service.SettlementProcessor,
 	idempotency *natsutil.IdempotencyStore,
 	pool pgutil.PgxPool,
-	mdrPercent float64,
 ) *BatchHandler {
 	return &BatchHandler{
 		batchRepo:   batchRepo,
@@ -161,7 +158,6 @@ func NewBatchHandler(
 		processor:   processor,
 		idempotency: idempotency,
 		pool:        pool,
-		mdrPercent:  mdrPercent,
 	}
 }
 

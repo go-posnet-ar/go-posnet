@@ -1,6 +1,6 @@
 # Settlement — Documentación técnica
 
-> Revisado el 2026-11-06. Este documento describe lo que el código hace
+> Revisado el 2026-11-10. Este documento describe lo que el código hace
 > hoy. Si algo difiere del [README del contexto](../../context/settlement/README.md) o de los
 > comentarios del código, vale lo que está acá. Para operar un incidente, ver el
 > [runbook de cierre de lote](../runbooks/batch-close-failure.md).
@@ -71,7 +71,6 @@ Terminal Gateway ── transaction.batch-close►│            │
 | [`infrastructure/postgres/`](../../context/settlement/infrastructure/postgres/) | Repositorio |
 | [`infrastructure/processor/`](../../context/settlement/infrastructure/processor/) | Procesador simulado |
 | [`infrastructure/http/`](../../context/settlement/infrastructure/http/) | Health checks, consulta, administración y DLQ |
-| [`infrastructure/grpc/server/`](../../context/settlement/infrastructure/grpc/server/) | Servidor sin servicios |
 
 Las rutas de `domain/`, `application/` e `infrastructure/` son relativas a `context/settlement/`.
 
@@ -123,7 +122,6 @@ Solo `SETTLED` es un estado final.
 |---|---|
 | `PURCHASE` | Compra aprobada |
 | `REVERSAL` | Reversa, con su monto real (ver [§5.2](#52-reversa)) |
-| `OFFLINE` | Definido, pero ningún flujo lo genera |
 | `ADJUSTMENT` | Corrección de un lote ya enviado, con signo: positivo devuelve al comercio, negativo le descuenta (ver [Revisiones de reversas](#revisiones-de-reversas)). Lleva el `transaction_id` de la compra |
 
 `(transaction_id, tx_type)` es único: una compra o su reversa no se cuentan dos veces, incluso si el evento
@@ -686,8 +684,8 @@ responde `400`. El `operator_id` queda en la [auditoría](#auditoría-de-operado
 
 ## 7. gRPC
 
-Hay un servidor en `GRPC_PORT` (9093 por defecto) sin servicios registrados, y el contexto no tiene un
-`.proto`. Es un placeholder: cualquier llamada devuelve `Unimplemented`.
+Settlement no expone gRPC: se comunica por NATS y se opera por la [API HTTP](#6-api-http). El servidor sin
+servicios que abría `GRPC_PORT` (9093) se eliminó, con la variable y el puerto de Docker Compose.
 
 ## 8. Eventos NATS
 
@@ -865,12 +863,18 @@ una revisión o una venta tardía (`AUTO_RELEASE`); los dos últimos, con `opera
 
 ### Costo por aprobación
 
-Cada aprobación carga todas las transacciones del lote y las vuelve a insertar con `ON CONFLICT DO
-NOTHING`. El costo por evento crece con el tamaño del lote, y con él el costo acumulado del día.
+Una venta, una reversa o un ajuste carga solo la fila del lote, sin sus transacciones (`FindOrCreateOpen`), e
+inserta solo la nueva: el lote lleva la cuenta de las que ya están guardadas. El costo por evento no depende
+del tamaño del lote. Un lote cargado así no puede calcular totales: `Close`, `Release` y `AddLateSale` fallan
+con `ErrTransactionsNotLoaded`, en vez de calcularlos sin las transacciones que faltan.
+
+El cierre, la liberación, una venta tardía y las operaciones de administración cargan el lote completo
+(`FindByID`, `FindOpenByTerminal`). Si una transacción no se puede leer, por un tipo desconocido o un corte a
+mitad de la lectura, el lote no se carga.
 
 ### Apagado
 
-Ante `SIGINT` o `SIGTERM`: detiene HTTP (hasta 10 s) y gRPC, espera al Relay, drena y cierra NATS, y cierra
+Ante `SIGINT` o `SIGTERM`: detiene HTTP (hasta 10 s), espera al Relay, drena y cierra NATS, y cierra
 el pool de Postgres.
 
 ## 10. Observabilidad y operación
@@ -951,7 +955,6 @@ conciliar, y `no settlement processor configured` los lotes que quedaron sin env
 | `POSTGRES_DSN` | Obligatoria | Sí; sin ella, el proceso termina con `panic` |
 | `NATS_URL` | Obligatoria | Sí; sin ella, el proceso termina con `panic` |
 | `HTTP_PORT` | `8083` | Sí; Docker Compose usa `8084` |
-| `GRPC_PORT` | `9093` | Sí |
 | `POSTGRES_MAX_CONNS`, `POSTGRES_MIN_CONNS` | `15`, `2` | Sí |
 | `POSTGRES_MAX_CONN_LIFETIME`, `POSTGRES_MAX_CONN_IDLE` | `30m`, `5m` | Sí |
 | `NATS_NKEY_PATH`, `NATS_TLS_CERT`, `NATS_TLS_KEY`, `NATS_TLS_CA` | Vacías | Sí |
@@ -1082,7 +1085,6 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
 | Las alertas no avisan a nadie | Alertmanager las envía a `webhook-mock`: hay que mirarlas en Prometheus o Alertmanager | Alertmanager |
-| Costo creciente por aprobación | Cada venta carga y reinserta todas las transacciones del lote. Los índices evitan recorrer toda la tabla, pero el costo sigue creciendo con el tamaño del lote | `Save`, `loadTransactions` |
 | Los eventos publicados no llevan la traza | El Relay publica sin el contexto del pedido: la traza del cierre no continúa en Notification. Se correlaciona por `correlation_id` | `pkg/outbox` |
 | Una fila que no se puede publicar frena a las demás | El ciclo se revierte ante el primer fallo. Hoy solo ocurre si NATS o el stream no están disponibles | `pkg/outbox` |
 | El terminal no se entera de un cierre sin lote | Terminal Gateway ya respondió `202`. Settlement lo cuenta y, si el terminal informó ventas, alerta con `CierreSinLote`, pero responderle requiere un evento que Terminal Gateway consuma | `closeWithoutBatch` |
@@ -1091,5 +1093,3 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | El reproceso de la DLQ no tiene auditoría propia | Quién reprocesó o descartó queda solo en los logs | `st_http_dead_letters.go` |
 | Una reversa tardía no vuelve a su lote cerrado | La venta tardía se agrega al lote en disputa; una reversa en la misma situación entra en el lote abierto, como cualquier reversa | `RegisterReversal` |
 | Sin migraciones automáticas | Los cambios de schema hay que aplicarlos a mano en las bases existentes | `pkg/pgutil/migrate.go` |
-| gRPC placeholder | Abre un puerto que no ofrece nada | `st_grpc_server.go` |
-| Código sin uso | `port.BatchService` y `port.AdminService` no se implementan; tampoco se usan `mdrPercent`, `BatchTxOffline` ni los eventos de dominio internos | `st_port_inbound.go`, `st_batch_handler.go`, `st_settlement_batch.go` |

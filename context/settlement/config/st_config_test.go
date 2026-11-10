@@ -11,7 +11,7 @@ import (
 // variables ya seteadas en la máquina donde corre el test contaminen el
 // resultado esperado.
 var optionalEnvKeys = []string{
-	"GRPC_PORT", "HTTP_PORT",
+	"HTTP_PORT",
 	"POSTGRES_MAX_CONNS", "POSTGRES_MIN_CONNS",
 	"POSTGRES_MAX_CONN_LIFETIME", "POSTGRES_MAX_CONN_IDLE", "MIGRATIONS_DIR",
 	"NATS_NKEY_PATH", "NATS_TLS_CERT", "NATS_TLS_KEY", "NATS_TLS_CA",
@@ -189,7 +189,6 @@ func TestValidate(t *testing.T) {
 func TestLoad_Success(t *testing.T) {
 	t.Setenv("POSTGRES_DSN", "postgres://localhost/test")
 	t.Setenv("NATS_URL", "nats://localhost:4222")
-	t.Setenv("GRPC_PORT", "9093")
 	t.Setenv("HTTP_PORT", "8083")
 	t.Setenv("POSTGRES_MAX_CONNS", "50")
 	t.Setenv("POSTGRES_MIN_CONNS", "5")
@@ -208,9 +207,6 @@ func TestLoad_Success(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if cfg.GRPCPort != 9093 {
-		t.Errorf("GRPCPort = %d, want 9093", cfg.GRPCPort)
-	}
 	if cfg.HTTPPort != 8083 {
 		t.Errorf("HTTPPort = %d, want 8083", cfg.HTTPPort)
 	}
@@ -270,9 +266,6 @@ func TestLoad_Defaults(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	if cfg.GRPCPort != 9093 {
-		t.Errorf("GRPCPort = %d, want 9093", cfg.GRPCPort)
-	}
 	if cfg.HTTPPort != 8083 {
 		t.Errorf("HTTPPort = %d, want 8083", cfg.HTTPPort)
 	}

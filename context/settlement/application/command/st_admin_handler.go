@@ -22,7 +22,7 @@ import (
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 )
 
-// AdminHandler implementa port.AdminService.
+// AdminHandler atiende las operaciones manuales de la API HTTP.
 type AdminHandler struct {
 	batchRepo  repository.SettlementBatchRepository
 	processor  service.SettlementProcessor

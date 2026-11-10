@@ -39,7 +39,8 @@ type SettlementBatchRepository interface {
 	FindOpenByTerminal(ctx context.Context, terminalID domain.TerminalID, date time.Time, currency string) (*aggregate.SettlementBatch, error)
 
 	// FindOrCreateOpen recupera el batch OPEN del terminal o lo crea si no existe.
-	// Garantiza que hay un solo batch OPEN por terminal, día y moneda.
+	// Garantiza que hay un solo batch OPEN por terminal, día y moneda. El lote viene sin sus
+	// transacciones, para agregarle una: no puede calcular totales ni cerrarse.
 	FindOrCreateOpen(ctx context.Context, terminalID domain.TerminalID, merchantID domain.MerchantID, date time.Time, currency string) (*aggregate.SettlementBatch, error)
 
 	// ListByMerchantDate lista todos los batches de un comercio en una fecha.

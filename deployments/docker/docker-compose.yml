@@ -291,11 +291,9 @@ services:
         aliases: [settlement-edge]
     ports:
       - "8084:8084"
-      - "9093:9093"
     env_file: ../../.env.docker
     environment:
       HTTP_PORT: "8084"
-      GRPC_PORT: "9093"
       OTEL_SERVICE_NAME: posnet-settlement
       SETTLEMENT_TRUSTED_PROXIES: "172.30.0.10/32" # el gateway, en la red edge
       SETTLEMENT_PROCESSOR: mock # Sin envío real, como acquirer-mock. El default del código es "none".
@@ -371,7 +369,7 @@ services:
     container_name: posnet-alertmanager
     restart: unless-stopped
     networks: [posnet]
-    # Host 9097 → 9093 interno. El 9093 del host ya lo usa el gRPC de settlement.
+    # Host 9097 → 9093 interno: el 9093 del host era el gRPC de settlement, que ya no existe.
     ports:
       - "9097:9093"
     volumes:
