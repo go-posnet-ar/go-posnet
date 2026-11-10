@@ -386,6 +386,11 @@ func requiredRole(r *http.Request) Role {
 			}
 		}
 	}
+	// Reprocesar sigue el camino normal del evento, con su idempotencia. Descartarlo lo pierde:
+	// queda en el rol máximo.
+	if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/dead-letters/") && strings.HasSuffix(r.URL.Path, "/replay") {
+		return RoleOperator
+	}
 	return RoleSupervisor
 }
 

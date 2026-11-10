@@ -77,6 +77,7 @@ const (
 	AuditActionRedate          = "REDATE"       // El cambio de zona del comercio movió el lote a otra fecha
 	AuditActionAutoRelease     = "AUTO_RELEASE" // Se cerró la última revisión y el lote concilia: pasa a CLOSED
 	AuditActionAdjustment      = "ADJUSTMENT"   // El lote recibió la corrección de un lote ya enviado
+	AuditActionLateSale        = "LATE_SALE"    // Llegó tarde una venta que el terminal había contado al cerrar
 
 	AuditActionReviewAccept            = "REVIEW_ACCEPT"
 	AuditActionReviewUsePurchaseAmount = "REVIEW_USE_PURCHASE_AMOUNT"
@@ -107,6 +108,18 @@ type BatchAuditLog interface {
 // vuelva a cerrar aunque sea de un día anterior a ayer.
 type BatchReopens interface {
 	WasReopened(ctx context.Context, batchID string) (bool, error)
+}
+
+// TerminalDayBatches busca los lotes de un terminal en un día, para las ventas y los cierres que
+// llegan tarde.
+type TerminalDayBatches interface {
+	// FindLateSaleBatchTx devuelve el lote DISPUTED del terminal, fecha y moneda al que le falta
+	// una venta autorizada en authorizedAt: concilió contra el terminal, cerró después de esa hora
+	// y el terminal contó más transacciones de las que tiene. Vacío si no hay ninguno.
+	FindLateSaleBatchTx(ctx context.Context, tx pgx.Tx, terminalID domain.TerminalID, date time.Time, currency string, authorizedAt time.Time) (string, error)
+
+	// CountTerminalDayBatches cuenta los lotes del terminal en esa fecha y moneda, en cualquier estado.
+	CountTerminalDayBatches(ctx context.Context, terminalID domain.TerminalID, date time.Time, currency string) (int, error)
 }
 
 // Motivos por los que una reversa queda en revisión.

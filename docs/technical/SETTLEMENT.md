@@ -67,10 +67,10 @@ Terminal Gateway ── transaction.batch-close►│            │
 | [`domain/service/`](../../context/settlement/domain/service/) | Puertos del publisher y del procesador |
 | [`application/command/`](../../context/settlement/application/command/) | `BatchHandler`, `AdminHandler` y métricas |
 | [`application/query/`](../../context/settlement/application/query/) | Consulta de lotes |
-| [`infrastructure/nats/`](../../context/settlement/infrastructure/nats/) | Publisher y subscriber |
+| [`infrastructure/nats/`](../../context/settlement/infrastructure/nats/) | Publisher, subscriber y DLQ |
 | [`infrastructure/postgres/`](../../context/settlement/infrastructure/postgres/) | Repositorio |
 | [`infrastructure/processor/`](../../context/settlement/infrastructure/processor/) | Procesador simulado |
-| [`infrastructure/http/`](../../context/settlement/infrastructure/http/) | Health checks, consulta y administración |
+| [`infrastructure/http/`](../../context/settlement/infrastructure/http/) | Health checks, consulta, administración y DLQ |
 | [`infrastructure/grpc/server/`](../../context/settlement/infrastructure/grpc/server/) | Servidor sin servicios |
 
 Las rutas de `domain/`, `application/` e `infrastructure/` son relativas a `context/settlement/`.
@@ -238,6 +238,20 @@ ninguna, el comando lo registra en `settlement.maintenance_runs`; hasta entonces
 Si el terminal cierra su lote y sigue vendiendo durante el mismo día, la venta abre un **lote nuevo** para
 esa fecha y moneda. Ese lote se cierra con un nuevo pedido del terminal o con el cierre automático.
 
+**Una venta anterior al cierre que llega después** (por un reintento de NATS o desde la [DLQ](#eventos-en-la-dlq)) va
+al lote en disputa que le faltaba, no a uno nuevo, si se cumple todo esto:
+
+- el lote del terminal para esa fecha y moneda está `DISPUTED` y se concilió contra el terminal;
+- la venta se autorizó antes del cierre, según el `authorized_at` del evento;
+- el terminal contó más transacciones de las que tiene el lote.
+
+La venta se agrega y el lote se vuelve a conciliar. Si ahora coincide y no tiene revisiones abiertas, pasa a `CLOSED`
+y se envía. Si no, sigue `DISPUTED` con las discrepancias recalculadas. Queda en la auditoría como `LATE_SALE`, y si se
+libera, también como `AUTO_RELEASE`, los dos con `operator_id` `system`. La métrica `posnet_settlement_late_sales_total`
+lo cuenta por `result`: `released`, `held` (coincide, pero una revisión lo retiene) o `disputed`.
+
+Sin `authorized_at` legible no se puede saber si la venta es anterior al cierre: abre un lote nuevo.
+
 ### 5.4 Cierre de lote
 
 Terminal Gateway publica `transaction.batch-close`, y `ProcessBatchClose` hace lo siguiente:
@@ -245,7 +259,7 @@ Terminal Gateway publica `transaction.batch-close`, y `ProcessBatchClose` hace l
 ```
 Busca el lote OPEN del terminal para batch_date
    │
-   ├─ No existe ─► WARN y confirma (sin respuesta al terminal)
+   ├─ No existe ─► confirma, con log y métrica según por qué (sin respuesta al terminal)
    │
    ▼
 Calcula totales, discrepancias y revisiones abiertas
@@ -300,7 +314,18 @@ El día que se puede cerrar, medido desde el día de negocio del pedido:
 
 Un rechazo descarta el evento sin reintentos, con un log `permanent error` y la métrica
 `posnet_settlement_batch_close_rejected_total{reason}`. El terminal no recibe respuesta: Terminal Gateway ya
-respondió `202`. Si no hay un lote `OPEN` para esa fecha, no se rechaza: se confirma sin hacer nada, como siempre.
+respondió `202`.
+
+Si no hay un lote `OPEN` para esa fecha, se confirma sin hacer nada, y la misma métrica dice por qué:
+
+| Situación | `reason` | Log |
+|---|---|---|
+| El día tiene lotes, ninguno `OPEN` | `already_closed` | `WARN`: suele ser un cierre repetido |
+| El día no tiene lotes y el terminal informó ventas | `no_batch` | `ERROR` con los totales del terminal, y alerta `CierreSinLote`: las ventas se están reintentando, están en la DLQ o no llegaron |
+| Sin lotes ni ventas | — | `INFO`: un día sin actividad |
+
+Con `no_batch`, los totales del terminal no se guardan: solo quedan en el log. Si las ventas llegan después, abren un
+lote nuevo, que el job cierra sin conciliar.
 
 Las fechas de los lotes creados antes del día de negocio siguen en UTC.
 
@@ -366,7 +391,8 @@ evento con el total acumulado.
 |---|---|---|
 | IDs inválidos | `Term`; no se reintenta | No |
 | Error de base de datos al registrar | `Nak` y reintento con espera (ver [§8](#8-eventos-nats)) | **Sí**, si se resuelve en unos 12 minutos |
-| Se agotan las entregas | El evento no se reintenta; log `deliveries exhausted` y alerta `EventoSettlementPerdido` | No: hay que [reprocesarlo](../runbooks/nats-dlq-reprocess.md) |
+| Se agotan las entregas | El evento pasa a la DLQ; log `moved to the dead letter queue` y alerta `EventosEnDLQSettlement` | Con [`replay`](#eventos-en-la-dlq) |
+| Se agotan las entregas y la DLQ no está disponible | El evento no se reintenta; log `dead letter could not be published` y alerta `EventoSettlementPerdido` | No: hay que [reprocesarlo](../runbooks/nats-dlq-reprocess.md) |
 | Conflicto con otro guardado del mismo lote | Reintento interno, y después `Nak` | **Sí** (ver [§5.10](#510-concurrencia)) |
 | Moneda inválida o monto no positivo | `Term`; no se reintenta | No |
 | Se pierde `auth.approved` en Authorization | La transacción falta en el lote; el cierre da `DISPUTED` | No |
@@ -483,6 +509,9 @@ entorno, arranca y lo advierte en el log. Docker Compose no usa TLS: es solo par
 | `POST /reversal-reviews/{transaction_id}/resolve` | Cerrar una revisión y corregir el lote si corresponde | `200` | `400`, `404`, `409`, `500` |
 | `GET /merchants/{merchant_id}/timezone` | Zona vigente del comercio | `200` | `400`, `500` |
 | `PUT /merchants/{merchant_id}/timezone` | Definir la zona del comercio | `200` | `400`, `500` |
+| `GET /dead-letters?limit=N` | Eventos en la DLQ, del más antiguo al más nuevo; hasta 100, o `limit` hasta 500 | `200` | `400`, `503` |
+| `POST /dead-letters/{sequence}/replay` | Procesar un evento de la DLQ y borrarlo | `200` | `400`, `404`, `422`, `503` |
+| `POST /dead-letters/{sequence}/discard` | Borrar un evento de la DLQ sin procesarlo | `200` | `400`, `404`, `503` |
 
 Todas las rutas no públicas pueden responder además `401`, `403`, `429` o `503`, como se explicó arriba. Un `{id}` que no sea un UUID responde `400` con `INVALID_ID`. Los errores tienen la forma
 `{"error": "CODIGO", "message": "..."}`.
@@ -617,6 +646,39 @@ responde `409` (`OPEN_BATCH_CONFLICT`) y no cambia nada: hay que cerrar antes es
 comercio usa la zona general. Quién hizo el cambio queda en `merchant_timezones.updated_by` y en los logs. Cada lote
 movido queda además en `batch_audit_log`, con la acción `REDATE` y las dos fechas en `reason`.
 
+### Eventos en la DLQ
+
+Un evento que agota sus entregas queda en el stream `POSNET_DLQ`, bajo `posnet.dlq.settlement.<subject original>`, con
+el payload y los headers originales, y estos otros:
+
+| Header | Contenido |
+|---|---|
+| `Posnet-Dlq-Subject` | Subject original |
+| `Posnet-Dlq-Event-Id` | `event_id` del envelope |
+| `Posnet-Dlq-Error` | Último error, hasta 1024 caracteres |
+| `Posnet-Dlq-Deliveries` | Entregas que se intentaron |
+| `Posnet-Dlq-Failed-At` | RFC3339 UTC |
+
+Está en NATS y no en Postgres porque la causa habitual de agotar las entregas es la base caída. Si tampoco se puede
+publicar ahí, el evento se pierde como antes: log `dead letter could not be published` y alerta `EventoSettlementPerdido`.
+
+`GET /dead-letters` responde `{"dead_letters": [...], "count": N}`, cada uno con `sequence`, `subject`, `event_id`,
+`error`, `deliveries` y `failed_at`. La `sequence` es la del stream, e identifica al evento en las otras rutas.
+
+`replay` procesa el evento con el mismo código que el consumidor, dentro de Settlement: no le llega a los otros BC. La
+idempotencia por `event_id` descarta uno ya registrado. Responde `{"status": "replayed"}` y borra el evento; con un
+error permanente, `422 REPLAY_REJECTED`; si sigue fallando, `503 REPLAY_FAILED`. En los dos casos, el evento queda en
+la DLQ. Pide el rol `operator`.
+
+`discard` borra el evento sin procesarlo, y exige `reason`. Pide el rol `supervisor`.
+
+```json
+{ "operator_id": "soporte-juan", "reason": "venta de prueba, ticket OPS-123" }
+```
+
+El operador y el motivo quedan en los logs (`dead letter replayed by operator`, `dead letter discarded by operator`),
+no en `batch_audit_log`, que registra cambios de lotes.
+
 ### Confirmar la liquidación
 
 `settle` exige `operator_id` y responde `{"status": "settled"}`. Con un lote que no esté en `SUBMITTED`,
@@ -651,8 +713,9 @@ Son durables con queue group del mismo nombre, hasta 5 entregas, política `Deli
 Las esperas dan unos 12 minutos para que se recupere, por ejemplo, una base caída. Los conflictos de versión
 no llegan a este punto: se reintentan antes, como explica [§5.10](#510-concurrencia).
 
-Un mensaje que agota las entregas no pasa a una DLQ: queda el log `deliveries exhausted` y salta la alerta
-`EventoSettlementPerdido`. Para recuperarlo, seguir el runbook
+Un mensaje que agota las entregas pasa a la [DLQ](#eventos-en-la-dlq) y se confirma: queda el log `moved to the dead
+letter queue` y salta la alerta `EventosEnDLQSettlement`. Se reprocesa con la API. Si la DLQ no está disponible, queda
+el log `dead letter could not be published`, salta `EventoSettlementPerdido`, y se recupera con el runbook
 [nats-dlq-reprocess](../runbooks/nats-dlq-reprocess.md).
 
 ### Publicados
@@ -797,7 +860,8 @@ ORDER BY created_at;
 
 **No se auditan** las operaciones rechazadas, porque no cambian nada, ni los cierres del terminal o del job
 automático, que no los hace un operador. Sí se auditan dos cambios del sistema que siguen a un operador: el lote que
-movió un cambio de zona (`REDATE`) y el que liberó el cierre de una revisión (`AUTO_RELEASE`, `operator_id` `system`). Las operaciones anteriores a `000004` solo están en los logs.
+movió un cambio de zona (`REDATE`), la venta que llegó después del cierre (`LATE_SALE`) y el que liberó el cierre de
+una revisión o una venta tardía (`AUTO_RELEASE`); los dos últimos, con `operator_id` `system`. Las operaciones anteriores a `000004` solo están en los logs.
 
 ### Costo por aprobación
 
@@ -824,7 +888,9 @@ el pool de Postgres.
 | `posnet_settlement_outbox_stuck` | Gauge | — | Eventos en el outbox desde hace más de 1 minuto |
 | `posnet_settlement_reversals_in_review` | Gauge | — | Revisiones de reversas abiertas desde hace más de 15 minutos, para dar tiempo a una compra demorada |
 | `posnet_settlement_reversal_recovery_pending` | Gauge | — | 1 mientras no se haya registrado la recuperación de reversas anteriores |
-| `posnet_settlement_batch_close_rejected_total` | Counter | `reason` | Cierres del terminal rechazados por su `batch_date`: `future`, `too_old` o `not_reopened` |
+| `posnet_settlement_batch_close_rejected_total` | Counter | `reason` | Cierres del terminal que no cerraron nada: rechazados por su `batch_date` (`future`, `too_old` o `not_reopened`) o sin un lote `OPEN` (`already_closed` o `no_batch`). Las series nacen en 0 |
+| `posnet_settlement_dead_letters` | Gauge | — | Eventos en la DLQ. Consulta NATS en cada scrape |
+| `posnet_settlement_late_sales_total` | Counter | `result` | Ventas agregadas a su lote en disputa después del cierre: `released`, `held` o `disputed` |
 
 También se exponen métricas del pool de Postgres y de mensajes NATS, incluida
 `posnet_nats_messages_failed_total{kind="exhausted"}` para los eventos que agotaron las entregas.
@@ -841,7 +907,9 @@ Si la consulta falla, estas series no se informan en ese scrape, y las alertas q
 
 | Alerta | Severidad | Se activa cuando | Qué hacer |
 |---|---|---|---|
-| `EventoSettlementPerdido` | Crítica | Un evento agotó las entregas. Sigue activa hasta reiniciar el servicio | [Reprocesar el evento](../runbooks/nats-dlq-reprocess.md) |
+| `EventoSettlementPerdido` | Crítica | Un evento agotó las entregas y no llegó a la DLQ. Sigue activa hasta reiniciar el servicio | [Reprocesar el evento](../runbooks/nats-dlq-reprocess.md) |
+| `EventosEnDLQSettlement` | Warning | Hay eventos en la DLQ, durante 1 min | [Escenario I](../runbooks/batch-close-failure.md#escenario-i--eventos-en-la-dlq) |
+| `CierreSinLote` | Warning | Un terminal informó ventas de un día sin ningún lote, en los últimos 30 min | [Escenario B](../runbooks/batch-close-failure.md#escenario-b--cierre-sin-lote-abierto) |
 | `OutboxSettlementTrabado` | Warning | Hay eventos en el outbox hace más de 1 minuto, durante 5 min | Revisar NATS y el log `outbox relay`. Se publican solos al resolver la causa |
 | `ReversasEnRevision` | Warning | Hay revisiones abiertas hace más de 15 min, durante 5 min | [Escenario H](../runbooks/batch-close-failure.md#escenario-h--reversas-en-revisión) |
 | `ReversasSinRecuperar` | Warning | Falta registrar la recuperación de reversas anteriores, durante 15 min | [Escenario E](../runbooks/batch-close-failure.md#escenario-e--reversas-anteriores-sin-descontar) |
@@ -868,7 +936,10 @@ ORDER BY batch_date DESC;
 ```
 
 En los logs, `modified concurrently` indica conflictos de versión, que son esperables con tráfico simultáneo,
-`no open batch found` indica cierres sin efecto, `deliveries exhausted` un evento perdido y
+`no open batch for the terminal` indica cierres sin efecto, `terminal reported sales for a day without any batch` un
+cierre con ventas que Settlement no tiene, `moved to the dead letter queue` un evento en la DLQ,
+`dead letter could not be published` un evento perdido, `late sale added to its disputed batch` una venta que llegó
+después de su cierre y
 `outbox relay: publish cycle failed` que el Relay no puede publicar y `reversal registered for review` una
 reversa que no coincide con su compra. `batch closed automatically` identifica los cierres sin
 conciliar, y `no settlement processor configured` los lotes que quedaron sin enviar.
@@ -1014,9 +1085,11 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Costo creciente por aprobación | Cada venta carga y reinserta todas las transacciones del lote. Los índices evitan recorrer toda la tabla, pero el costo sigue creciendo con el tamaño del lote | `Save`, `loadTransactions` |
 | Los eventos publicados no llevan la traza | El Relay publica sin el contexto del pedido: la traza del cierre no continúa en Notification. Se correlaciona por `correlation_id` | `pkg/outbox` |
 | Una fila que no se puede publicar frena a las demás | El ciclo se revierte ante el primer fallo. Hoy solo ocurre si NATS o el stream no están disponibles | `pkg/outbox` |
-| Un cierre sin lote no recibe respuesta | Terminal Gateway ya respondió `202`, y Settlement solo deja un `WARN` | `ProcessBatchClose` |
-| Sin DLQ ni reintento pasados unos 12 minutos | Una caída más larga agota las 5 entregas: el evento queda sin registrar hasta que alguien lo reprocesa | `nak` |
-| Un reintento puede llegar después del cierre | Si una venta está esperando su reentrega cuando el terminal cierra, el cierre da `DISPUTED` y la venta entra en un lote nuevo | `retryDelays` |
+| El terminal no se entera de un cierre sin lote | Terminal Gateway ya respondió `202`. Settlement lo cuenta y, si el terminal informó ventas, alerta con `CierreSinLote`, pero responderle requiere un evento que Terminal Gateway consuma | `closeWithoutBatch` |
+| Los totales de un cierre sin lote no se guardan | Con `no_batch`, solo quedan en el log: las ventas que lleguen después abren un lote que el job cierra sin conciliar | `closeWithoutBatch` |
+| La DLQ no se reprocesa sola | Al resolverse la causa, alguien tiene que llamar a `replay`. Sin eso, los eventos esperan en la DLQ con la alerta activa | `DeadLetterQueue` |
+| El reproceso de la DLQ no tiene auditoría propia | Quién reprocesó o descartó queda solo en los logs | `st_http_dead_letters.go` |
+| Una reversa tardía no vuelve a su lote cerrado | La venta tardía se agrega al lote en disputa; una reversa en la misma situación entra en el lote abierto, como cualquier reversa | `RegisterReversal` |
 | Sin migraciones automáticas | Los cambios de schema hay que aplicarlos a mano en las bases existentes | `pkg/pgutil/migrate.go` |
 | gRPC placeholder | Abre un puerto que no ofrece nada | `st_grpc_server.go` |
 | Código sin uso | `port.BatchService` y `port.AdminService` no se implementan; tampoco se usan `mdrPercent`, `BatchTxOffline` ni los eventos de dominio internos | `st_port_inbound.go`, `st_batch_handler.go`, `st_settlement_batch.go` |

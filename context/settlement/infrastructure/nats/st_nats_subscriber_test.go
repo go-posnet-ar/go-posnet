@@ -478,17 +478,47 @@ func TestNak_TransientErrorBeforeLastDeliveryIsWarning(t *testing.T) {
 	}
 }
 
-func TestNak_LastDeliveryReportsExhausted(t *testing.T) {
+// La última entrega fallida pasa a la DLQ, con el subject original y el error en los headers.
+func TestNak_LastDeliveryMovesToDeadLetterQueue(t *testing.T) {
 	rec := &logRecorder{}
-	s := &Subscriber{log: slog.New(rec)}
+	js := &fakeJetStream{}
+	s := &Subscriber{js: js, log: slog.New(rec)}
+	msg := jsMsg(maxDeliveries)
+	msg.Subject = events.SubjectAuthApproved
+	msg.Data = []byte(`{"event_id":"evt-4"}`)
+	msg.Header = natsclient.Header{"Traceparent": []string{"00-abc-def-01"}}
 
-	s.nak(context.Background(), jsMsg(maxDeliveries), errors.New("db timeout"), "evt-4")
+	s.nak(context.Background(), msg, errors.New("db timeout"), "evt-4")
 
-	last := rec.last()
-	if last.Level != slog.LevelError {
-		t.Errorf("level = %v, want Error", last.Level)
+	if last := rec.last(); last.Level != slog.LevelError || last.Message != "deliveries exhausted — event moved to the dead letter queue" {
+		t.Errorf("log = %v %q", last.Level, last.Message)
 	}
-	if last.Message != "deliveries exhausted — event will not be retried" {
+	if len(js.published) != 1 {
+		t.Fatalf("published = %d, want 1", len(js.published))
+	}
+	dl := js.published[0]
+	if dl.Subject != "posnet.dlq.settlement."+events.SubjectAuthApproved || string(dl.Data) != `{"event_id":"evt-4"}` {
+		t.Errorf("dead letter = %s %s", dl.Subject, dl.Data)
+	}
+	want := map[string]string{
+		"Posnet-Dlq-Subject": events.SubjectAuthApproved, "Posnet-Dlq-Event-Id": "evt-4", "Posnet-Dlq-Error": "db timeout",
+		"Posnet-Dlq-Deliveries": "5", natsclient.MsgIdHdr: "dlq-settlement-evt-4", "Traceparent": "00-abc-def-01",
+	}
+	for k, v := range want {
+		if got := dl.Header.Get(k); got != v {
+			t.Errorf("header %s = %q, want %q", k, got, v)
+		}
+	}
+}
+
+// Si la DLQ no está disponible, el evento se pierde como antes, y el log lo dice.
+func TestNak_LastDeliveryWithoutDeadLetterQueue(t *testing.T) {
+	rec := &logRecorder{}
+	s := &Subscriber{js: &fakeJetStream{publishErr: errors.New("no responders")}, log: slog.New(rec)}
+
+	s.nak(context.Background(), jsMsg(maxDeliveries), errors.New("db timeout"), "evt-5")
+
+	if last := rec.last(); last.Message != "deliveries exhausted and the dead letter could not be published — event will not be retried" {
 		t.Errorf("message = %q", last.Message)
 	}
 }

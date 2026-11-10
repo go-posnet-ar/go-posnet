@@ -410,6 +410,41 @@ func (r *SettlementBatchRepo) CountOpenReversalReviews(ctx context.Context, batc
 	return n, nil
 }
 
+// FindLateSaleBatchTx busca el lote en disputa al que le falta una venta que llegó tarde. El
+// total_count guardado es el del último cálculo del lote; AddLateSale lo vuelve a comprobar.
+func (r *SettlementBatchRepo) FindLateSaleBatchTx(ctx context.Context, tx pgx.Tx, terminalID domain.TerminalID, date time.Time, currency string, authorizedAt time.Time) (string, error) {
+	const q = `
+		SELECT id::text FROM settlement.settlement_batches
+		WHERE terminal_id = $1 AND batch_date = $2::date AND currency = $3
+		  AND state = 'DISPUTED' AND reconciled_with = 'TERMINAL'
+		  AND closed_at >= $4 AND terminal_count > COALESCE(total_count, 0)
+		ORDER BY closed_at ASC
+		LIMIT 1
+	`
+	var id string
+	err := tx.QueryRow(ctx, q, terminalID.String(), date.Format("2006-01-02"), currency, authorizedAt).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("FindLateSaleBatchTx: %w", err)
+	}
+	return id, nil
+}
+
+// CountTerminalDayBatches cuenta los lotes del terminal en esa fecha y moneda.
+func (r *SettlementBatchRepo) CountTerminalDayBatches(ctx context.Context, terminalID domain.TerminalID, date time.Time, currency string) (int, error) {
+	const q = `
+		SELECT COUNT(*) FROM settlement.settlement_batches
+		WHERE terminal_id = $1 AND batch_date = $2::date AND currency = $3
+	`
+	var n int
+	if err := r.pool.QueryRow(ctx, q, terminalID.String(), date.Format("2006-01-02"), currency).Scan(&n); err != nil {
+		return 0, fmt.Errorf("CountTerminalDayBatches: %w", err)
+	}
+	return n, nil
+}
+
 // FindReleasableHeldBatchIDs lista los lotes retenidos cuyas revisiones ya se cerraron. Un lote
 // que se volvió a conciliar y no coincide ya tiene discrepancias: no vuelve a aparecer.
 func (r *SettlementBatchRepo) FindReleasableHeldBatchIDs(ctx context.Context) ([]string, error) {

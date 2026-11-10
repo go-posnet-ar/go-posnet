@@ -152,14 +152,7 @@ func (b *SettlementBatch) Close(terminalCount int, terminalAmount int64) error {
 	// desajuste de monto por sí solo también debe contar como discrepancia
 	// aunque countDiff sea 0, o quedaría enmascarado para el caller que
 	// solo chequea Discrepancies() > 0.
-	countDiff := abs(terminalCount - backendTotalCount)
-	b.discrepancies = 0
-	if terminalCount != backendTotalCount || terminalAmount != backendTotalAmount {
-		b.discrepancies = countDiff
-		if b.discrepancies == 0 {
-			b.discrepancies = 1
-		}
-	}
+	b.discrepancies = discrepancyCount(terminalCount, terminalAmount, backendTotalCount, backendTotalAmount)
 
 	b.summary = &summary
 	now := time.Now().UTC()
@@ -246,9 +239,7 @@ func (b *SettlementBatch) Release() (released, changed bool, err error) {
 	}
 	discrepancies := 0
 	if b.reconciledWith == ReconciledWithTerminal && b.terminalCount != nil && b.terminalAmount != nil {
-		if *b.terminalCount != count || *b.terminalAmount != amount {
-			discrepancies = max(abs(*b.terminalCount-count), 1)
-		}
+		discrepancies = discrepancyCount(*b.terminalCount, *b.terminalAmount, count, amount)
 	}
 	if discrepancies > 0 {
 		changed = discrepancies != b.discrepancies || b.summary == nil || *b.summary != summary
@@ -262,6 +253,53 @@ func (b *SettlementBatch) Release() (released, changed bool, err error) {
 	now := time.Now().UTC()
 	b.closedAt = &now
 	return true, true, nil
+}
+
+// AddLateSale agrega a un lote DISPUTED una venta que llegó después de su cierre, si el terminal
+// la había contado: el lote se concilió contra el terminal, la venta se autorizó antes del cierre
+// y al backend le faltan transacciones. Recalcula el resumen y las discrepancias, sin cambiar de
+// estado: si ahora coincide, el lote se libera con Release. Devuelve false, sin cambiar nada, si
+// la venta no corresponde a este lote; entonces abre uno nuevo, como cualquier venta posterior.
+func (b *SettlementBatch) AddLateSale(transactionID domain.TransactionID, amountCents int64, authorizedAt time.Time) (bool, error) {
+	if b.state != valueobject.BatchStateDisputed || b.reconciledWith != ReconciledWithTerminal ||
+		b.terminalCount == nil || b.terminalAmount == nil || b.closedAt == nil || authorizedAt.After(*b.closedAt) {
+		return false, nil
+	}
+	_, count, _, err := b.calculateSummary()
+	if err != nil {
+		return false, err
+	}
+	if count >= *b.terminalCount {
+		return false, nil // El terminal no contó más ventas de las que hay: esta no es suya
+	}
+	for _, t := range b.transactions {
+		if t.TransactionID() == transactionID && t.Type() == valueobject.BatchTxPurchase {
+			return false, nil
+		}
+	}
+
+	tx, err := entity.NewBatchTransaction(b.id, transactionID, amountCents, b.currency, valueobject.BatchTxPurchase)
+	if err != nil {
+		return false, fmt.Errorf("settlement_batch: create batch transaction: %w", err)
+	}
+	b.transactions = append(b.transactions, tx)
+	summary, count, amount, err := b.calculateSummary()
+	if err != nil {
+		return false, err
+	}
+	b.summary = &summary
+	b.discrepancies = discrepancyCount(*b.terminalCount, *b.terminalAmount, count, amount)
+	return true, nil
+}
+
+// discrepancyCount compara los totales del terminal con los del backend: 0 si coinciden; si no,
+// la diferencia de cantidad, o 1 si solo difiere el monto. Un desajuste de monto tiene que
+// contar, o quedaría enmascarado para quien solo mira Discrepancies() > 0.
+func discrepancyCount(terminalCount int, terminalAmount int64, count int, amount int64) int {
+	if terminalCount == count && terminalAmount == amount {
+		return 0
+	}
+	return max(abs(terminalCount-count), 1)
 }
 
 // BackendTotals devuelve la cantidad y el monto neto de las transacciones actuales del lote,

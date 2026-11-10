@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/juantevez/go-posnet/context/settlement/application/command"
+	"github.com/juantevez/go-posnet/context/settlement/application/port"
 	"github.com/juantevez/go-posnet/context/settlement/application/query"
 	"github.com/juantevez/go-posnet/pkg/observability"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
@@ -18,12 +19,14 @@ func NewRouter(
 	security Security,
 	natsConnected func() bool,
 	missingTables func(ctx context.Context) ([]string, error),
+	deadLetters port.DeadLetterQueue,
 ) http.Handler {
 	mux := http.NewServeMux()
 
 	h := NewHandler(queryHandler, adminHandler, pool)
 	h.natsConnected = natsConnected
 	h.missingTables = missingTables
+	h.deadLetters = deadLetters
 	h.RegisterRoutes(mux)
 
 	mux.Handle("GET /metrics", observability.MetricsHandler())

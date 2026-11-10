@@ -32,6 +32,8 @@ type Handler struct {
 	natsConnected func() bool
 	// missingTables informa las tablas que faltan en la base; nil = sin verificar.
 	missingTables func(ctx context.Context) ([]string, error)
+	// deadLetters es la DLQ de Settlement; nil = las rutas /dead-letters responden 503.
+	deadLetters port.DeadLetterQueue
 }
 
 func NewHandler(
@@ -57,6 +59,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /reversal-reviews/{transaction_id}/resolve", h.handleResolveReversalReview)
 	mux.HandleFunc("GET  /merchants/{merchant_id}/timezone", h.handleGetMerchantTimezone)
 	mux.HandleFunc("PUT  /merchants/{merchant_id}/timezone", h.handleSetMerchantTimezone)
+	mux.HandleFunc("GET  /dead-letters", h.handleListDeadLetters)
+	mux.HandleFunc("POST /dead-letters/{sequence}/replay", h.handleReplayDeadLetter)
+	mux.HandleFunc("POST /dead-letters/{sequence}/discard", h.handleDiscardDeadLetter)
 }
 
 // requireBatchID rechaza un {id} que no sea un UUID canónico. Sin esto llega a

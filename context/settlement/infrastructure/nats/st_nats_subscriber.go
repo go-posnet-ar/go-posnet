@@ -93,130 +93,94 @@ func (s *Subscriber) Subscribe() error {
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 func (s *Subscriber) handleAuthApproved(msg *natsclient.Msg) {
-	ctx := observability.ExtractTraceContext(context.Background(), msg)
-	ctx, span := observability.StartSpan(ctx, "subscriber.handleAuthApproved")
-	defer span.End()
-
-	envelope, err := events.UnmarshalEnvelope(msg.Data)
-	if err != nil {
-		s.log.ErrorContext(ctx, "failed to unmarshal envelope", slog.String("error", err.Error()))
-		_ = msg.Term()
-		return
-	}
-
-	payload, err := events.Unwrap[events.AuthorizationApprovedPayload](envelope)
-	if err != nil {
-		s.log.ErrorContext(ctx, "failed to unwrap AuthorizationApproved",
-			slog.String("event_id", envelope.EventID),
-			slog.String("error", err.Error()),
-		)
-		_ = msg.Term()
-		return
-	}
-
-	cmd := port.RegisterApprovalCommand{
-		EventID:       envelope.EventID,
-		TransactionID: payload.TransactionID,
-		TerminalID:    payload.TerminalID,
-		MerchantID:    payload.MerchantID,
-		AmountCents:   payload.AmountCents,
-		Currency:      payload.Currency,
-		AuthorizedAt:  payload.AuthorizedAt,
-	}
-
-	if err := s.batchHandler.RegisterApproval(ctx, cmd); err != nil {
-		s.nak(ctx, msg, err, envelope.EventID)
-		return
-	}
-	_ = msg.Ack()
+	s.handle(msg, "subscriber.handleAuthApproved")
 }
 
 func (s *Subscriber) handleReversalCompleted(msg *natsclient.Msg) {
+	s.handle(msg, "subscriber.handleReversalCompleted")
+}
+
+func (s *Subscriber) handleBatchCloseRequested(msg *natsclient.Msg) {
+	s.handle(msg, "subscriber.handleBatchCloseRequested")
+}
+
+// handle procesa un mensaje y lo confirma, o lo devuelve para reintento según el error.
+func (s *Subscriber) handle(msg *natsclient.Msg, spanName string) {
 	ctx := observability.ExtractTraceContext(context.Background(), msg)
-	ctx, span := observability.StartSpan(ctx, "subscriber.handleReversalCompleted")
+	ctx, span := observability.StartSpan(ctx, spanName)
 	defer span.End()
 
-	envelope, err := events.UnmarshalEnvelope(msg.Data)
+	eventID, err := s.process(ctx, msg.Subject, msg.Data)
 	if err != nil {
-		s.log.ErrorContext(ctx, "failed to unmarshal envelope", slog.String("error", err.Error()))
-		_ = msg.Term()
-		return
-	}
-
-	payload, err := events.Unwrap[events.ReversalCompletedPayload](envelope)
-	if err != nil {
-		s.log.ErrorContext(ctx, "failed to unwrap ReversalCompleted",
-			slog.String("event_id", envelope.EventID),
-			slog.String("error", err.Error()),
-		)
-		_ = msg.Term()
-		return
-	}
-
-	cmd := port.RegisterReversalCommand{
-		EventID:               envelope.EventID,
-		OriginalTransactionID: payload.OriginalTransactionID,
-		TerminalID:            payload.TerminalID,
-		MerchantID:            payload.MerchantID,
-		AmountCents:           payload.AmountCents,
-		Currency:              payload.Currency,
-		CompletedAt:           payload.CompletedAt,
-	}
-
-	if err := s.batchHandler.RegisterReversal(ctx, cmd); err != nil {
-		s.nak(ctx, msg, err, envelope.EventID)
+		s.nak(ctx, msg, err, eventID)
 		return
 	}
 	_ = msg.Ack()
 }
 
-func (s *Subscriber) handleBatchCloseRequested(msg *natsclient.Msg) {
-	ctx := observability.ExtractTraceContext(context.Background(), msg)
-	ctx, span := observability.StartSpan(ctx, "subscriber.handleBatchCloseRequested")
-	defer span.End()
-
-	envelope, err := events.UnmarshalEnvelope(msg.Data)
+// process decodifica el evento y ejecuta el comando que le corresponde por subject. Lo usan el
+// consumer y el reproceso de la DLQ. Un evento que no se puede decodificar es un error
+// permanente: reintentarlo no lo arregla.
+func (s *Subscriber) process(ctx context.Context, subject string, data []byte) (string, error) {
+	envelope, err := events.UnmarshalEnvelope(data)
 	if err != nil {
-		s.log.ErrorContext(ctx, "failed to unmarshal envelope", slog.String("error", err.Error()))
-		_ = msg.Term()
-		return
+		return "", pkgerrors.NewValidationError("malformed envelope: " + err.Error())
 	}
 
-	payload, err := events.Unwrap[events.BatchCloseRequestedPayload](envelope)
-	if err != nil {
-		s.log.ErrorContext(ctx, "failed to unwrap BatchCloseRequested",
-			slog.String("event_id", envelope.EventID),
-			slog.String("error", err.Error()),
-		)
-		_ = msg.Term()
-		return
-	}
+	switch subject {
+	case events.SubjectAuthApproved:
+		payload, err := events.Unwrap[events.AuthorizationApprovedPayload](envelope)
+		if err != nil {
+			return envelope.EventID, pkgerrors.NewValidationError("unwrap AuthorizationApproved: " + err.Error())
+		}
+		return envelope.EventID, s.batchHandler.RegisterApproval(ctx, port.RegisterApprovalCommand{
+			EventID:       envelope.EventID,
+			TransactionID: payload.TransactionID,
+			TerminalID:    payload.TerminalID,
+			MerchantID:    payload.MerchantID,
+			AmountCents:   payload.AmountCents,
+			Currency:      payload.Currency,
+			AuthorizedAt:  payload.AuthorizedAt,
+		})
 
-	cmd := port.ProcessBatchCloseCommand{
-		EventID:        envelope.EventID,
-		TerminalID:     payload.TerminalID,
-		MerchantID:     payload.MerchantID,
-		BatchDate:      payload.BatchDate,
-		RequestedAt:    payload.RequestedAt,
-		TerminalCount:  payload.TerminalCount,
-		TerminalAmount: payload.TerminalAmount,
-		Currency:       payload.Currency,
-	}
+	case events.SubjectReversalCompleted:
+		payload, err := events.Unwrap[events.ReversalCompletedPayload](envelope)
+		if err != nil {
+			return envelope.EventID, pkgerrors.NewValidationError("unwrap ReversalCompleted: " + err.Error())
+		}
+		return envelope.EventID, s.batchHandler.RegisterReversal(ctx, port.RegisterReversalCommand{
+			EventID:               envelope.EventID,
+			OriginalTransactionID: payload.OriginalTransactionID,
+			TerminalID:            payload.TerminalID,
+			MerchantID:            payload.MerchantID,
+			AmountCents:           payload.AmountCents,
+			Currency:              payload.Currency,
+			CompletedAt:           payload.CompletedAt,
+		})
 
-	if err := s.batchHandler.ProcessBatchClose(ctx, cmd); err != nil {
-		s.nak(ctx, msg, err, envelope.EventID)
-		return
+	case events.SubjectBatchCloseRequested:
+		payload, err := events.Unwrap[events.BatchCloseRequestedPayload](envelope)
+		if err != nil {
+			return envelope.EventID, pkgerrors.NewValidationError("unwrap BatchCloseRequested: " + err.Error())
+		}
+		return envelope.EventID, s.batchHandler.ProcessBatchClose(ctx, port.ProcessBatchCloseCommand{
+			EventID:        envelope.EventID,
+			TerminalID:     payload.TerminalID,
+			MerchantID:     payload.MerchantID,
+			BatchDate:      payload.BatchDate,
+			RequestedAt:    payload.RequestedAt,
+			TerminalCount:  payload.TerminalCount,
+			TerminalAmount: payload.TerminalAmount,
+			Currency:       payload.Currency,
+		})
 	}
-	_ = msg.Ack()
+	return envelope.EventID, pkgerrors.NewValidationError("unexpected subject " + subject)
 }
 
 func (s *Subscriber) nak(ctx context.Context, msg *natsclient.Msg, err error, eventID string) {
 	observability.RecordError(ctx, err)
 
-	var validationErr *pkgerrors.ValidationError
-	var conflictErr *pkgerrors.ConflictError
-
-	if errors.As(err, &validationErr) || errors.As(err, &conflictErr) {
+	if isPermanent(err) {
 		s.log.ErrorContext(ctx, "permanent error — terminating",
 			slog.String("event_id", eventID),
 			slog.String("error", err.Error()),
@@ -228,15 +192,27 @@ func (s *Subscriber) nak(ctx context.Context, msg *natsclient.Msg, err error, ev
 
 	delivered := deliveryCount(msg)
 	if delivered >= maxDeliveries {
-		// JetStream no vuelve a entregarlo: sin intervención, el evento se pierde.
-		s.log.ErrorContext(ctx, "deliveries exhausted — event will not be retried",
+		// JetStream no vuelve a entregarlo: se guarda en la DLQ, de donde se reprocesa con la API.
+		if dlqErr := s.deadLetter(ctx, msg, err, eventID, delivered); dlqErr != nil {
+			s.log.ErrorContext(ctx, "deliveries exhausted and the dead letter could not be published — event will not be retried",
+				slog.String("event_id", eventID),
+				slog.String("subject", msg.Subject),
+				slog.Uint64("delivered", delivered),
+				slog.String("error", err.Error()),
+				slog.String("dlq_error", dlqErr.Error()),
+			)
+			observability.RecordNATSFailed(ctx, msg.Subject, "exhausted")
+			_ = msg.Nak()
+			return
+		}
+		s.log.ErrorContext(ctx, "deliveries exhausted — event moved to the dead letter queue",
 			slog.String("event_id", eventID),
 			slog.String("subject", msg.Subject),
 			slog.Uint64("delivered", delivered),
 			slog.String("error", err.Error()),
 		)
-		observability.RecordNATSFailed(ctx, msg.Subject, "exhausted")
-		_ = msg.Nak()
+		observability.RecordNATSFailed(ctx, msg.Subject, "dead_lettered")
+		_ = msg.Ack()
 		return
 	}
 
@@ -249,6 +225,13 @@ func (s *Subscriber) nak(ctx context.Context, msg *natsclient.Msg, err error, ev
 	)
 	observability.RecordNATSFailed(ctx, msg.Subject, "transient")
 	_ = msg.NakWithDelay(delay)
+}
+
+// isPermanent indica un error que no se arregla reintentando.
+func isPermanent(err error) bool {
+	var validationErr *pkgerrors.ValidationError
+	var conflictErr *pkgerrors.ConflictError
+	return errors.As(err, &validationErr) || errors.As(err, &conflictErr)
 }
 
 // deliveryCount devuelve el número de entrega del mensaje. Si no puede leerlo, asume

@@ -2,7 +2,12 @@
 
 ## Antes de empezar — cómo funciona hoy
 
-El stream `POSNET_DLQ` existe, pero **nada publica en él**. Un mensaje que agota `MaxDeliver` no se
+**Settlement usa `POSNET_DLQ`:** un evento que agota sus 5 entregas queda en `posnet.dlq.settlement.<subject>`, y se
+reprocesa con su API, sin republicar nada: seguí el
+[Escenario I de batch-close-failure.md](batch-close-failure.md#escenario-i--eventos-en-la-dlq). Este runbook sigue
+sirviendo para Settlement solo si el log dice `dead letter could not be published`: el evento no llegó a la DLQ.
+
+**Los otros BC no publican en `POSNET_DLQ`.** Un mensaje que agota `MaxDeliver` no se
 mueve: JetStream deja de entregárselo a ese consumidor, y el mensaje sigue en su stream de origen.
 
 Por eso, "reprocesar" significa **encontrar el mensaje original y volver a publicarlo**. Es un
@@ -22,7 +27,7 @@ Hay dos formas de que un mensaje deje de reintentarse:
 
 Los reintentos son inmediatos, así que una caída de pocos segundos ya puede agotar las entregas. **Settlement
 es la excepción:** espera 5 s, 30 s, 2 min y 10 min entre entregas, así que resiste una caída de unos 12
-minutos, y registra `deliveries exhausted` en el último intento.
+minutos, y en el último intento pasa el evento a la DLQ.
 
 Los comandos se probaron con el CLI `nats` `v0.4.0`. Requieren también `jq`.
 

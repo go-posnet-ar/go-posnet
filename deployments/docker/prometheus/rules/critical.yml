@@ -71,7 +71,8 @@ groups:
           summary: "Deadlock detectado en Postgres (db posnet)"
           description: "increase(pg_stat_database_deadlocks[1m]) > 0. Contención probable en la TX SERIALIZABLE de Settlement."
 
-      # Evento de Settlement que agotó las entregas: una venta, reversa o cierre sin registrar.
+      # Evento de Settlement que agotó las entregas y no se pudo guardar en la DLQ: una venta, reversa
+      # o cierre sin registrar. Los que llegan a la DLQ los avisa EventosEnDLQSettlement.
       # Compara contra 0 y no usa increase() porque el primer incremento de un counter
       # no se ve: queda activa hasta reprocesar el evento y reiniciar el servicio.
       - alert: EventoSettlementPerdido
@@ -80,5 +81,5 @@ groups:
           severity: critical
         annotations:
           summary: "Settlement agotó las entregas de {{ $labels.subject }}"
-          description: "Un evento no se reintentará y falta en los lotes. Buscar 'deliveries exhausted' en los logs y seguir nats-dlq-reprocess.md."
+          description: "Un evento no se reintentará, no llegó a la DLQ y falta en los lotes. Buscar 'dead letter could not be published' en los logs y seguir nats-dlq-reprocess.md."
 

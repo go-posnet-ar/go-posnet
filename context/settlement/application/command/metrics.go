@@ -27,6 +27,8 @@ import (
 //	posnet_settlement_reversals_in_review → posnet_settlement_reversals_in_review
 //	posnet_settlement_batch_close_rejected → posnet_settlement_batch_close_rejected_total{reason}
 //	posnet_settlement_reversal_recovery_pending → posnet_settlement_reversal_recovery_pending
+//	posnet_settlement_dead_letters → posnet_settlement_dead_letters
+//	posnet_settlement_late_sales → posnet_settlement_late_sales_total{result}
 //
 // El label "bc" lo inyecta Prometheus como target label (prometheus.yml).
 type Metrics struct {
@@ -36,6 +38,7 @@ type Metrics struct {
 	batchDuration metric.Float64Histogram
 	submissions   metric.Int64Counter
 	closeRejected metric.Int64Counter
+	lateSales     metric.Int64Counter
 }
 
 // Valores del label reason de posnet_settlement_batch_close_rejected_total.
@@ -43,6 +46,18 @@ const (
 	closeRejectedFuture      = "future"       // batch_date posterior al día de negocio
 	closeRejectedTooOld      = "too_old"      // más antiguo que SETTLEMENT_CLOSE_MAX_AGE_DAYS
 	closeRejectedNotReopened = "not_reopened" // anterior a ayer, de un lote que nadie reabrió
+	// closeRejectedNoBatch: el terminal informó ventas de un día sin ningún lote. Pueden estar
+	// reintentándose, o no haber llegado nunca.
+	closeRejectedNoBatch = "no_batch"
+	// closeRejectedAlreadyClosed: el día tiene lotes, pero ninguno OPEN. Suele ser un cierre repetido.
+	closeRejectedAlreadyClosed = "already_closed"
+)
+
+// Valores del label result de posnet_settlement_late_sales_total.
+const (
+	lateSaleReleased = "released" // Con la venta, el lote coincide y se envía
+	lateSaleDisputed = "disputed" // Sigue sin coincidir: falta otra venta, o difiere el monto
+	lateSaleHeld     = "held"     // Coincide, pero una revisión de reversa lo retiene
 )
 
 // Valores del label result de posnet_settlement_submissions_total.
@@ -101,9 +116,26 @@ func NewMetrics() (*Metrics, error) {
 	}
 
 	closeRejected, err := m.Int64Counter("posnet_settlement_batch_close_rejected",
-		metric.WithDescription("Pedidos de cierre de un terminal rechazados por su batch_date, por reason. El terminal no recibe respuesta."))
+		metric.WithDescription("Pedidos de cierre de un terminal que no cerraron nada, por reason: rechazados por su batch_date o sin un lote OPEN. El terminal no recibe respuesta."))
 	if err != nil {
 		return nil, err
+	}
+
+	lateSales, err := m.Int64Counter("posnet_settlement_late_sales",
+		metric.WithDescription("Ventas que llegaron después del cierre de su lote en disputa, que el terminal había contado, por result."),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	// Las series nacen en 0: increase() no ve el primer incremento de una serie nueva, y una alerta
+	// sobre el primer rechazo no se dispararía.
+	ctx := context.Background()
+	for _, reason := range []string{closeRejectedFuture, closeRejectedTooOld, closeRejectedNotReopened, closeRejectedNoBatch, closeRejectedAlreadyClosed} {
+		closeRejected.Add(ctx, 0, metric.WithAttributes(attribute.String("reason", reason)))
+	}
+	for _, result := range []string{lateSaleReleased, lateSaleDisputed, lateSaleHeld} {
+		lateSales.Add(ctx, 0, metric.WithAttributes(attribute.String("result", result)))
 	}
 
 	return &Metrics{
@@ -113,7 +145,16 @@ func NewMetrics() (*Metrics, error) {
 		batchDuration: batchDuration,
 		submissions:   submissions,
 		closeRejected: closeRejected,
+		lateSales:     lateSales,
 	}, nil
+}
+
+// RecordLateSale cuenta una venta agregada a un lote en disputa después de su cierre. Nil-safe.
+func (m *Metrics) RecordLateSale(ctx context.Context, result string) {
+	if m == nil {
+		return
+	}
+	m.lateSales.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
 }
 
 // RecordSubmission contabiliza un intento de envío al procesador. Nil-safe.
@@ -221,6 +262,38 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 			return nil
 		},
 		gauge, outboxGauge, reviewGauge, recoveryGauge,
+	)
+	return err
+}
+
+// DeadLetterCounter cuenta los eventos de la DLQ de Settlement.
+type DeadLetterCounter interface {
+	Count(ctx context.Context) (int, error)
+}
+
+// RegisterDeadLetterGauge publica posnet_settlement_dead_letters, consultando NATS en cada
+// scrape. Si la consulta falla, la serie no se informa: un cero ocultaría los eventos.
+func RegisterDeadLetterGauge(counter DeadLetterCounter) error {
+	gauge, err := observability.Meter("posnet.settlement").Int64ObservableGauge(
+		"posnet_settlement_dead_letters",
+		metric.WithDescription("Eventos que agotaron sus entregas y esperan en la DLQ de Settlement a que se reprocesen o descarten."),
+	)
+	if err != nil {
+		return err
+	}
+	_, err = observability.Meter("posnet.settlement").RegisterCallback(
+		func(ctx context.Context, o metric.Observer) error {
+			ctx, cancel := context.WithTimeout(ctx, attentionQueryTimeout)
+			defer cancel()
+			n, err := counter.Count(ctx)
+			if err != nil {
+				slog.ErrorContext(ctx, "failed to count dead letters", slog.String("error", err.Error()))
+				return nil
+			}
+			o.ObserveInt64(gauge, int64(n))
+			return nil
+		},
+		gauge,
 	)
 	return err
 }

@@ -1542,3 +1542,48 @@ func TestFindReleasableHeldBatchIDs(t *testing.T) {
 		t.Errorf("FindReleasableHeldBatchIDs() = %v, %v, want [b-1 b-2]", ids, err)
 	}
 }
+
+func TestFindLateSaleBatchTx(t *testing.T) {
+	terminal := domain.NewTerminalID()
+	date := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	authorizedAt := time.Date(2026, 11, 10, 22, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		rows *pgxmock.Rows
+		want string
+	}{
+		{"found", pgxmock.NewRows([]string{"id"}).AddRow("b-1"), "b-1"},
+		{"none", pgxmock.NewRows([]string{"id"}), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newMockPool(t)
+			pool.ExpectBegin()
+			pool.ExpectQuery(`state = 'DISPUTED' AND reconciled_with = 'TERMINAL'`).
+				WithArgs(terminal.String(), "2026-11-10", "ARS", authorizedAt).WillReturnRows(tc.rows)
+			pool.ExpectRollback()
+			tx, err := pool.Begin(context.Background())
+			if err != nil {
+				t.Fatalf("Begin() error = %v", err)
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+
+			got, err := postgres.NewSettlementBatchRepo(pool).FindLateSaleBatchTx(context.Background(), tx, terminal, date, "ARS", authorizedAt)
+			if err != nil || got != tc.want {
+				t.Errorf("FindLateSaleBatchTx() = %q, %v, want %q", got, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestCountTerminalDayBatches(t *testing.T) {
+	pool := newMockPool(t)
+	terminal := domain.NewTerminalID()
+	pool.ExpectQuery("SELECT COUNT").WithArgs(terminal.String(), "2026-11-10", "ARS").
+		WillReturnRows(pgxmock.NewRows([]string{"count"}).AddRow(2))
+
+	n, err := postgres.NewSettlementBatchRepo(pool).CountTerminalDayBatches(context.Background(), terminal, time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC), "ARS")
+	if err != nil || n != 2 {
+		t.Errorf("CountTerminalDayBatches() = %d, %v, want 2", n, err)
+	}
+}

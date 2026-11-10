@@ -127,6 +127,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	batchHandler.SetCloseGrace(cfg.Settlement.BatchCloseGrace)
 	batchHandler.SetBatchReopens(batchRepo)
 	batchHandler.SetAuditLog(batchRepo)
+	batchHandler.SetTerminalDayBatches(batchRepo)
 	businessLocation, err := time.LoadLocation(cfg.Settlement.BusinessTimezone)
 	if err != nil {
 		return nil, fmt.Errorf("wire: load business timezone: %w", err)
@@ -149,6 +150,10 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 
 	// NATS Subscriber — consume AuthApproved, ReversalCompleted, BatchCloseRequested
 	subscriber := natsinfra.NewSubscriber(js, batchHandler)
+	deadLetters := natsinfra.NewDeadLetterQueue(js, subscriber)
+	if err := command.RegisterDeadLetterGauge(deadLetters); err != nil {
+		return nil, fmt.Errorf("wire: dead letter gauge: %w", err)
+	}
 
 	// gRPC Server — placeholder
 	grpcSrv := grpcserver.NewSettlementServer()
@@ -170,7 +175,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	}
 	router := httpinfra.NewRouter(queryHandler, adminHandler, pool,
 		httpinfra.Security{Tokens: adminTokens, TrustedProxies: trustedProxies},
-		natsConn.IsConnected, batchRepo.MissingTables)
+		natsConn.IsConnected, batchRepo.MissingTables, deadLetters)
 	httpSrv := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.HTTPPort),
 		Handler:      router,

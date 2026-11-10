@@ -27,7 +27,7 @@ func newRouterWithKey(repo repository.SettlementBatchRepository, pool *fakePool,
 	if err != nil {
 		panic(err)
 	}
-	return NewRouter(queryHandler, adminHandler, pool, Security{Tokens: tokens}, nil, nil)
+	return NewRouter(queryHandler, adminHandler, pool, Security{Tokens: tokens}, nil, nil, nil)
 }
 
 func TestNewRouter_Routes(t *testing.T) {

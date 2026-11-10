@@ -21,7 +21,7 @@ export AUTH="Authorization: Bearer <token>"
 | Respuesta | Qué significa |
 |---|---|
 | `401 UNAUTHORIZED` | Falta el token, es incorrecto o venció. Queda `rejected admin request` en el log |
-| `403 FORBIDDEN` | Tu rol no alcanza: `force-close`, `resubmit` y `reopen` piden `operator`; lo demás que modifica, `supervisor` |
+| `403 FORBIDDEN` | Tu rol no alcanza: `force-close`, `resubmit`, `reopen` y el reproceso de la DLQ piden `operator`; lo demás que modifica, `supervisor` |
 | `403 OPERATOR_MISMATCH` | El `operator_id` del body no es el de tu token. Omitilo |
 | `429 TOO_MANY_ATTEMPTS` | Demasiados tokens incorrectos desde tu IP. Esperá lo que indica `Retry-After`, hasta 5 minutos |
 | `503 ADMIN_API_DISABLED` | El servicio no tiene tokens configurados. Hay que definir `SETTLEMENT_ADMIN_TOKENS_FILE` y reiniciarlo |
@@ -31,18 +31,19 @@ export AUTH="Authorization: Bearer <token>"
 falta aplicar las [migraciones](../technical/SETTLEMENT.md#aplicar-la-migración). `/readyz` lo confirma: responde `503`
 con `database schema incomplete`, y Docker muestra el contenedor `unhealthy`.
 
-Revisado contra el código el 2026-11-06. Detalle técnico en
+Revisado contra el código el 2026-11-10. Detalle técnico en
 [SETTLEMENT.md](../technical/SETTLEMENT.md). Puerto HTTP en Docker Compose: `8084`.
 
 | Síntoma | Escenario |
 |---|---|
 | Lote en `DISPUTED` | [A](#escenario-a--lote-en-disputed) |
-| Cierre sin efecto, log `no open batch found` | [B](#escenario-b--cierre-sin-lote-abierto) |
+| Cierre sin efecto, logs `no open batch for the terminal` o `terminal reported sales for a day without any batch`, alerta `CierreSinLote` | [B](#escenario-b--cierre-sin-lote-abierto) |
 | Lote en `CLOSED` que no avanza | [C](#escenario-c--lote-en-closed-sin-enviar) |
 | Aprobaciones sin lote | [D](#escenario-d--aprobaciones-fuera-de-todo-lote) |
 | Reversa anterior a la corrección que no se descontó | [E](#escenario-e--reversas-anteriores-sin-descontar) |
 | Lote `OPEN` de días anteriores | [F](#escenario-f--lotes-abiertos-de-días-anteriores) |
 | Lote en `SUBMITTED` que no se liquida | [G](#escenario-g--confirmar-la-liquidación) |
+| Eventos en la DLQ, alerta `EventosEnDLQSettlement` | [I](#escenario-i--eventos-en-la-dlq) |
 
 ## Contexto del flujo
 
@@ -107,6 +108,10 @@ marked as disputed`, `batch held — reversals under review` o `resubmit blocked
 
 **Causa:** la cantidad o el monto del terminal no coinciden con el backend. Las más comunes:
 
+Una venta que el terminal contó pero llegó después del cierre, por un reintento o desde la DLQ, **se agrega sola** al
+lote en disputa (log `late sale added to its disputed batch`, auditoría `LATE_SALE`). Si con ella coincide, el lote pasa
+a `CLOSED` y se envía. Esperá unos 12 minutos antes de intervenir en una disputa recién cerrada, y revisá la DLQ.
+
 | Causa | Cómo reconocerla |
 |---|---|
 | Reversa de antes de la corrección | [Escenario E](#escenario-e--reversas-anteriores-sin-descontar) |
@@ -170,15 +175,21 @@ medio.
 
 ## Escenario B — Cierre sin lote abierto
 
-**Síntoma:** el terminal pidió el cierre y no cambió nada. Log: `no open batch found for terminal —
-nothing to close`. El mensaje se confirma, sin reintento, y el cliente ya había recibido `202`.
+**Síntoma:** el terminal pidió el cierre y no cambió nada. El mensaje se confirma, sin reintento, y el cliente ya
+había recibido `202`. El log y `posnet_settlement_batch_close_rejected_total{reason}` dicen por qué:
 
-**Causas típicas:**
+| Log | `reason` | Causa típica |
+|---|---|---|
+| `no open batch for the terminal — the day's batches are already closed` (`WARN`) | `already_closed` | Un reintento del terminal o de un reprocesamiento: el cierre ya se había procesado |
+| `terminal reported sales for a day without any batch` (`ERROR`, alerta `CierreSinLote`) | `no_batch` | El terminal informó ventas que Settlement no tiene: se están reintentando, están en la [DLQ](#escenario-i--eventos-en-la-dlq), o no llegaron |
+| `no open batch for the terminal and no sales reported` (`INFO`) | — | Un día sin ventas en esa moneda. No hay nada que hacer |
 
-- El lote ya estaba cerrado: un reintento del terminal o de un reprocesamiento.
-- No hubo transacciones de esa moneda en esa fecha.
-- Un `batch_date` distinto al de las ventas: el lote de las ventas sigue `OPEN`
-  ([Escenario F](#escenario-f--lotes-abiertos-de-días-anteriores)).
+Un `batch_date` distinto al de las ventas también da `no_batch`: el lote de las ventas sigue `OPEN`
+([Escenario F](#escenario-f--lotes-abiertos-de-días-anteriores)).
+
+**Con `no_batch`, los totales del terminal están en el log** (`terminal_count`, `terminal_amount`): no se guardan en
+ningún otro lado. Anotalos. Si las ventas llegan después, abren un lote nuevo que el job cierra sin conciliar, porque
+no hay un lote en disputa que las espere.
 
 **Diagnóstico:**
 
@@ -191,7 +202,7 @@ WHERE terminal_id = '<terminal_id>' ORDER BY batch_date DESC, created_at DESC LI
 |---|---|
 | Lote cerrado o posterior en esa fecha | El cierre ya se había procesado: no hay nada que hacer |
 | Lote `OPEN` de otra fecha | Escenario F |
-| Sin lote en esa fecha, pero con ventas aprobadas | Faltan eventos: Escenario D |
+| Sin lote en esa fecha, pero con ventas aprobadas | Faltan eventos: revisá la DLQ (Escenario I) y después el Escenario D |
 
 ---
 
@@ -243,7 +254,7 @@ causa esto: abre un lote nuevo.
 | Causa | Cómo reconocerla |
 |---|---|
 | `auth.approved` no se publicó | `failed to publish approval event` en Authorization; el evento no está en el stream |
-| Settlement no pudo procesar el evento | `transient error` repetido en `settlement-auth-consumer`, hasta agotar 5 entregas |
+| Settlement no pudo procesar el evento | `transient error` repetido en `settlement-auth-consumer`, hasta agotar 5 entregas. Si después aparece `moved to the dead letter queue`, está en la DLQ: [Escenario I](#escenario-i--eventos-en-la-dlq) |
 | Moneda inválida o monto no positivo | `permanent error` con `invalid currency` o `amount_cents`: se descartó |
 
 **Diagnóstico:**
@@ -258,7 +269,8 @@ ORDER BY t.authorized_at DESC;
 
 **Resolución:**
 
-1. **Republicá el `auth.approved` original** con [nats-dlq-reprocess.md](nats-dlq-reprocess.md). La venta entra
+1. **Si está en la DLQ, reprocesalo desde ahí** ([Escenario I](#escenario-i--eventos-en-la-dlq)): no le llega a los
+   otros consumidores. Si no, **republicá el `auth.approved` original** con [nats-dlq-reprocess.md](nats-dlq-reprocess.md). La venta entra
    en el lote `OPEN` de su día y moneda, o abre uno nuevo: no hace falta reabrir ningún lote. No debería
    existir una fila en `settlement.processed_events`, porque la transacción se deshace al fallar.
 2. **Si el evento no está en el stream,** no hay un procedimiento seguro: coordinalo con el equipo.
@@ -444,6 +456,58 @@ curl -X POST http://<host>:8084/batches/<batch_id>/resubmit -H "$AUTH" -d '{"ope
 
 ---
 
+## Escenario I — Eventos en la DLQ
+
+**Síntoma:** alerta `EventosEnDLQSettlement`, `posnet_settlement_dead_letters` mayor que 0, log `deliveries exhausted —
+event moved to the dead letter queue`.
+
+**Causa:** una venta, reversa o cierre falló las 5 entregas, durante unos 12 minutos, con un error transitorio: casi
+siempre la base caída. No se perdió: está en `POSNET_DLQ`, bajo `posnet.dlq.settlement.<subject>`, con el error.
+Mientras tanto, falta en los lotes.
+
+**Diagnóstico:**
+
+```bash
+curl -s http://<host>:8084/dead-letters -H "$AUTH" | jq '.dead_letters[] | {sequence, subject, event_id, error, failed_at}'
+```
+
+**Resolución:**
+
+1. **Confirmá que la causa se resolvió:** `/readyz` en `200`.
+2. **Reprocesá cada evento,** del más antiguo al más nuevo. Una reversa antes que su compra queda en revisión
+   hasta que llegue la compra ([Escenario H](#escenario-h--reversas-en-revisión)):
+
+   ```bash
+   curl -X POST http://<host>:8084/dead-letters/<sequence>/replay -H "$AUTH" -d '{"operator_id":"<tu_usuario>"}'
+   ```
+
+   | Respuesta | Qué significa |
+   |---|---|
+   | `200 replayed` | Se procesó y se borró de la DLQ. Uno ya registrado también da `200`: la idempotencia lo descarta |
+   | `422 REPLAY_REJECTED` | Error permanente, como un dato inválido: reintentarlo no lo arregla. Corregí la causa o descartalo |
+   | `503 REPLAY_FAILED` | Sigue fallando, y queda en la DLQ. Revisá la causa y repetí |
+   | `404` | Ya no está: lo reprocesó o descartó otra persona |
+
+   Reprocesar usa el mismo código que el consumidor, en Settlement: **no le llega a Terminal Gateway ni a
+   Notification**, a diferencia de republicar con `nats pub`. Pide el rol `operator`.
+
+3. **Un cierre reprocesado tarde** cierra con los totales del terminal si el lote sigue `OPEN`. Si el job ya lo cerró,
+   da `already_closed` y no hace nada ([Escenario B](#escenario-b--cierre-sin-lote-abierto)).
+4. **Descartar** pierde el evento: solo con un motivo, y con el rol `supervisor`:
+
+   ```bash
+   curl -X POST http://<host>:8084/dead-letters/<sequence>/discard -H "$AUTH" \
+     -d '{"operator_id":"<tu_usuario>","reason":"<ticket>"}'
+   ```
+
+El reproceso y el descarte quedan solo en los logs (`dead letter replayed by operator`, `dead letter discarded by
+operator`), con el operador: `batch_audit_log` registra cambios de lotes.
+
+**Si en vez de `moved to the dead letter queue` el log dice `dead letter could not be published`,** el evento no llegó a
+la DLQ y salta `EventoSettlementPerdido`: seguí [nats-dlq-reprocess.md](nats-dlq-reprocess.md).
+
+---
+
 ## Referencia — endpoints
 
 | Endpoint | Sobre qué estado | Resultado |
@@ -459,6 +523,9 @@ curl -X POST http://<host>:8084/batches/<batch_id>/resubmit -H "$AUTH" -d '{"ope
 | `POST /reversal-reviews/{transaction_id}/resolve` | Revisión abierta; otras, `400` | Cierra la revisión y corrige el lote si corresponde. Inexistente, `404` |
 | `GET /merchants/{merchant_id}/timezone` | — | Zona vigente del comercio |
 | `PUT /merchants/{merchant_id}/timezone` | — | Define la zona del comercio. Rige para las operaciones siguientes |
+| `GET /dead-letters` | — | Eventos en la DLQ, hasta 100 (`?limit=` hasta 500) |
+| `POST /dead-letters/{sequence}/replay` | — | Procesa el evento y lo borra de la DLQ ([Escenario I](#escenario-i--eventos-en-la-dlq)) |
+| `POST /dead-letters/{sequence}/discard` | — | Borra el evento sin procesarlo; exige `reason` |
 
 Todos los `POST` y `PUT` exigen un operador, que sale del token o de `operator_id`; `reopen` y `resolve-dispute`, también `reason`. Esos datos
 quedan en la [auditoría](../technical/SETTLEMENT.md#auditoría-de-operadores). Con un token del archivo, el operador es

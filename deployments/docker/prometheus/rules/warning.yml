@@ -217,6 +217,29 @@ groups:
           summary: "{{ $value }} reversas en revisión"
           description: "Hay reversas sin compra o que no coinciden con ella. Sus lotes no se envían hasta cerrar la revisión (batch-close-failure.md, Escenario H)."
 
+      # Eventos que agotaron sus entregas, unos 12 minutos de reintentos, y esperan en la DLQ. No se
+      # pierden, pero no cuentan hasta que alguien los reprocese.
+      # Investigar: docs/runbooks/batch-close-failure.md, Escenario I.
+      - alert: EventosEnDLQSettlement
+        expr: max(posnet_settlement_dead_letters) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} eventos de Settlement en la DLQ"
+          description: "Ventas, reversas o cierres que no se pudieron registrar. Revisar la causa (logs 'moved to the dead letter queue') y reprocesarlos con POST /dead-letters/{sequence}/replay (batch-close-failure.md, Escenario I)."
+
+      # Un terminal informó ventas de un día en el que Settlement no tiene ningún lote. Terminal
+      # Gateway ya le respondió 202: el terminal cree que cerró.
+      # Investigar: docs/runbooks/batch-close-failure.md, Escenario B.
+      - alert: CierreSinLote
+        expr: sum(increase(posnet_settlement_batch_close_rejected_total{reason="no_batch"}[30m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Un terminal cerró con ventas que Settlement no tiene"
+          description: "Las ventas pueden estar reintentándose o en la DLQ, o no haber llegado. Revisar el log 'terminal reported sales for a day without any batch' (batch-close-failure.md, Escenario B)."
+
       # Falta ejecutar settlement-recover-reversals en este entorno: puede haber ventas anuladas
       # antes de que se guardaran las reversas que siguen sumando. Se apaga sola cuando el comando
       # registra que no queda ninguna.
