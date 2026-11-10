@@ -220,7 +220,10 @@ CREATE TABLE IF NOT EXISTS settlement.settlement_batches (
     -- Contra qué se concilió el cierre (TERMINAL o BACKEND) y los totales del terminal.
     reconciled_with VARCHAR(10),
     terminal_count  INTEGER,
-    terminal_amount BIGINT
+    terminal_amount BIGINT,
+    -- Ajustes de lotes ya enviados: cuántos y su suma, con signo. total_amount los incluye.
+    adjustment_count  INTEGER,
+    adjustment_amount BIGINT
 );
 -- Un solo lote abierto por terminal, fecha y moneda.
 CREATE UNIQUE INDEX IF NOT EXISTS uq_settlement_batches_open

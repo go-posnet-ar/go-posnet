@@ -66,6 +66,7 @@ func (h *BatchQueryHandler) GetBatch(ctx context.Context, batchID string) (*port
 	if s := batch.Summary(); s != nil {
 		result.TotalCount = s.TotalCount()
 		result.TotalAmount = s.TotalAmount().Cents()
+		result.AdjustmentCount, result.AdjustmentAmount = s.AdjustmentCount(), s.AdjustmentAmount()
 	}
 
 	if t := batch.ClosedAt(); t != nil {
@@ -118,6 +119,7 @@ func (h *BatchQueryHandler) ListBatchesByMerchant(
 		if s := b.Summary(); s != nil {
 			r.TotalCount = s.TotalCount()
 			r.TotalAmount = s.TotalAmount().Cents()
+			r.AdjustmentCount, r.AdjustmentAmount = s.AdjustmentCount(), s.AdjustmentAmount()
 		}
 		if t := b.ClosedAt(); t != nil {
 			r.ClosedAt = t.Format(time.RFC3339)

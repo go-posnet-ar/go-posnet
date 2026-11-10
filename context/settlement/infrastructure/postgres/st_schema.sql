@@ -37,7 +37,12 @@ CREATE TABLE settlement.settlement_batches (
     -- Migración 000007.
     reconciled_with VARCHAR(10),
     terminal_count  INTEGER,
-    terminal_amount BIGINT
+    terminal_amount BIGINT,
+
+    -- Ajustes de lotes ya enviados: cuántos y su suma, con signo. total_amount los incluye;
+    -- total_count no. Migración 000009.
+    adjustment_count  INTEGER,
+    adjustment_amount BIGINT
 );
 
 -- Garantiza un solo batch OPEN por terminal, día y moneda
@@ -60,7 +65,7 @@ CREATE TABLE settlement.batch_transactions (
     transaction_id  UUID        NOT NULL,
     amount_cents    BIGINT      NOT NULL,
     currency        CHAR(3)     NOT NULL,
-    tx_type         VARCHAR(20) NOT NULL,        -- PURCHASE | REVERSAL | OFFLINE
+    tx_type         VARCHAR(20) NOT NULL,        -- PURCHASE | REVERSAL | OFFLINE | ADJUSTMENT (con signo)
     included_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

@@ -473,37 +473,63 @@ func (h *AdminHandler) ResolveReversalReview(ctx context.Context, cmd port.Resol
 		return fmt.Errorf("ResolveReversalReview: reviews are not configured")
 	}
 
-	var batchID string
-	err := pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
-		review, err := h.reviews.LockReversalReviewTx(ctx, tx, cmd.TransactionID)
-		if err != nil {
-			return err
-		}
-		if review == nil {
-			return pkgerrors.NewNotFoundError("ReversalReview", cmd.TransactionID)
-		}
-		if review.Resolved {
-			return pkgerrors.NewValidationError("review is already resolved")
-		}
-		batchID = review.BatchID
-		if err := h.applyReviewAction(ctx, tx, review, cmd.Action); err != nil {
-			return err
-		}
-		// ACCEPT sobre una reversa excluida la deja excluida: la acción guardada lo sigue diciendo.
-		storedAction := cmd.Action
-		if review.Action == repository.ReviewActionExclude && cmd.Action == repository.ReviewActionAccept {
-			storedAction = repository.ReviewActionExclude
-		}
-		if err := h.reviews.CloseReversalReviewTx(ctx, tx, cmd.TransactionID, cmd.OperatorID, cmd.Resolution, storedAction); err != nil {
-			return err
-		}
-		return h.audit.InsertAuditTx(ctx, tx, repository.BatchAuditEntry{
-			BatchID: review.BatchID, Action: auditAction, OperatorID: cmd.OperatorID, Reason: cmd.Resolution,
-			FromState: review.BatchState, ToState: review.BatchState, PreviousDiscrepancies: review.Discrepancies,
+	var (
+		batchID    string
+		adjustment *adjustment
+	)
+	// Un ajuste guarda el lote abierto del terminal: si una venta lo guardó en el medio, se repite todo.
+	err := retryOnStale(ctx, func() error {
+		batchID, adjustment = "", nil
+		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
+			review, err := h.reviews.LockReversalReviewTx(ctx, tx, cmd.TransactionID)
+			if err != nil {
+				return err
+			}
+			if review == nil {
+				return pkgerrors.NewNotFoundError("ReversalReview", cmd.TransactionID)
+			}
+			if review.Resolved && !correctsSentBatch(review, cmd.Action) {
+				return pkgerrors.NewValidationError("review is already resolved; it can only be corrected once its batch was sent, if it was resolved with ACCEPT or by the system")
+			}
+			batchID = review.BatchID
+			adjustment, err = h.applyReviewAction(ctx, tx, review, cmd.Action)
+			if err != nil {
+				return err
+			}
+			if adjustment != nil {
+				if err := h.audit.InsertAuditTx(ctx, tx, repository.BatchAuditEntry{
+					BatchID: adjustment.batchID, Action: repository.AuditActionAdjustment, OperatorID: cmd.OperatorID,
+					Reason: fmt.Sprintf("%s (ajuste de la transacción %s del lote %s, %s: %+d)",
+						cmd.Resolution, cmd.TransactionID, review.BatchID, review.BatchState, adjustment.amount),
+					FromState: valueobject.BatchStateOpen.String(), ToState: valueobject.BatchStateOpen.String(),
+				}); err != nil {
+					return err
+				}
+			}
+			// ACCEPT sobre una reversa excluida la deja excluida: la acción guardada lo sigue diciendo.
+			storedAction := cmd.Action
+			if review.Action == repository.ReviewActionExclude && cmd.Action == repository.ReviewActionAccept {
+				storedAction = repository.ReviewActionExclude
+			}
+			if err := h.reviews.CloseReversalReviewTx(ctx, tx, cmd.TransactionID, cmd.OperatorID, cmd.Resolution, storedAction); err != nil {
+				return err
+			}
+			return h.audit.InsertAuditTx(ctx, tx, repository.BatchAuditEntry{
+				BatchID: review.BatchID, Action: auditAction, OperatorID: cmd.OperatorID, Reason: cmd.Resolution,
+				FromState: review.BatchState, ToState: review.BatchState, PreviousDiscrepancies: review.Discrepancies,
+			})
 		})
 	})
 	if err != nil {
 		return fmt.Errorf("ResolveReversalReview: %w", err)
+	}
+	if adjustment != nil {
+		observability.FromContext(ctx).Warn("sent batch corrected with an adjustment in the terminal's open batch",
+			slog.String("transaction_id", cmd.TransactionID),
+			slog.String("sent_batch_id", batchID),
+			slog.String("adjustment_batch_id", adjustment.batchID),
+			slog.Int64("amount_cents", adjustment.amount),
+		)
 	}
 
 	observability.FromContext(ctx).Warn("reversal review resolved by operator",
@@ -521,36 +547,130 @@ func (h *AdminHandler) ResolveReversalReview(ctx context.Context, cmd port.Resol
 	return nil
 }
 
+// correctsSentBatch indica si una revisión ya cerrada se puede volver a resolver: cuando se aceptó
+// la reversa (ACCEPT, o la cerró el sistema porque la compra coincidió), el lote se envió, y
+// después se ve que había que corregirla. La corrección es un ajuste en el lote abierto del
+// terminal. Solo una vez: después la acción guardada ya es la corrección.
+func correctsSentBatch(review *repository.StoredReversalReview, action string) bool {
+	sent := review.BatchState == valueobject.BatchStateSubmitted.String() || review.BatchState == valueobject.BatchStateSettled.String()
+	accepted := review.Action == "" || review.Action == repository.ReviewActionAccept
+	corrects := action == repository.ReviewActionUsePurchaseAmount || action == repository.ReviewActionExclude
+	return sent && accepted && corrects
+}
+
+// adjustment es la corrección de un lote ya enviado, agregada al lote abierto del terminal.
+type adjustment struct {
+	batchID string
+	amount  int64 // Con signo: positivo devuelve al comercio
+}
+
 // applyReviewAction corrige la reversa en el lote, si la acción lo pide y el lote lo permite.
+//
+//   - Lote OPEN o DISPUTED: se corrige la reversa en el lote.
+//   - Lote SUBMITTED o SETTLED: el dinero ya salió. La corrección entra como ajuste en el lote
+//     abierto del mismo terminal, y se liquida con él (ver addAdjustment).
+//   - Lote CLOSED: todavía no se envió; un resubmit lo pasa a DISPUTED, y ahí se corrige.
 //
 // Una revisión reabierta de una reversa excluida, porque su compra llegó y no coincide, tiene
 // la reversa fuera de todo lote: ACCEPT la deja así, USE_PURCHASE_AMOUNT la vuelve a agregar
 // con el monto de la compra, y EXCLUDE no aplica.
-func (h *AdminHandler) applyReviewAction(ctx context.Context, tx pgx.Tx, review *repository.StoredReversalReview, action string) error {
+func (h *AdminHandler) applyReviewAction(ctx context.Context, tx pgx.Tx, review *repository.StoredReversalReview, action string) (*adjustment, error) {
 	if action == repository.ReviewActionAccept {
-		return nil
-	}
-	if review.BatchState != valueobject.BatchStateOpen.String() && review.BatchState != valueobject.BatchStateDisputed.String() {
-		return pkgerrors.NewValidationError(fmt.Sprintf(
-			"batch must be OPEN or DISPUTED to correct it, current state is %s; use ACCEPT and adjust it with the processor", review.BatchState,
-		))
+		return nil, nil
 	}
 	excluded := review.Action == repository.ReviewActionExclude
-	if action == repository.ReviewActionExclude {
-		if excluded {
-			return pkgerrors.NewValidationError("the reversal is already excluded; use ACCEPT to keep it that way")
-		}
-		return h.reviews.DeleteReversalTx(ctx, tx, review.BatchID, review.TransactionID)
+	if action == repository.ReviewActionExclude && excluded {
+		return nil, pkgerrors.NewValidationError("the reversal is already excluded; use ACCEPT to keep it that way")
 	}
-	if review.Reason != repository.ReversalReviewAmountMismatch || review.Purchase == nil {
-		return pkgerrors.NewValidationError(fmt.Sprintf(
+	if action == repository.ReviewActionUsePurchaseAmount && (review.Reason != repository.ReversalReviewAmountMismatch || review.Purchase == nil) {
+		return nil, pkgerrors.NewValidationError(fmt.Sprintf(
 			"%s only applies to %s, this review is %s", repository.ReviewActionUsePurchaseAmount, repository.ReversalReviewAmountMismatch, review.Reason,
 		))
 	}
-	if excluded {
-		return h.reviews.InsertReversalTx(ctx, tx, review.BatchID, review.TransactionID, review.Purchase.AmountCents, review.Purchase.Currency)
+
+	switch review.BatchState {
+	case valueobject.BatchStateOpen.String(), valueobject.BatchStateDisputed.String():
+	case valueobject.BatchStateSubmitted.String(), valueobject.BatchStateSettled.String():
+		// Lo que se descontó de más es positivo: vuelve al comercio.
+		var amount int64
+		switch {
+		case action == repository.ReviewActionExclude:
+			amount = review.AmountCents
+		case excluded:
+			amount = -review.Purchase.AmountCents
+		default:
+			amount = review.AmountCents - review.Purchase.AmountCents
+		}
+		return h.addAdjustment(ctx, tx, review, amount)
+	default:
+		return nil, pkgerrors.NewValidationError(fmt.Sprintf(
+			"batch is %s and was not sent: resubmit moves it to DISPUTED, then correct it", review.BatchState,
+		))
 	}
-	return h.reviews.UpdateReversalAmountTx(ctx, tx, review.BatchID, review.TransactionID, review.Purchase.AmountCents)
+
+	if action == repository.ReviewActionExclude {
+		return nil, h.reviews.DeleteReversalTx(ctx, tx, review.BatchID, review.TransactionID)
+	}
+	if excluded {
+		return nil, h.reviews.InsertReversalTx(ctx, tx, review.BatchID, review.TransactionID, review.Purchase.AmountCents, review.Purchase.Currency)
+	}
+	return nil, h.reviews.UpdateReversalAmountTx(ctx, tx, review.BatchID, review.TransactionID, review.Purchase.AmountCents)
+}
+
+// addAdjustment agrega la corrección de un lote ya enviado al lote abierto del mismo terminal y
+// moneda, en el día de negocio de hoy, o a uno nuevo. Ese lote la liquida: su total la incluye,
+// pero la conciliación con el terminal no, porque el terminal no la conoce. El lote enviado no
+// cambia.
+func (h *AdminHandler) addAdjustment(ctx context.Context, tx pgx.Tx, review *repository.StoredReversalReview, amount int64) (*adjustment, error) {
+	if amount == 0 {
+		return nil, pkgerrors.NewValidationError("the correction does not change the amount: use ACCEPT")
+	}
+	sent, err := h.batchRepo.FindByID(ctx, review.BatchID)
+	if err != nil {
+		return nil, fmt.Errorf("find sent batch: %w", err)
+	}
+	if sent == nil {
+		return nil, pkgerrors.NewNotFoundError("SettlementBatch", review.BatchID)
+	}
+	today, err := h.businessToday(ctx, sent.MerchantID().String())
+	if err != nil {
+		return nil, err
+	}
+	open, err := h.batchRepo.FindOrCreateOpen(ctx, sent.TerminalID(), sent.MerchantID(), today, sent.Currency())
+	if err != nil {
+		return nil, fmt.Errorf("find or create the open batch: %w", err)
+	}
+	txID, err := domain.ParseTransactionID(review.TransactionID)
+	if err != nil {
+		return nil, fmt.Errorf("adjustment: %w", err)
+	}
+	if err := open.AddAdjustment(txID, amount); err != nil {
+		return nil, fmt.Errorf("adjustment: %w", err)
+	}
+	if err := h.batchRepo.SaveTx(ctx, tx, open); err != nil {
+		return nil, err
+	}
+	return &adjustment{batchID: open.ID(), amount: amount}, nil
+}
+
+// businessToday es el día de negocio de hoy en la zona del comercio, o en la general.
+func (h *AdminHandler) businessToday(ctx context.Context, merchantID string) (time.Time, error) {
+	loc := time.UTC
+	if h.location != nil {
+		loc = h.location
+	}
+	if h.timezones != nil {
+		name, err := h.timezones.MerchantTimezone(ctx, merchantID)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("business date: %w", err)
+		}
+		if name != "" {
+			if loc, err = time.LoadLocation(name); err != nil {
+				return time.Time{}, fmt.Errorf("business date: load timezone: %w", err)
+			}
+		}
+	}
+	return midnightUTC(time.Now().In(loc)), nil
 }
 
 // SetMerchantTimezone define la zona del día de negocio de un comercio. Rige para las

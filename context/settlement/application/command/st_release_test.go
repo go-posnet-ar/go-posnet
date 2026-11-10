@@ -169,3 +169,129 @@ func TestResolveReversalReview_ExcludedReversal(t *testing.T) {
 		})
 	}
 }
+
+// sentReview es una revisión de una reversa de 500 en un lote ya enviado.
+func sentReview(state string, purchase *repository.ReversalPurchase) *repository.StoredReversalReview {
+	r := storedReview(repository.ReversalReviewAmountMismatch, state, purchase)
+	r.TransactionID = domain.NewTransactionID().String()
+	return r
+}
+
+// Corregir una reversa de un lote ya enviado agrega un ajuste, con signo, al lote abierto del
+// mismo terminal. El lote enviado no cambia.
+func TestResolveReversalReview_SentBatchBecomesAnAdjustment(t *testing.T) {
+	purchase := &repository.ReversalPurchase{AmountCents: 900, Currency: "ARS"}
+	tests := []struct {
+		name     string
+		action   string
+		state    string
+		excluded bool
+		want     int64
+	}{
+		// Se descontaron 500 y la compra era de 900: falta descontar 400.
+		{"USE_PURCHASE_AMOUNT on a submitted batch", repository.ReviewActionUsePurchaseAmount, "SUBMITTED", false, -400},
+		// La reversa no debía descontarse: vuelven los 500.
+		{"EXCLUDE on a settled batch", repository.ReviewActionExclude, "SETTLED", false, 500},
+		// La reversa estaba excluida y la compra de 900 ya se liquidó entera.
+		{"USE_PURCHASE_AMOUNT on an excluded reversal", repository.ReviewActionUsePurchaseAmount, "SETTLED", true, -900},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			review := sentReview(tc.state, purchase)
+			if tc.excluded {
+				review.Action = repository.ReviewActionExclude
+			}
+			reviews := &fakeReviews{stored: review}
+			h, repo := reviewAdmin(t, reviews, true)
+			sent := heldBatch(t, valueobject.BatchStateSettled, aggregate.ReconciledWithTerminal, 1, 1000)
+			open := newOpenBatch(t, sent.TerminalID(), sent.MerchantID())
+			repo.findByIDResult, repo.findOrCreateResult = sent, open
+			cmd := resolveCmd(tc.action)
+			cmd.TransactionID = review.TransactionID
+
+			if err := h.ResolveReversalReview(context.Background(), cmd); err != nil {
+				t.Fatalf("ResolveReversalReview() error = %v", err)
+			}
+			var adjustments []int64
+			for _, tx := range open.Transactions() {
+				if tx.Type() == valueobject.BatchTxAdjustment {
+					adjustments = append(adjustments, tx.AmountCents())
+				}
+			}
+			if len(adjustments) != 1 || adjustments[0] != tc.want {
+				t.Errorf("adjustments in the open batch = %v, want [%d]", adjustments, tc.want)
+			}
+			if repo.findOrCreateCurrency != "ARS" {
+				t.Errorf("open batch currency = %q, want the sent batch's", repo.findOrCreateCurrency)
+			}
+			if reviews.updateCalls+reviews.deleteCalls != 0 || len(reviews.insertedReversals) != 0 {
+				t.Errorf("the sent batch must not change: updates %d, deletes %d, inserts %v", reviews.updateCalls, reviews.deleteCalls, reviews.insertedReversals)
+			}
+			if len(repo.auditEntries) != 2 || repo.auditEntries[0].Action != repository.AuditActionAdjustment || repo.auditEntries[0].BatchID != open.ID() {
+				t.Errorf("audit = %+v, want an ADJUSTMENT on the open batch and the review", repo.auditEntries)
+			}
+		})
+	}
+}
+
+// Un lote CLOSED todavía no se envió: no lleva ajuste, se corrige pasándolo a DISPUTED.
+func TestResolveReversalReview_ClosedBatchIsRejected(t *testing.T) {
+	reviews := &fakeReviews{stored: sentReview("CLOSED", &repository.ReversalPurchase{AmountCents: 900, Currency: "ARS"})}
+	h, repo := reviewAdmin(t, reviews, false)
+
+	err := h.ResolveReversalReview(context.Background(), resolveCmd(repository.ReviewActionExclude))
+	wantValidation(t, err)
+	if len(repo.savedBatches) != 0 {
+		t.Errorf("saved = %d batches, want none", len(repo.savedBatches))
+	}
+}
+
+// Una revisión ya cerrada solo se vuelve a resolver para corregir un lote enviado, si se había
+// aceptado la reversa, y una sola vez.
+func TestResolveReversalReview_CorrectsAnAcceptedReviewOnceItsBatchWasSent(t *testing.T) {
+	purchase := &repository.ReversalPurchase{AmountCents: 900, Currency: "ARS"}
+	tests := []struct {
+		name       string
+		state      string
+		stored     string // acción guardada al cerrarla
+		action     string
+		wantAdjust bool
+	}{
+		{"accepted, batch submitted", "SUBMITTED", repository.ReviewActionAccept, repository.ReviewActionUsePurchaseAmount, true},
+		{"resolved by the system, batch settled", "SETTLED", "", repository.ReviewActionExclude, true},
+		{"accepted, batch not sent yet", "OPEN", repository.ReviewActionAccept, repository.ReviewActionUsePurchaseAmount, false},
+		{"already corrected", "SUBMITTED", repository.ReviewActionUsePurchaseAmount, repository.ReviewActionUsePurchaseAmount, false},
+		{"accepting again", "SUBMITTED", repository.ReviewActionAccept, repository.ReviewActionAccept, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			review := sentReview(tc.state, purchase)
+			review.Resolved, review.Action = true, tc.stored
+			reviews := &fakeReviews{stored: review}
+			h, repo := reviewAdmin(t, reviews, tc.wantAdjust)
+			sent := heldBatch(t, valueobject.BatchStateSubmitted, aggregate.ReconciledWithTerminal, 1, 1000)
+			open := newOpenBatch(t, sent.TerminalID(), sent.MerchantID())
+			repo.findByIDResult, repo.findOrCreateResult = sent, open
+			cmd := resolveCmd(tc.action)
+			cmd.TransactionID = review.TransactionID
+
+			err := h.ResolveReversalReview(context.Background(), cmd)
+			if !tc.wantAdjust {
+				wantValidation(t, err)
+				if len(open.Transactions()) != 0 {
+					t.Errorf("open batch got %d transactions, want none", len(open.Transactions()))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveReversalReview() error = %v", err)
+			}
+			if len(open.Transactions()) != 1 || open.Transactions()[0].Type() != valueobject.BatchTxAdjustment {
+				t.Errorf("open batch transactions = %v, want one adjustment", open.Transactions())
+			}
+			if reviews.closedAction != tc.action {
+				t.Errorf("stored action = %q, want %q: a second correction must be rejected", reviews.closedAction, tc.action)
+			}
+		})
+	}
+}

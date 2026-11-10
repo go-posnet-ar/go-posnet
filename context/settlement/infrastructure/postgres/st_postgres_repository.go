@@ -56,8 +56,9 @@ func (r *SettlementBatchRepo) SaveTx(ctx context.Context, tx pgx.Tx, b *aggregat
 			total_count, total_amount, purchase_count, purchase_amount,
 			reversal_count, reversal_amount, discrepancies,
 			created_at, closed_at, submitted_at, settled_at, version,
-			reconciled_with, terminal_count, terminal_amount
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NULLIF($19,''),$20,$21)
+			reconciled_with, terminal_count, terminal_amount,
+			adjustment_count, adjustment_amount
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,NULLIF($19,''),$20,$21,$22,$23)
 		ON CONFLICT (id) DO UPDATE SET
 			state           = EXCLUDED.state,
 			total_count     = EXCLUDED.total_count,
@@ -73,7 +74,9 @@ func (r *SettlementBatchRepo) SaveTx(ctx context.Context, tx pgx.Tx, b *aggregat
 			version         = EXCLUDED.version,
 			reconciled_with = EXCLUDED.reconciled_with,
 			terminal_count  = EXCLUDED.terminal_count,
-			terminal_amount = EXCLUDED.terminal_amount
+			terminal_amount = EXCLUDED.terminal_amount,
+			adjustment_count  = EXCLUDED.adjustment_count,
+			adjustment_amount = EXCLUDED.adjustment_amount
 		WHERE settlement.settlement_batches.version = EXCLUDED.version - 1
 	`
 
@@ -83,7 +86,13 @@ func (r *SettlementBatchRepo) SaveTx(ctx context.Context, tx pgx.Tx, b *aggregat
 	)
 
 	terminalCount, terminalAmount := b.TerminalTotals()
+	var (
+		adjustmentCount  *int
+		adjustmentAmount *int64
+	)
 	if s := b.Summary(); s != nil {
+		ac, aa := s.AdjustmentCount(), s.AdjustmentAmount()
+		adjustmentCount, adjustmentAmount = &ac, &aa
 		tc := s.TotalCount()
 		pc := s.PurchaseCount()
 		rc := s.ReversalCount()
@@ -107,6 +116,7 @@ func (r *SettlementBatchRepo) SaveTx(ctx context.Context, tx pgx.Tx, b *aggregat
 		b.Discrepancies(),
 		b.CreatedAt(), b.ClosedAt(), b.SubmittedAt(), b.SettledAt(), b.Version()+1,
 		b.ReconciledWith(), terminalCount, terminalAmount,
+		adjustmentCount, adjustmentAmount,
 	)
 	if err != nil {
 		return fmt.Errorf("SettlementBatchRepo.Save: upsert batch: %w", err)
@@ -155,6 +165,8 @@ var requiredColumns = []string{
 	"settlement.settlement_batches.terminal_count",
 	"settlement.settlement_batches.terminal_amount",
 	"settlement.reversal_reviews.action",
+	"settlement.settlement_batches.adjustment_count",
+	"settlement.settlement_batches.adjustment_amount",
 }
 
 // MissingTables devuelve las tablas y columnas requeridas que no existen en la base.
@@ -524,11 +536,12 @@ func (r *SettlementBatchRepo) DeleteReversalTx(ctx context.Context, tx pgx.Tx, b
 }
 
 // CloseReversalReviewTx cierra la revisión con el operador, la resolución y la acción indicados.
+// También corrige una ya cerrada: quien llama decide si corresponde, con la revisión bloqueada.
 func (r *SettlementBatchRepo) CloseReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID, operatorID, resolution, action string) error {
 	const q = `
 		UPDATE settlement.reversal_reviews
 		SET resolved_at = now(), resolved_by = $2, resolution = $3, action = $4
-		WHERE transaction_id = $1 AND resolved_at IS NULL
+		WHERE transaction_id = $1
 	`
 	if _, err := tx.Exec(ctx, q, transactionID, operatorID, resolution, action); err != nil {
 		return fmt.Errorf("CloseReversalReviewTx: %w", err)
@@ -639,10 +652,12 @@ func redateError(err error) error {
 	return fmt.Errorf("SetMerchantTimezone: redate open batches: %w", err)
 }
 
-// ClosedTotalsForTerminalDay suma los totales de los lotes ya cerrados del terminal en la fecha.
+// ClosedTotalsForTerminalDay suma los totales de los lotes ya cerrados del terminal en la fecha,
+// sin los ajustes: se comparan con lo que informa el terminal, que no los conoce.
 func (r *SettlementBatchRepo) ClosedTotalsForTerminalDay(ctx context.Context, terminalID domain.TerminalID, date time.Time, currency, excludeBatchID string) (int, int64, error) {
 	const q = `
-		SELECT COALESCE(SUM(total_count), 0)::bigint, COALESCE(SUM(total_amount), 0)::bigint
+		SELECT COALESCE(SUM(total_count), 0)::bigint,
+		       COALESCE(SUM(total_amount - COALESCE(adjustment_amount, 0)), 0)::bigint
 		FROM settlement.settlement_batches
 		WHERE terminal_id = $1 AND batch_date = $2::date AND currency = $3 AND id <> $4
 		  AND state IN ('CLOSED', 'SUBMITTED', 'SETTLED')
@@ -704,7 +719,8 @@ func (r *SettlementBatchRepo) FindByID(ctx context.Context, id string) (*aggrega
 		       total_count, total_amount, purchase_count, purchase_amount,
 		       reversal_count, reversal_amount, discrepancies,
 		       created_at, closed_at, submitted_at, settled_at, version,
-		       reconciled_with, terminal_count, terminal_amount
+		       reconciled_with, terminal_count, terminal_amount,
+		       adjustment_count, adjustment_amount
 		FROM settlement.settlement_batches WHERE id = $1
 	`
 	row := r.pool.QueryRow(ctx, q, id)
@@ -733,7 +749,8 @@ func (r *SettlementBatchRepo) FindOpenByTerminal(
 		       total_count, total_amount, purchase_count, purchase_amount,
 		       reversal_count, reversal_amount, discrepancies,
 		       created_at, closed_at, submitted_at, settled_at, version,
-		       reconciled_with, terminal_count, terminal_amount
+		       reconciled_with, terminal_count, terminal_amount,
+		       adjustment_count, adjustment_amount
 		FROM settlement.settlement_batches
 		WHERE terminal_id = $1
 		  AND batch_date = $2::date
@@ -854,7 +871,8 @@ func (r *SettlementBatchRepo) ListByMerchantDate(
 		       total_count, total_amount, purchase_count, purchase_amount,
 		       reversal_count, reversal_amount, discrepancies,
 		       created_at, closed_at, submitted_at, settled_at, version,
-		       reconciled_with, terminal_count, terminal_amount
+		       reconciled_with, terminal_count, terminal_amount,
+		       adjustment_count, adjustment_amount
 		FROM settlement.settlement_batches
 		WHERE merchant_id = $1 AND batch_date = $2::date
 		ORDER BY created_at ASC
@@ -889,7 +907,7 @@ func (r *SettlementBatchRepo) CountBatchesNeedingAttention(ctx context.Context, 
 	const q = `
 		SELECT
 			COUNT(*) FILTER (WHERE b.state = 'DISPUTED'),
-			COUNT(*) FILTER (WHERE b.state = 'CLOSED' AND COALESCE(b.total_count, 0) > 0 AND b.closed_at < $1),
+			COUNT(*) FILTER (WHERE b.state = 'CLOSED' AND (COALESCE(b.total_count, 0) > 0 OR COALESCE(b.adjustment_count, 0) > 0) AND b.closed_at < $1),
 			COUNT(*) FILTER (WHERE b.state = 'OPEN' AND b.batch_date < ($2::timestamptz AT TIME ZONE COALESCE(m.timezone, $3))::date),
 			(SELECT COUNT(*) FROM settlement.outbox WHERE created_at < $4),
 			(SELECT COUNT(*) FROM settlement.reversal_reviews WHERE resolved_at IS NULL AND created_at < $5),
@@ -952,6 +970,8 @@ type rawBatch struct {
 	reconciledWith                              *string
 	terminalCount                               *int
 	terminalAmount                              *int64
+	adjustmentCount                             *int
+	adjustmentAmount                            *int64
 }
 
 type scanner interface {
@@ -969,6 +989,7 @@ func scanBatch(row scanner) (*rawBatch, error) {
 		&b.discrepancies,
 		&b.createdAt, &b.closedAt, &b.submittedAt, &b.settledAt, &b.version,
 		&b.reconciledWith, &b.terminalCount, &b.terminalAmount,
+		&b.adjustmentCount, &b.adjustmentAmount,
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -1048,6 +1069,7 @@ func toBatchParams(b *rawBatch, txs []*entity.BatchTransaction) aggregate.Recons
 			derefInt(b.reversalCount), reversalMoney,
 		)
 		if err == nil {
+			summary = summary.WithAdjustments(derefInt(b.adjustmentCount), derefInt64(b.adjustmentAmount))
 			params.Summary = &summary
 		}
 	}

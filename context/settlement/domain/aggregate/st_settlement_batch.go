@@ -121,6 +121,11 @@ func (b *SettlementBatch) RemoveTransaction(transactionID domain.TransactionID, 
 	return nil
 }
 
+// AddAdjustment agrega la corrección de un lote ya enviado, con signo. Solo en un lote OPEN.
+func (b *SettlementBatch) AddAdjustment(transactionID domain.TransactionID, amountCents int64) error {
+	return b.AddTransaction(transactionID, amountCents, valueobject.BatchTxAdjustment)
+}
+
 // RequestClose inicia el proceso de cierre — transiciona a PENDING_CLOSE.
 func (b *SettlementBatch) RequestClose() error {
 	if err := b.transition(valueobject.BatchStatePendingClose); err != nil {
@@ -259,16 +264,19 @@ func (b *SettlementBatch) Release() (released, changed bool, err error) {
 	return true, true, nil
 }
 
-// BackendTotals devuelve la cantidad y el monto neto de las transacciones actuales del lote.
+// BackendTotals devuelve la cantidad y el monto neto de las transacciones actuales del lote,
+// sin los ajustes: es lo que se compara con el terminal.
 func (b *SettlementBatch) BackendTotals() (int, int64, error) {
 	_, count, amount, err := b.calculateSummary()
 	return count, amount, err
 }
 
-// calculateSummary calcula los totales del backend a partir de las transacciones.
+// calculateSummary calcula los totales del backend a partir de las transacciones. Devuelve el
+// resumen, con los ajustes en el monto total, y la cantidad y el monto comparables con el
+// terminal, sin los ajustes.
 func (b *SettlementBatch) calculateSummary() (valueobject.BatchSummary, int, int64, error) {
-	var purchaseCount, reversalCount int
-	var purchaseAmount, reversalAmount int64
+	var purchaseCount, reversalCount, adjustmentCount int
+	var purchaseAmount, reversalAmount, adjustmentAmount int64
 
 	for _, tx := range b.transactions {
 		switch tx.Type() {
@@ -278,11 +286,15 @@ func (b *SettlementBatch) calculateSummary() (valueobject.BatchSummary, int, int
 		case valueobject.BatchTxReversal:
 			reversalCount++
 			reversalAmount += tx.AmountCents()
+		case valueobject.BatchTxAdjustment:
+			adjustmentCount++
+			adjustmentAmount += tx.AmountCents()
 		}
 	}
 
 	totalCount := purchaseCount + reversalCount
-	totalAmount := purchaseAmount - reversalAmount
+	terminalAmount := purchaseAmount - reversalAmount
+	totalAmount := terminalAmount + adjustmentAmount
 
 	cur, _ := domain.ParseCurrency(b.currency)
 	totalMoney, _ := domain.NewMoney(totalAmount, cur)
@@ -300,7 +312,7 @@ func (b *SettlementBatch) calculateSummary() (valueobject.BatchSummary, int, int
 	if err != nil {
 		return valueobject.BatchSummary{}, 0, 0, fmt.Errorf("settlement_batch: calculate summary: %w", err)
 	}
-	return summary, totalCount, totalAmount, nil
+	return summary.WithAdjustments(adjustmentCount, adjustmentAmount), totalCount, terminalAmount, nil
 }
 
 // Submit marca el lote como enviado al procesador externo.

@@ -75,6 +75,7 @@ const (
 	AuditActionRecoverReversal = "RECOVER_REVERSAL"
 	AuditActionRedate          = "REDATE"       // El cambio de zona del comercio movió el lote a otra fecha
 	AuditActionAutoRelease     = "AUTO_RELEASE" // Se cerró la última revisión y el lote concilia: pasa a CLOSED
+	AuditActionAdjustment      = "ADJUSTMENT"   // El lote recibió la corrección de un lote ya enviado
 
 	AuditActionReviewAccept            = "REVIEW_ACCEPT"
 	AuditActionReviewUsePurchaseAmount = "REVIEW_USE_PURCHASE_AMOUNT"
@@ -213,6 +214,7 @@ type ReversalReviewLog interface {
 	InsertReversalTx(ctx context.Context, tx pgx.Tx, batchID, transactionID string, amountCents int64, currency string) error
 
 	// CloseReversalReviewTx cierra la revisión con el operador, la resolución y la acción indicados.
+	// Sobre una revisión ya cerrada, la reemplaza: es la corrección de un lote ya enviado.
 	CloseReversalReviewTx(ctx context.Context, tx pgx.Tx, transactionID, operatorID, resolution, action string) error
 }
 

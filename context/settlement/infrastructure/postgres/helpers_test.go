@@ -74,6 +74,7 @@ var batchColumns = []string{
 	"reversal_count", "reversal_amount", "discrepancies",
 	"created_at", "closed_at", "submitted_at", "settled_at", "version",
 	"reconciled_with", "terminal_count", "terminal_amount",
+	"adjustment_count", "adjustment_amount",
 }
 
 var batchTxColumns = []string{
@@ -101,6 +102,9 @@ type batchRow struct {
 	reconciledWith *string
 	terminalCount  *int
 	terminalAmount *int64
+
+	adjustmentCount  *int
+	adjustmentAmount *int64
 }
 
 func newBatchRow() batchRow {
@@ -134,6 +138,7 @@ func (r batchRow) rows() *pgxmock.Rows {
 		r.reversalCount, r.reversalAmount, r.discrepancies,
 		r.createdAt, r.closedAt, r.submittedAt, r.settledAt, r.version,
 		r.reconciledWith, r.terminalCount, r.terminalAmount,
+		r.adjustmentCount, r.adjustmentAmount,
 	)
 }
 

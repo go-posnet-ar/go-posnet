@@ -36,7 +36,12 @@ func NewBatchTransaction(
 	if transactionID.IsZero() {
 		return nil, fmt.Errorf("batch_transaction: transaction_id cannot be zero")
 	}
-	if amountCents <= 0 {
+	// Un ajuste tiene signo; el resto de los movimientos, no.
+	if txType == valueobject.BatchTxAdjustment {
+		if amountCents == 0 {
+			return nil, fmt.Errorf("batch_transaction: an adjustment cannot be zero")
+		}
+	} else if amountCents <= 0 {
 		return nil, fmt.Errorf("batch_transaction: amount_cents must be positive")
 	}
 	return &BatchTransaction{

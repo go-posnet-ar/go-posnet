@@ -27,7 +27,7 @@ func TestSave_NoSummary_NoTransactions(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(21)...).
+		WithArgs(anyArgs(23)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectCommit()
 	pool.ExpectRollback()
@@ -44,7 +44,7 @@ func TestSave_WithSummaryAndTransactions(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(21)...).
+		WithArgs(anyArgs(23)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectExec("INSERT INTO settlement.batch_transactions").
 		WithArgs(anyArgs(7)...).
@@ -70,7 +70,7 @@ func TestSave_MultipleTransactions(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(21)...).
+		WithArgs(anyArgs(23)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectExec("INSERT INTO settlement.batch_transactions").
 		WithArgs(anyArgs(7)...).
@@ -91,7 +91,7 @@ func TestSave_UpsertBatchError(t *testing.T) {
 	pool := newMockPool(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(21)...).
+		WithArgs(anyArgs(23)...).
 		WillReturnError(errors.New("connection reset"))
 	pool.ExpectRollback()
 
@@ -111,7 +111,7 @@ func TestSave_InsertBatchTransactionError(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(21)...).
+		WithArgs(anyArgs(23)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectExec("INSERT INTO settlement.batch_transactions").
 		WithArgs(anyArgs(7)...).
@@ -590,11 +590,11 @@ func TestListByMerchantDate_Success(t *testing.T) {
 			AddRow(row1.id, row1.terminalID, row1.merchantID, row1.batchDate, row1.state, row1.currency,
 				row1.totalCount, row1.totalAmount, row1.purchaseCount, row1.purchaseAmount,
 				row1.reversalCount, row1.reversalAmount, row1.discrepancies,
-				row1.createdAt, row1.closedAt, row1.submittedAt, row1.settledAt, row1.version, row1.reconciledWith, row1.terminalCount, row1.terminalAmount).
+				row1.createdAt, row1.closedAt, row1.submittedAt, row1.settledAt, row1.version, row1.reconciledWith, row1.terminalCount, row1.terminalAmount, row1.adjustmentCount, row1.adjustmentAmount).
 			AddRow(row2.id, row2.terminalID, row2.merchantID, row2.batchDate, row2.state, row2.currency,
 				row2.totalCount, row2.totalAmount, row2.purchaseCount, row2.purchaseAmount,
 				row2.reversalCount, row2.reversalAmount, row2.discrepancies,
-				row2.createdAt, row2.closedAt, row2.submittedAt, row2.settledAt, row2.version, row2.reconciledWith, row2.terminalCount, row2.terminalAmount))
+				row2.createdAt, row2.closedAt, row2.submittedAt, row2.settledAt, row2.version, row2.reconciledWith, row2.terminalCount, row2.terminalAmount, row2.adjustmentCount, row2.adjustmentAmount))
 	pool.ExpectQuery("FROM settlement.batch_transactions").
 		WithArgs(row1.id).
 		WillReturnRows(emptyBatchTxRows())
@@ -745,7 +745,7 @@ func TestSave_StaleVersionReturnsErrStaleBatch(t *testing.T) {
 	b := newOpenBatch(t)
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("WHERE settlement.settlement_batches.version = EXCLUDED.version - 1").
-		WithArgs(anyArgs(21)...).
+		WithArgs(anyArgs(23)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 0))
 	pool.ExpectRollback()
 
@@ -764,7 +764,7 @@ func TestSave_IncrementsVersionOnEachSave(t *testing.T) {
 	repo := postgres.NewSettlementBatchRepo(pool)
 
 	for want := 1; want <= 2; want++ {
-		args := anyArgs(21)
+		args := anyArgs(23)
 		args[17] = want // la versión nueva es el último argumento
 		pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		pool.ExpectExec("INSERT INTO settlement.settlement_batches").
@@ -791,7 +791,7 @@ func TestSave_ReversalUsesConflictOnTransactionAndType(t *testing.T) {
 
 	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(21)...).
+		WithArgs(anyArgs(23)...).
 		WillReturnResult(pgxmock.NewResult("INSERT", 1))
 	pool.ExpectExec(`ON CONFLICT \(transaction_id, tx_type\) DO NOTHING`).
 		WithArgs(pgxmock.AnyArg(), pgxmock.AnyArg(), pgxmock.AnyArg(), int64(750), "ARS", "REVERSAL", pgxmock.AnyArg()).
@@ -862,7 +862,7 @@ func TestSaveTx_UsesCallerTransaction(t *testing.T) {
 
 	pool.ExpectBegin()
 	pool.ExpectExec("INSERT INTO settlement.settlement_batches").
-		WithArgs(anyArgs(21)...).
+		WithArgs(anyArgs(23)...).
 		WillReturnResult(pgxmock.NewResult("UPDATE", 1))
 	pool.ExpectCommit()
 
@@ -1470,5 +1470,24 @@ func TestRecordMaintenanceRun(t *testing.T) {
 
 	if err := postgres.NewSettlementBatchRepo(pool).RecordMaintenanceRun(context.Background(), "reversal-recovery", "op-1", "3 reversas registradas"); err != nil {
 		t.Fatalf("RecordMaintenanceRun() error = %v", err)
+	}
+}
+
+// Los ajustes de un lote cerrado se leen con su resumen.
+func TestFindByID_ReadsAdjustments(t *testing.T) {
+	pool := newMockPool(t)
+	row := newBatchRow().withSummary(1, 1, 0, 600, 1000, 0)
+	count, amount := 1, int64(-400)
+	row.adjustmentCount, row.adjustmentAmount = &count, &amount
+
+	pool.ExpectQuery("WHERE id =").WithArgs(row.id).WillReturnRows(row.rows())
+	pool.ExpectQuery("FROM settlement.batch_transactions").WithArgs(row.id).WillReturnRows(emptyBatchTxRows())
+
+	b, err := postgres.NewSettlementBatchRepo(pool).FindByID(context.Background(), row.id)
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if s := b.Summary(); s == nil || s.AdjustmentCount() != 1 || s.AdjustmentAmount() != -400 || s.TotalAmount().Cents() != 600 {
+		t.Errorf("summary = %+v, want total 600 with one adjustment of -400", s)
 	}
 }

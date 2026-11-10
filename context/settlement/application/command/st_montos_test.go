@@ -268,7 +268,6 @@ func TestResolveReversalReview_Rejected(t *testing.T) {
 		review *repository.StoredReversalReview
 	}{
 		{"ya resuelta", repository.ReviewActionAccept, resolved},
-		{"lote enviado", repository.ReviewActionExclude, storedReview(repository.ReversalReviewAmountMismatch, "SUBMITTED", purchase)},
 		{"lote cerrado", repository.ReviewActionUsePurchaseAmount, storedReview(repository.ReversalReviewAmountMismatch, "CLOSED", purchase)},
 		{"monto de compra sin diferencia de monto", repository.ReviewActionUsePurchaseAmount, storedReview(repository.ReversalReviewMerchantMismatch, "OPEN", purchase)},
 		{"monto de compra sin compra", repository.ReviewActionUsePurchaseAmount, storedReview(repository.ReversalReviewAmountMismatch, "OPEN", nil)},

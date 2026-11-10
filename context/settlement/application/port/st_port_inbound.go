@@ -137,18 +137,21 @@ type ListBatchesCommand struct {
 
 // BatchResult es el resultado de las queries de batch.
 type BatchResult struct {
-	ID            string
-	TerminalID    string
-	MerchantID    string
-	BatchDate     string
-	State         string
-	Currency      string
-	TotalCount    int
-	TotalAmount   int64
-	Discrepancies int
-	ClosedAt      string
-	SubmittedAt   string
-	SettledAt     string
+	ID          string
+	TerminalID  string
+	MerchantID  string
+	BatchDate   string
+	State       string
+	Currency    string
+	TotalCount  int
+	TotalAmount int64 // Incluye los ajustes
+	// Correcciones de lotes ya enviados que liquida este lote, con signo.
+	AdjustmentCount  int
+	AdjustmentAmount int64
+	Discrepancies    int
+	ClosedAt         string
+	SubmittedAt      string
+	SettledAt        string
 }
 
 // ReversalReviewResult es una revisión abierta de una reversa.

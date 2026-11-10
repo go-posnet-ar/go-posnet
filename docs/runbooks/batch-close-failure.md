@@ -408,9 +408,20 @@ curl -X POST http://<host>:8084/reversal-reviews/<transaction_id>/resolve -H "$A
   -d '{"operator_id":"<tu_usuario>","resolution":"<qué se hizo, ticket>","action":"USE_PURCHASE_AMOUNT"}'
 ```
 
-`USE_PURCHASE_AMOUNT` y `EXCLUDE` solo funcionan si el lote está en `OPEN` o `DISPUTED`. Con un lote en `CLOSED`, un
-`resubmit` lo pasa a `DISPUTED`. Con uno `SUBMITTED` o `SETTLED`, el dinero ya salió: usá `ACCEPT` y ajustalo con el
-procesador.
+`USE_PURCHASE_AMOUNT` y `EXCLUDE` corrigen la reversa en un lote `OPEN` o `DISPUTED`. Con un lote en `CLOSED`, un
+`resubmit` lo pasa a `DISPUTED`. **Con uno `SUBMITTED` o `SETTLED`, el dinero ya salió:** el lote no cambia, y la
+corrección entra como un `ADJUSTMENT` en el lote abierto del mismo terminal, que la liquida (log `sent batch corrected
+with an adjustment`). Revisá el monto antes: positivo le devuelve al comercio, negativo le descuenta.
+
+**Si la revisión ya se cerró con `ACCEPT`, o la cerró el sistema, y su lote se envió,** se puede volver a resolver con
+`USE_PURCHASE_AMOUNT` o `EXCLUDE` para corregirla: genera el ajuste igual. Se puede hacer una sola vez, y requiere la
+misma aprobación que cualquier corrección.
+
+```sql
+SELECT b.id, b.state, t.amount_cents
+FROM settlement.batch_transactions t JOIN settlement.settlement_batches b ON b.id = t.batch_id
+WHERE t.transaction_id = '<transaction_id>' AND t.tx_type = 'ADJUSTMENT';
+```
 
 **Si `EXCLUDE` fue por `PURCHASE_NOT_FOUND` y la compra llega después,** la reversa vuelve sola si coincide (log
 `excluded reversal restored`). Si no coincide, la revisión se reabre en el lote de la compra (log `excluded reversal

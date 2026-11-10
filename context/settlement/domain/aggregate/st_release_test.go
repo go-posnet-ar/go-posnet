@@ -109,3 +109,38 @@ func TestCloseRecordsTheReconciliationReference(t *testing.T) {
 		t.Errorf("after ResolveDispute: %q, want BACKEND", resolved.ReconciledWith())
 	}
 }
+
+// Un ajuste entra en el total que se liquida, pero no en lo que se compara con el terminal.
+func TestAdjustment_CountsInTheTotalButNotInTheReconciliation(t *testing.T) {
+	b := newOpenBatch(t)
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	if err := b.AddAdjustment(domain.NewTransactionID(), -400); err != nil {
+		t.Fatalf("AddAdjustment() error = %v", err)
+	}
+	if err := b.RequestClose(); err != nil {
+		t.Fatalf("RequestClose() error = %v", err)
+	}
+	// El terminal solo conoce la compra.
+	if err := b.Close(1, 1000); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if b.Discrepancies() != 0 {
+		t.Errorf("discrepancies = %d, want 0: the terminal does not know the adjustment", b.Discrepancies())
+	}
+	s := b.Summary()
+	if s.TotalCount() != 1 || s.TotalAmount().Cents() != 600 || s.AdjustmentCount() != 1 || s.AdjustmentAmount() != -400 {
+		t.Errorf("summary = count %d, total %d, adjustments %d / %d, want 1, 600, 1 / -400",
+			s.TotalCount(), s.TotalAmount().Cents(), s.AdjustmentCount(), s.AdjustmentAmount())
+	}
+	if count, amount, _ := b.BackendTotals(); count != 1 || amount != 1000 {
+		t.Errorf("BackendTotals() = %d, %d, want 1, 1000", count, amount)
+	}
+}
+
+func TestAdjustment_CannotBeZero(t *testing.T) {
+	if err := newOpenBatch(t).AddAdjustment(domain.NewTransactionID(), 0); err == nil {
+		t.Fatal("AddAdjustment(0) error = nil, want an error")
+	}
+}

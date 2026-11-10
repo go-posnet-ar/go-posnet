@@ -15,6 +15,10 @@ type BatchSummary struct {
 	purchaseAmount domain.Money
 	reversalCount  int
 	reversalAmount domain.Money
+	// Ajustes de lotes ya enviados. totalAmount los incluye; totalCount no, porque el terminal
+	// no los conoce.
+	adjustmentCount  int
+	adjustmentAmount int64
 }
 
 // NewBatchSummary crea un BatchSummary validando consistencia de los totales.
@@ -51,4 +55,14 @@ func (s BatchSummary) PurchaseCount() int           { return s.purchaseCount }
 func (s BatchSummary) PurchaseAmount() domain.Money { return s.purchaseAmount }
 func (s BatchSummary) ReversalCount() int           { return s.reversalCount }
 func (s BatchSummary) ReversalAmount() domain.Money { return s.reversalAmount }
-func (s BatchSummary) IsZero() bool                 { return s.totalCount == 0 }
+func (s BatchSummary) IsZero() bool                 { return s.totalCount == 0 && s.adjustmentCount == 0 }
+func (s BatchSummary) AdjustmentCount() int         { return s.adjustmentCount }
+
+// AdjustmentAmount es la suma de los ajustes, con signo, en centavos.
+func (s BatchSummary) AdjustmentAmount() int64 { return s.adjustmentAmount }
+
+// WithAdjustments devuelve el resumen con sus ajustes. totalAmount ya debe incluirlos.
+func (s BatchSummary) WithAdjustments(count int, amount int64) BatchSummary {
+	s.adjustmentCount, s.adjustmentAmount = count, amount
+	return s
+}

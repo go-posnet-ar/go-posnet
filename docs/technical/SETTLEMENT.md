@@ -124,6 +124,7 @@ Solo `SETTLED` es un estado final.
 | `PURCHASE` | Compra aprobada |
 | `REVERSAL` | Reversa, con su monto real (ver [§5.2](#52-reversa)) |
 | `OFFLINE` | Definido, pero ningún flujo lo genera |
+| `ADJUSTMENT` | Corrección de un lote ya enviado, con signo: positivo devuelve al comercio, negativo le descuenta (ver [Revisiones de reversas](#revisiones-de-reversas)). Lleva el `transaction_id` de la compra |
 
 `(transaction_id, tx_type)` es único: una compra o su reversa no se cuentan dos veces, incluso si el evento
 llega con otro `event_id`.
@@ -144,6 +145,10 @@ monto    = monto de compras − monto de reversas
 | Solo el monto difiere | `1` |
 
 El valor no mide la diferencia de dinero: solo indica cuántas transacciones faltan o sobran.
+
+**Los ajustes no entran en la conciliación,** porque el terminal no los conoce: ni en la cantidad ni en el monto
+que se comparan, tampoco en el acumulado de un terminal que no reinicia sus contadores. Sí entran en `total_amount`,
+que es lo que se envía y se liquida, y se guardan aparte en `adjustment_count` y `adjustment_amount`.
 
 **El terminal debe informar `terminal_count` contando compras y reversas, y `terminal_amount` como monto
 neto.** Después de cada cierre, sus contadores deben volver a cero: el cierre siguiente solo abarca lo
@@ -546,10 +551,31 @@ el estado actual del lote.
 | `action` | Efecto | Se puede usar |
 |---|---|---|
 | `ACCEPT` | Deja la reversa como está | Siempre |
-| `USE_PURCHASE_AMOUNT` | Cambia el monto de la reversa por el de la compra | Con `AMOUNT_MISMATCH`, si el lote está en `OPEN` o `DISPUTED` |
-| `EXCLUDE` | Quita la reversa del lote | Si el lote está en `OPEN` o `DISPUTED` |
+| `USE_PURCHASE_AMOUNT` | Cambia el monto de la reversa por el de la compra | Con `AMOUNT_MISMATCH`, si el lote está en `OPEN`, `DISPUTED`, `SUBMITTED` o `SETTLED` |
+| `EXCLUDE` | Quita la reversa del lote | Si el lote está en `OPEN`, `DISPUTED`, `SUBMITTED` o `SETTLED` |
 
-Fuera de esos casos, o si la revisión ya está cerrada, responde `400` y no cambia nada. La corrección, el cierre de
+**En un lote `SUBMITTED` o `SETTLED`, el dinero ya salió:** el lote no cambia, y la corrección entra como un
+`ADJUSTMENT` en el lote abierto del mismo terminal y moneda, del día de negocio de hoy, que se crea si no hay. Ese lote
+la liquida: el terminal lo cierra como siempre, y el ajuste no entra en la conciliación.
+
+| Corrección | Ajuste |
+|---|---|
+| `USE_PURCHASE_AMOUNT` | Reversa − compra: lo que se descontó de más (positivo) o de menos (negativo) |
+| `EXCLUDE` | + reversa: vuelve lo que se descontó |
+| `USE_PURCHASE_AMOUNT` sobre una reversa excluida | − compra: la compra se liquidó entera |
+
+**Una revisión abierta frena el envío de su lote,** así que el caso habitual es otro: la revisión se cerró con
+`ACCEPT`, o la cerró el sistema porque la compra coincidió, el lote se envió, y después se ve que había que corregirla.
+Para eso, una revisión ya cerrada se puede volver a resolver, **una sola vez**, si su lote está `SUBMITTED` o
+`SETTLED`, se había cerrado con `ACCEPT` o por el sistema, y la acción nueva es `USE_PURCHASE_AMOUNT` o `EXCLUDE`. La
+revisión guarda la corrección, y un segundo intento responde `400`.
+
+Queda en la auditoría de los dos lotes: `REVIEW_*` en el enviado y `ADJUSTMENT` en el que lo recibe, con la transacción,
+el lote de origen y el monto. Un lote `CLOSED` todavía no se envió: responde `400`, y se corrige pasándolo a `DISPUTED`
+con un `resubmit`.
+
+Fuera de esos casos, o si la revisión ya está cerrada (salvo para [corregir un lote enviado](#revisiones-de-reversas)),
+responde `400` y no cambia nada. La corrección, el cierre de
 la revisión y la [auditoría](#auditoría-de-operadores) son atómicos. `resolved_by` es el operador, y la acción queda
 en `reversal_reviews.action`. Si era la última revisión de un lote `DISPUTED`, después
 [se vuelve a conciliar](#52-reversa) y, si coincide, se libera y se envía.
@@ -654,7 +680,7 @@ hace nada, [`migrations/settlement/`](../../migrations/settlement/) se aplica a 
 
 | Tabla | Propósito | Claves e índices |
 |---|---|---|
-| `settlement_batches` | Lotes | PK `id`; único `(terminal_id, batch_date, currency)` solo para `OPEN` |
+| `settlement_batches` | Lotes; incluye la referencia de conciliación y los ajustes | PK `id`; único `(terminal_id, batch_date, currency)` solo para `OPEN` |
 | `batch_transactions` | Transacciones del lote | PK `id`; único `(transaction_id, tx_type)`; FK `batch_id` |
 | `processed_events` | Idempotencia | PK `event_id` |
 | `outbox` | Eventos pendientes de publicar | PK `id`; índice `created_at` |
@@ -674,7 +700,7 @@ Con 2.000 lotes y 400.000 transacciones, cargar un lote pasó de recorrer toda l
 
 ### Aplicar la migración
 
-**Una base existente necesita `000001` y de `000003` a `000008` antes de desplegar esta versión del servicio.**
+**Una base existente necesita `000001` y de `000003` a `000009` antes de desplegar esta versión del servicio.**
 `01-init.sql` solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
 
 ```bash
@@ -686,19 +712,20 @@ psql "$POSTGRES_DSN" -f migrations/settlement/000005_reversal_reviews.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000006_merchant_timezones.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000007_release_held_batches.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000008_maintenance_runs.up.sql
+psql "$POSTGRES_DSN" -f migrations/settlement/000009_batch_adjustments.up.sql
 ```
 
 Son idempotentes y no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
 coincide con el de una base nueva.
 
-**Con una tabla faltante, o una columna de `000007`, `/readyz` responde `503` con `database schema incomplete`,** y el
+**Con una tabla faltante, o una columna de `000007` o `000009`, `/readyz` responde `503` con `database schema incomplete`,** y el
 log `required tables are missing` la nombra. El `healthcheck` de Docker Compose usa `/readyz`, así que el contenedor
-queda `unhealthy`. Las columnas que verifica son solo las de `000007`: no detecta si falta `000001`. **`unhealthy` no reinicia el servicio ni frena el consumo de
+queda `unhealthy`. Las columnas que verifica son solo las de `000007` y `000009`: no detecta si falta `000001`. **`unhealthy` no reinicia el servicio ni frena el consumo de
 eventos:** mientras falte una tabla, los que la usen fallan y, al agotar los reintentos, se pierden.
 
 **Sin `000003`, fallan los cierres y las liquidaciones,** y `/metrics` deja de informar los lotes que
 requieren atención. **Sin `000004`, fallan las operaciones de administración.** **Sin `000005` o `000006`, fallan todas las ventas y reversas,**
-y al agotar los reintentos sus eventos se pierden. Sin `000006` también fallan los cierres. **Sin `000007`, falla cada
+y al agotar los reintentos sus eventos se pierden. Sin `000006` también fallan los cierres. **Sin `000007` o `000009`, falla cada
 guardado de un lote:** ventas, reversas, cierres y operaciones. Todas se pueden aplicar con el servicio anterior en
 marcha, porque solo agregan tablas o columnas que admiten `NULL`. Los lotes cerrados antes de `000007` no tienen
 referencia de conciliación y no se liberan solos. **Sin `000008`, `/metrics` deja de informar los lotes que requieren
@@ -717,7 +744,8 @@ registros de auditoría, para no perderlos. `000005_reversal_reviews.down.sql` f
 exige volver antes a una versión del servicio que no use la tabla. `000006_merchant_timezones.down.sql` exige lo
 mismo: los comercios configurados vuelven a la zona general. `000007_release_held_batches.down.sql` también: se pierde
 la referencia de conciliación de los lotes y la acción de las revisiones. `000008_maintenance_runs.down.sql` también:
-se pierde el registro de la recuperación.
+se pierde el registro de la recuperación. `000009_batch_adjustments.down.sql` exige lo mismo, y falla sin cambiar nada
+si ya hay ajustes: la versión anterior los sumaría como compras.
 
 ### Auditoría de operadores
 
@@ -727,7 +755,7 @@ lote no cambia.
 
 | Columna | Contenido |
 |---|---|
-| `action` | `FORCE_CLOSE`, `RESUBMIT`, `RESUBMIT_BLOCKED`, `REOPEN`, `RESOLVE_DISPUTE` o `SETTLE`; `REVIEW_*` al cerrar una revisión; `REDATE` y `AUTO_RELEASE`, del sistema |
+| `action` | `FORCE_CLOSE`, `RESUBMIT`, `RESUBMIT_BLOCKED`, `REOPEN`, `RESOLVE_DISPUTE` o `SETTLE`; `REVIEW_*` al cerrar una revisión; `ADJUSTMENT` en el lote que recibe una corrección; `REDATE` y `AUTO_RELEASE`, del sistema |
 | `operator_id` | El `name` del token. Con `SETTLEMENT_ADMIN_API_KEY`, lo que declaró quien llama |
 | `reason` | Lo que declaró quien llama. Solo existe en `reopen`, `resolve-dispute` y las revisiones |
 | `from_state`, `to_state` | Estado antes y después |
@@ -923,7 +951,8 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 |---|---|---|
 | Los lotes retenidos antes de `000007` no se liberan solos | No tienen guardado contra qué se conciliaron: siguen `DISPUTED` hasta un `resolve-dispute` o `reopen` | `SettlementBatch.Release` |
 | Una liberación fallida no se reintenta | Si falla después de cerrar la revisión, el lote sigue `DISPUTED`, con el log `could not release the held batch` | `ReleaseHeldBatch` |
-| Sin corrección en un lote ya enviado | `USE_PURCHASE_AMOUNT` y `EXCLUDE` no aplican a un lote `SUBMITTED` o `SETTLED`: el ajuste se hace con el procesador | `applyReviewAction` |
+| Los eventos no distinguen los ajustes | `batch-closed` y `settlement.completed` informan el total con los ajustes incluidos, sin desglose: Notification no puede explicarle al comercio la diferencia | `st_nats_publisher.go` |
+| Sin especificación del procesador | Un ajuste viaja dentro del total del lote siguiente. Si el procesador real exige informarlos aparte, habrá que adaptarlo en su adaptador | `ADJUSTMENT` |
 | Una venta simultánea al cambio de zona puede abrir otro lote | Si leyó la zona anterior justo antes del cambio, busca el lote en la fecha vieja, que ya se movió, y abre uno nuevo. La ventana es de milisegundos | `SetMerchantTimezone`, `RegisterApproval` |
 
 ### Ciclo de vida del lote
