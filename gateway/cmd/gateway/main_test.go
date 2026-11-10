@@ -76,7 +76,7 @@ func TestHandler_WebSocketOutlivesServerTimeouts(t *testing.T) {
 		if err != nil {
 			return
 		}
-		defer conn.CloseNow()
+		defer func() { _ = conn.CloseNow() }()
 		for {
 			typ, msg, err := conn.Read(r.Context())
 			if err != nil {
@@ -110,7 +110,7 @@ func TestHandler_WebSocketOutlivesServerTimeouts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Dial() error = %v", err)
 	}
-	defer conn.CloseNow()
+	defer func() { _ = conn.CloseNow() }()
 
 	time.Sleep(800 * time.Millisecond) // más que los timeouts del servidor
 	if err := conn.Write(ctx, websocket.MessageText, []byte("hola")); err != nil {
