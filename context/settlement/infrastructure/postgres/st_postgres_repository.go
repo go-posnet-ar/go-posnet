@@ -18,9 +18,6 @@ import (
 	"github.com/juantevez/go-posnet/pkg/pgutil"
 )
 
-// pgSerializationFailure es el SQLSTATE de un conflicto en una transacción SERIALIZABLE.
-const pgSerializationFailure = "40001"
-
 // pgxPool es el subconjunto de *pgxpool.Pool que este repositorio necesita:
 // pgutil.PgxPool (BeginTx/Ping, usado por WithReadCommitted/WithSerializable)
 // más QueryRow/Query, usados directamente en las consultas de lectura.
@@ -157,6 +154,8 @@ var requiredTables = []string{
 	"settlement.reversal_reviews",
 	"settlement.merchant_timezones",
 	"settlement.maintenance_runs",
+	"settlement.batch_submissions",
+	"settlement.pending_terminal_closes",
 }
 
 // requiredColumns son las columnas agregadas por migraciones sobre tablas existentes, como
@@ -411,9 +410,10 @@ func (r *SettlementBatchRepo) CountOpenReversalReviews(ctx context.Context, batc
 	return n, nil
 }
 
-// FindLateSaleBatchTx busca el lote en disputa al que le falta una venta que llegó tarde. El
-// total_count guardado es el del último cálculo del lote; AddLateSale lo vuelve a comprobar.
-func (r *SettlementBatchRepo) FindLateSaleBatchTx(ctx context.Context, tx pgx.Tx, terminalID domain.TerminalID, date time.Time, currency string, authorizedAt time.Time) (string, error) {
+// FindLateBatchTx busca el lote en disputa al que le falta una venta o reversa que llegó tarde.
+// El total_count guardado es el del último cálculo del lote; AddLateSale y AddLateReversal lo
+// vuelven a comprobar.
+func (r *SettlementBatchRepo) FindLateBatchTx(ctx context.Context, tx pgx.Tx, terminalID domain.TerminalID, date time.Time, currency string, at time.Time) (string, error) {
 	const q = `
 		SELECT id::text FROM settlement.settlement_batches
 		WHERE terminal_id = $1 AND batch_date = $2::date AND currency = $3
@@ -423,14 +423,106 @@ func (r *SettlementBatchRepo) FindLateSaleBatchTx(ctx context.Context, tx pgx.Tx
 		LIMIT 1
 	`
 	var id string
-	err := tx.QueryRow(ctx, q, terminalID.String(), date.Format("2006-01-02"), currency, authorizedAt).Scan(&id)
+	err := tx.QueryRow(ctx, q, terminalID.String(), date.Format("2006-01-02"), currency, at).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("FindLateSaleBatchTx: %w", err)
+		return "", fmt.Errorf("FindLateBatchTx: %w", err)
 	}
 	return id, nil
+}
+
+// SavePendingClose guarda los totales de un cierre sin lote. Con dos pedidos del mismo día quedan
+// los del más nuevo: el terminal informa el acumulado del día.
+func (r *SettlementBatchRepo) SavePendingClose(ctx context.Context, p repository.PendingClose) error {
+	const q = `
+		INSERT INTO settlement.pending_terminal_closes
+			(terminal_id, batch_date, currency, terminal_count, terminal_amount, event_id, requested_at)
+		VALUES ($1, $2::date, $3, $4, $5, $6, $7)
+		ON CONFLICT (terminal_id, batch_date, currency) DO UPDATE SET
+			terminal_count  = EXCLUDED.terminal_count,
+			terminal_amount = EXCLUDED.terminal_amount,
+			event_id        = EXCLUDED.event_id,
+			requested_at    = EXCLUDED.requested_at,
+			received_at     = now()
+		WHERE settlement.pending_terminal_closes.requested_at <= EXCLUDED.requested_at
+	`
+	err := pgutil.WithReadCommitted(ctx, r.pool, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, q, p.TerminalID.String(), p.BatchDate.Format("2006-01-02"), p.Currency,
+			p.TerminalCount, p.TerminalAmount, p.EventID, p.RequestedAt)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("SavePendingClose: %w", err)
+	}
+	return nil
+}
+
+// FindPendingClose devuelve los totales de un cierre sin lote, o nil si no hay.
+func (r *SettlementBatchRepo) FindPendingClose(ctx context.Context, terminalID domain.TerminalID, date time.Time, currency string) (*repository.PendingClose, error) {
+	const q = `
+		SELECT terminal_count, terminal_amount, event_id, requested_at
+		FROM settlement.pending_terminal_closes
+		WHERE terminal_id = $1 AND batch_date = $2::date AND currency = $3
+	`
+	p := repository.PendingClose{TerminalID: terminalID, BatchDate: date, Currency: currency}
+	err := r.pool.QueryRow(ctx, q, terminalID.String(), date.Format("2006-01-02"), currency).
+		Scan(&p.TerminalCount, &p.TerminalAmount, &p.EventID, &p.RequestedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("FindPendingClose: %w", err)
+	}
+	return &p, nil
+}
+
+// DeletePendingCloseTx borra los totales de un cierre sin lote, dentro de tx.
+func (r *SettlementBatchRepo) DeletePendingCloseTx(ctx context.Context, tx pgx.Tx, terminalID domain.TerminalID, date time.Time, currency string) error {
+	const q = `
+		DELETE FROM settlement.pending_terminal_closes
+		WHERE terminal_id = $1 AND batch_date = $2::date AND currency = $3
+	`
+	if _, err := tx.Exec(ctx, q, terminalID.String(), date.Format("2006-01-02"), currency); err != nil {
+		return fmt.Errorf("DeletePendingCloseTx: %w", err)
+	}
+	return nil
+}
+
+// StartSubmission registra el intento fuera de cualquier transacción del llamador: tiene que estar
+// confirmado antes de llamar al procesador.
+func (r *SettlementBatchRepo) StartSubmission(ctx context.Context, batchID string) (string, error) {
+	const q = `
+		INSERT INTO settlement.batch_submissions (batch_id, attempts, first_attempt_at, last_attempt_at)
+		VALUES ($1, 1, now(), now())
+		ON CONFLICT (batch_id) DO UPDATE SET
+			attempts        = settlement.batch_submissions.attempts + 1,
+			last_attempt_at = now()
+		RETURNING COALESCE(confirmation_id, '')
+	`
+	var confirmationID string
+	if err := r.pool.QueryRow(ctx, q, batchID).Scan(&confirmationID); err != nil {
+		return "", fmt.Errorf("StartSubmission: %w", err)
+	}
+	return confirmationID, nil
+}
+
+// ConfirmSubmission guarda la confirmación del procesador, salvo que ya haya una.
+func (r *SettlementBatchRepo) ConfirmSubmission(ctx context.Context, batchID, confirmationID string) error {
+	const q = `
+		UPDATE settlement.batch_submissions
+		SET confirmation_id = $2, confirmed_at = now()
+		WHERE batch_id = $1 AND confirmation_id IS NULL
+	`
+	err := pgutil.WithReadCommitted(ctx, r.pool, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, q, batchID, confirmationID)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("ConfirmSubmission: %w", err)
+	}
+	return nil
 }
 
 // CountTerminalDayBatches cuenta los lotes del terminal en esa fecha y moneda.
@@ -807,8 +899,8 @@ const findBatchByIDQuery = `
 
 // findForAppend recupera un batch sin sus transacciones, para agregarle una: cargarlas haría
 // crecer el costo de cada venta con el tamaño del lote. El lote no puede calcular totales.
-func (r *SettlementBatchRepo) findForAppend(ctx context.Context, id string) (*aggregate.SettlementBatch, error) {
-	batch, err := scanBatch(r.pool.QueryRow(ctx, findBatchByIDQuery, id))
+func (r *SettlementBatchRepo) findForAppend(ctx context.Context, tx pgx.Tx, id string) (*aggregate.SettlementBatch, error) {
+	batch, err := scanBatch(tx.QueryRow(ctx, findBatchByIDQuery, id))
 	if err != nil {
 		return nil, err
 	}
@@ -871,87 +963,75 @@ func (r *SettlementBatchRepo) FindOpenByTerminal(
 	return aggregate.Reconstitute(toBatchParams(batch, txs)), nil
 }
 
-// FindOrCreateOpen recupera o crea el batch OPEN del terminal para ese día, sin sus
-// transacciones: es para agregarle una. Usa SERIALIZABLE para evitar condiciones de carrera.
-func (r *SettlementBatchRepo) FindOrCreateOpen(
+// FindOrCreateOpenTx recupera o crea el batch OPEN del terminal para ese día, sin sus
+// transacciones: es para agregarle una. Todo en tx: si la operación se revierte, el lote creado
+// también, y no queda un lote vacío que el job cierra.
+//
+// Alcanza con READ COMMITTED: con dos creaciones simultáneas, ON CONFLICT espera a la otra y no
+// inserta, y la búsqueda siguiente, con una instantánea nueva, encuentra su lote. FOR UPDATE
+// ordena las ventas del lote, que de todos modos lo actualizan en el mismo tx.
+func (r *SettlementBatchRepo) FindOrCreateOpenTx(
 	ctx context.Context,
+	tx pgx.Tx,
 	terminalID domain.TerminalID,
 	merchantID domain.MerchantID,
 	date time.Time,
 	currency string,
 ) (*aggregate.SettlementBatch, error) {
-	var result *aggregate.SettlementBatch
-
-	err := pgutil.WithSerializable(ctx, r.pool, func(tx pgx.Tx) error {
-		// Intentar encontrar uno existente primero
-		const findQ = `
-			SELECT id FROM settlement.settlement_batches
-			WHERE terminal_id = $1 AND batch_date = $2::date AND currency = $3 AND state = 'OPEN'
-			FOR UPDATE
-		`
-		var existingID string
-		err := tx.QueryRow(ctx, findQ, terminalID.String(), date.Format("2006-01-02"), currency).Scan(&existingID)
-
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("FindOrCreateOpen: check existing: %w", err)
+	const findQ = `
+		SELECT id FROM settlement.settlement_batches
+		WHERE terminal_id = $1 AND batch_date = $2::date AND currency = $3 AND state = 'OPEN'
+		FOR UPDATE
+	`
+	day := date.Format("2006-01-02")
+	find := func() (string, error) {
+		var id string
+		err := tx.QueryRow(ctx, findQ, terminalID.String(), day, currency).Scan(&id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", nil
 		}
-
-		if existingID != "" {
-			batch, err := r.findForAppend(ctx, existingID)
-			if err != nil {
-				return err
-			}
-			result = batch
-			return nil
-		}
-
-		// No existe — crear uno nuevo
-		newBatch, err := aggregate.NewSettlementBatch(terminalID, merchantID, date, currency)
-		if err != nil {
-			return fmt.Errorf("FindOrCreateOpen: create batch: %w", err)
-		}
-
-		const insertQ = `
-			INSERT INTO settlement.settlement_batches
-				(id, terminal_id, merchant_id, batch_date, state, currency, discrepancies, created_at)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-			ON CONFLICT (terminal_id, batch_date, currency) WHERE state = 'OPEN' DO NOTHING
-		`
-		tag, err := tx.Exec(ctx, insertQ,
-			newBatch.ID(), terminalID.String(), merchantID.String(),
-			date.Format("2006-01-02"), "OPEN", currency, 0, newBatch.CreatedAt(),
-		)
-		if err != nil {
-			return fmt.Errorf("FindOrCreateOpen: insert batch: %w", err)
-		}
-
-		if tag.RowsAffected() == 0 {
-			// Conflicto — otro proceso creó el batch concurrentemente
-			// Reintentar la búsqueda
-			var concurrentID string
-			if err := tx.QueryRow(ctx, findQ,
-				terminalID.String(), date.Format("2006-01-02"), currency,
-			).Scan(&concurrentID); err != nil {
-				return fmt.Errorf("FindOrCreateOpen: reload after conflict: %w", err)
-			}
-			batch, err := r.findForAppend(ctx, concurrentID)
-			if err != nil {
-				return err
-			}
-			result = batch
-			return nil
-		}
-
-		result = newBatch
-		return nil
-	})
-
-	// Una falla de serialización es el mismo conflicto que una versión vieja.
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgSerializationFailure {
-		return nil, fmt.Errorf("FindOrCreateOpen: %w: %w", repository.ErrStaleBatch, err)
+		return id, err
 	}
-	return result, err
+
+	existingID, err := find()
+	if err != nil {
+		return nil, fmt.Errorf("FindOrCreateOpen: check existing: %w", err)
+	}
+	if existingID != "" {
+		return r.findForAppend(ctx, tx, existingID)
+	}
+
+	newBatch, err := aggregate.NewSettlementBatch(terminalID, merchantID, date, currency)
+	if err != nil {
+		return nil, fmt.Errorf("FindOrCreateOpen: create batch: %w", err)
+	}
+	const insertQ = `
+		INSERT INTO settlement.settlement_batches
+			(id, terminal_id, merchant_id, batch_date, state, currency, discrepancies, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		ON CONFLICT (terminal_id, batch_date, currency) WHERE state = 'OPEN' DO NOTHING
+	`
+	tag, err := tx.Exec(ctx, insertQ,
+		newBatch.ID(), terminalID.String(), merchantID.String(),
+		day, "OPEN", currency, 0, newBatch.CreatedAt(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("FindOrCreateOpen: insert batch: %w", err)
+	}
+	if tag.RowsAffected() > 0 {
+		return newBatch, nil
+	}
+
+	// Otro proceso lo creó a la vez: usar el suyo.
+	concurrentID, err := find()
+	if err != nil {
+		return nil, fmt.Errorf("FindOrCreateOpen: reload after conflict: %w", err)
+	}
+	if concurrentID == "" {
+		// Se cerró entre el conflicto y la búsqueda: reintentar desde el principio.
+		return nil, fmt.Errorf("FindOrCreateOpen: reload after conflict: %w", repository.ErrStaleBatch)
+	}
+	return r.findForAppend(ctx, tx, concurrentID)
 }
 
 // ListByMerchantDate lista todos los batches de un comercio en una fecha.

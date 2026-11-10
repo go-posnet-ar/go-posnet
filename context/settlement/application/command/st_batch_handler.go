@@ -34,13 +34,26 @@ type BatchHandler struct {
 	pool        pgutil.PgxPool
 	metrics     *Metrics // opcional; nil = sin instrumentación (tests)
 	location    *time.Location
-	reviews     repository.ReversalReviewLog  // opcional; nil = no valida las reversas
-	timezones   repository.MerchantTimezones  // opcional; nil = una sola zona para todos
-	maxCloseAge int                           // días; 0 = no limita la antigüedad de batch_date
-	closeGrace  time.Duration                 // plazo tras la medianoche del comercio para el cierre automático
-	reopens     repository.BatchReopens       // opcional; nil = acepta cualquier día dentro de maxCloseAge
-	audit       repository.BatchAuditLog      // opcional; nil = la liberación de un lote no se audita
-	days        repository.TerminalDayBatches // opcional; nil = sin ventas tardías ni motivo de un cierre sin lote
+	reviews     repository.ReversalReviewLog     // opcional; nil = no valida las reversas
+	timezones   repository.MerchantTimezones     // opcional; nil = una sola zona para todos
+	maxCloseAge int                              // días; 0 = no limita la antigüedad de batch_date
+	closeGrace  time.Duration                    // plazo tras la medianoche del comercio para el cierre automático
+	reopens     repository.BatchReopens          // opcional; nil = acepta cualquier día dentro de maxCloseAge
+	audit       repository.BatchAuditLog         // opcional; nil = la liberación de un lote no se audita
+	days        repository.TerminalDayBatches    // opcional; nil = sin ventas tardías ni motivo de un cierre sin lote
+	submissions repository.BatchSubmissions      // opcional; nil = no registra los envíos y un reenvío puede duplicarlos
+	pending     repository.PendingTerminalCloses // opcional; nil = los totales de un cierre sin lote solo van al log
+}
+
+// SetPendingTerminalCloses guarda los totales de un cierre sin lote, para que el cierre automático
+// concilie contra ellos el lote que formen las ventas que lleguen después.
+func (h *BatchHandler) SetPendingTerminalCloses(p repository.PendingTerminalCloses) {
+	h.pending = p
+}
+
+// SetBatchSubmissions registra los envíos al procesador, para no enviar dos veces un lote aceptado.
+func (h *BatchHandler) SetBatchSubmissions(s repository.BatchSubmissions) {
+	h.submissions = s
 }
 
 // SetTerminalDayBatches habilita agregar una venta tardía al lote en disputa que le faltaba, y
@@ -221,14 +234,18 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 			// Una venta que el terminal contó al cerrar, pero que llegó después del cierre por un
 			// reintento, va al lote en disputa que le faltaba, no a uno nuevo.
 			if authorizedKnown {
-				if late, err = h.addLateSale(ctx, tx, terminalID, batchDate, cmd.Currency, authorizedAt, txID, cmd.AmountCents); err != nil {
+				late, err = h.addLate(ctx, tx, lateTx{
+					terminalID: terminalID, date: batchDate, currency: cmd.Currency, at: authorizedAt,
+					txID: txID, amount: cmd.AmountCents, txType: valueobject.BatchTxPurchase,
+				})
+				if err != nil {
 					return err
 				}
 			}
 			if late != nil {
 				batchID = late.batch.ID()
 			} else {
-				batch, err := h.batchRepo.FindOrCreateOpen(ctx, terminalID, merchantID, batchDate, cmd.Currency)
+				batch, err := h.batchRepo.FindOrCreateOpenTx(ctx, tx, terminalID, merchantID, batchDate, cmd.Currency)
 				if err != nil {
 					return fmt.Errorf("find or create batch: %w", err)
 				}
@@ -283,21 +300,36 @@ func (h *BatchHandler) RegisterApproval(ctx context.Context, cmd port.RegisterAp
 	return nil
 }
 
-// lateSale es una venta agregada a un lote en disputa después de su cierre.
-type lateSale struct {
-	batch    *aggregate.SettlementBatch
-	previous int  // Discrepancias antes de la venta
-	released bool // Con la venta coincide y pasó a CLOSED
+// lateTx es una venta o reversa que llegó después del cierre del lote que el terminal la contó.
+type lateTx struct {
+	terminalID domain.TerminalID
+	date       time.Time
+	currency   string
+	at         time.Time // Autorización de la venta o finalización de la reversa
+	txID       domain.TransactionID
+	amount     int64
+	txType     valueobject.BatchTransactionType
+	// hold, si está, revisa la transacción en el lote antes de decidir si se libera: true lo
+	// retiene. La reversa se compara con su compra, y si no coinciden abre una revisión.
+	hold func(batchID string) (bool, error)
 }
 
-// addLateSale agrega la venta al lote en disputa del terminal que la había contado, si hay uno, y
-// lo libera si ahora coincide y no le quedan revisiones abiertas. Todo en tx, con la auditoría.
-// Devuelve nil si la venta no corresponde a ningún lote en disputa.
-func (h *BatchHandler) addLateSale(ctx context.Context, tx pgx.Tx, terminalID domain.TerminalID, date time.Time, currency string, authorizedAt time.Time, txID domain.TransactionID, amount int64) (*lateSale, error) {
+// lateSale es una venta o reversa agregada a un lote en disputa después de su cierre.
+type lateSale struct {
+	batch    *aggregate.SettlementBatch
+	txType   valueobject.BatchTransactionType
+	previous int  // Discrepancias antes de la transacción
+	released bool // Con la transacción coincide y pasó a CLOSED
+}
+
+// addLate agrega la transacción al lote en disputa del terminal que la había contado, si hay uno,
+// y lo libera si ahora coincide y no le quedan revisiones abiertas. Todo en tx, con la auditoría.
+// Devuelve nil si la transacción no corresponde a ningún lote en disputa.
+func (h *BatchHandler) addLate(ctx context.Context, tx pgx.Tx, l lateTx) (*lateSale, error) {
 	if h.days == nil {
 		return nil, nil
 	}
-	id, err := h.days.FindLateSaleBatchTx(ctx, tx, terminalID, date, currency, authorizedAt)
+	id, err := h.days.FindLateBatchTx(ctx, tx, l.terminalID, l.date, l.currency, l.at)
 	if err != nil || id == "" {
 		return nil, err
 	}
@@ -309,12 +341,23 @@ func (h *BatchHandler) addLateSale(ctx context.Context, tx pgx.Tx, terminalID do
 		return nil, nil
 	}
 	previous := batch.Discrepancies()
-	added, err := batch.AddLateSale(txID, amount, authorizedAt)
+	var added bool
+	if l.txType == valueobject.BatchTxReversal {
+		added, err = batch.AddLateReversal(l.txID, l.amount, l.at)
+	} else {
+		added, err = batch.AddLateSale(l.txID, l.amount, l.at)
+	}
 	if err != nil || !added {
 		return nil, err
 	}
+	held := false
+	if l.hold != nil {
+		if held, err = l.hold(id); err != nil {
+			return nil, err
+		}
+	}
 	released := false
-	if batch.Discrepancies() == 0 {
+	if batch.Discrepancies() == 0 && !held {
 		open, err := h.openReviews(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("count open reviews: %w", err)
@@ -329,11 +372,15 @@ func (h *BatchHandler) addLateSale(ctx context.Context, tx pgx.Tx, terminalID do
 		return nil, err
 	}
 	if h.audit != nil {
+		action, what, when := repository.AuditActionLateSale, "sale", "authorized"
+		if l.txType == valueobject.BatchTxReversal {
+			action, what, when = repository.AuditActionLateReversal, "reversal", "completed"
+		}
 		disputed := valueobject.BatchStateDisputed.String()
 		if err := h.audit.InsertAuditTx(ctx, tx, repository.BatchAuditEntry{
-			BatchID: id, Action: repository.AuditActionLateSale, OperatorID: "system",
-			Reason: fmt.Sprintf("sale %s of %d, authorized at %s before the close, arrived late: discrepancies %d → %d",
-				txID, amount, authorizedAt.UTC().Format(time.RFC3339), previous, batch.Discrepancies()),
+			BatchID: id, Action: action, OperatorID: "system",
+			Reason: fmt.Sprintf("%s %s of %d, %s at %s before the close, arrived late: discrepancies %d → %d",
+				what, l.txID, l.amount, when, l.at.UTC().Format(time.RFC3339), previous, batch.Discrepancies()),
 			FromState: disputed, ToState: disputed, PreviousDiscrepancies: previous,
 		}); err != nil {
 			return nil, err
@@ -341,18 +388,22 @@ func (h *BatchHandler) addLateSale(ctx context.Context, tx pgx.Tx, terminalID do
 		if released {
 			if err := h.audit.InsertAuditTx(ctx, tx, repository.BatchAuditEntry{
 				BatchID: id, Action: repository.AuditActionAutoRelease, OperatorID: "system",
-				Reason:    "a late sale completed the batch and it reconciles against " + batch.ReconciledWith(),
+				Reason:    "a late " + what + " completed the batch and it reconciles against " + batch.ReconciledWith(),
 				FromState: disputed, ToState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
 			}); err != nil {
 				return nil, err
 			}
 		}
 	}
-	return &lateSale{batch: batch, previous: previous, released: released}, nil
+	return &lateSale{batch: batch, txType: l.txType, previous: previous, released: released}, nil
 }
 
-// finishLateSale informa la venta tardía y, si liberó el lote, lo envía.
+// finishLateSale informa la transacción tardía y, si liberó el lote, lo envía.
 func (h *BatchHandler) finishLateSale(ctx context.Context, late *lateSale) {
+	what, record := "sale", h.metrics.RecordLateSale
+	if late.txType == valueobject.BatchTxReversal {
+		what, record = "reversal", h.metrics.RecordLateReversal
+	}
 	log := observability.FromContext(ctx).With(
 		slog.String("batch_id", late.batch.ID()),
 		slog.Int("previous_discrepancies", late.previous),
@@ -360,18 +411,18 @@ func (h *BatchHandler) finishLateSale(ctx context.Context, late *lateSale) {
 	)
 	switch {
 	case late.released:
-		h.metrics.RecordLateSale(ctx, lateSaleReleased)
-		log.Warn("late sale added to its disputed batch — it now reconciles and is released")
+		record(ctx, lateSaleReleased)
+		log.Warn("late " + what + " added to its disputed batch — it now reconciles and is released")
 		// Ya quedó CLOSED: si el envío falla, se reintenta con ResubmitBatch, como tras un cierre.
 		if err := h.submitBatch(ctx, late.batch); err != nil {
-			log.Error("submit after late sale failed — batch stays CLOSED", slog.String("error", err.Error()))
+			log.Error("submit after late "+what+" failed — batch stays CLOSED", slog.String("error", err.Error()))
 		}
 	case late.batch.Discrepancies() == 0:
-		h.metrics.RecordLateSale(ctx, lateSaleHeld)
-		log.Warn("late sale added to its disputed batch — it reconciles, but a reversal review still holds it")
+		record(ctx, lateSaleHeld)
+		log.Warn("late " + what + " added to its disputed batch — it reconciles, but a reversal review still holds it")
 	default:
-		h.metrics.RecordLateSale(ctx, lateSaleDisputed)
-		log.Warn("late sale added to its disputed batch — it still does not reconcile")
+		record(ctx, lateSaleDisputed)
+		log.Warn("late " + what + " added to its disputed batch — it still does not reconcile")
 	}
 }
 
@@ -399,6 +450,7 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 		return pkgerrors.NewValidationError("amount_cents must be positive")
 	}
 	completedAt, err := time.Parse(time.RFC3339, cmd.CompletedAt)
+	completedKnown := err == nil
 	if err != nil {
 		completedAt = time.Now().UTC()
 	}
@@ -406,9 +458,10 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 	var (
 		registered   bool
 		reviewReason string
+		late         *lateSale
 	)
 	err = retryOnStale(ctx, func() error {
-		registered, reviewReason = false, ""
+		registered, reviewReason, late = false, "", nil
 		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
 			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
 			if err != nil {
@@ -422,7 +475,28 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 				return err
 			}
 
-			batch, err := h.batchRepo.FindOrCreateOpen(ctx, terminalID, merchantID, batchDate, cmd.Currency)
+			// Una reversa que el terminal contó al cerrar, pero que llegó después, va al lote en
+			// disputa que le faltaba. Se compara con su compra antes de decidir si el lote se libera.
+			if completedKnown {
+				late, err = h.addLate(ctx, tx, lateTx{
+					terminalID: terminalID, date: batchDate, currency: cmd.Currency, at: completedAt,
+					txID: origTxID, amount: cmd.AmountCents, txType: valueobject.BatchTxReversal,
+					hold: func(batchID string) (bool, error) {
+						reason, err := h.reviewReversal(ctx, tx, batchID, origTxID.String(), merchantID.String(), cmd)
+						reviewReason = reason
+						return reason != "", err
+					},
+				})
+				if err != nil {
+					return err
+				}
+				if late != nil {
+					registered = true
+					return nil
+				}
+			}
+
+			batch, err := h.batchRepo.FindOrCreateOpenTx(ctx, tx, terminalID, merchantID, batchDate, cmd.Currency)
 			if err != nil {
 				return fmt.Errorf("find or create batch: %w", err)
 			}
@@ -451,6 +525,9 @@ func (h *BatchHandler) RegisterReversal(ctx context.Context, cmd port.RegisterRe
 			slog.Int64("amount_cents", cmd.AmountCents),
 			slog.String("currency", cmd.Currency),
 		)
+	}
+	if late != nil {
+		h.finishLateSale(ctx, late)
 	}
 	return nil
 }
@@ -587,6 +664,12 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 			if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
 				return err
 			}
+			// Unos totales guardados de un cierre sin lote quedan reemplazados por estos.
+			if h.pending != nil {
+				if err := h.pending.DeletePendingCloseTx(ctx, tx, terminalID, closeDate, cmd.Currency); err != nil {
+					return err
+				}
+			}
 			return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch)
 		})
 	})
@@ -594,7 +677,9 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 		return fmt.Errorf("ProcessBatchClose: %w", err)
 	}
 	if batch == nil {
-		h.closeWithoutBatch(ctx, terminalID, closeDate, cmd)
+		if err := h.closeWithoutBatch(ctx, terminalID, closeDate, cmd); err != nil {
+			return fmt.Errorf("ProcessBatchClose: %w", err)
+		}
 		return nil
 	}
 	if !processed {
@@ -629,9 +714,11 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 //
 //   - El día tiene lotes, ninguno OPEN: suele ser un cierre repetido (already_closed).
 //   - El día no tiene lotes y el terminal informó ventas: el backend no tiene ninguna. Pueden estar
-//     reintentándose, o haberse perdido (no_batch). Hay que revisarlo.
+//     reintentándose, o haberse perdido (no_batch). Hay que revisarlo. Los totales se guardan: el
+//     cierre automático concilia contra ellos el lote que formen las ventas que lleguen después.
+//     Si no se pueden guardar, devuelve el error y el cierre se reintenta.
 //   - Sin lotes ni ventas: un día sin actividad. No se cuenta.
-func (h *BatchHandler) closeWithoutBatch(ctx context.Context, terminalID domain.TerminalID, date time.Time, cmd port.ProcessBatchCloseCommand) {
+func (h *BatchHandler) closeWithoutBatch(ctx context.Context, terminalID domain.TerminalID, date time.Time, cmd port.ProcessBatchCloseCommand) error {
 	log := observability.FromContext(ctx).With(
 		slog.String("terminal_id", cmd.TerminalID),
 		slog.String("batch_date", date.Format("2006-01-02")),
@@ -653,18 +740,36 @@ func (h *BatchHandler) closeWithoutBatch(ctx context.Context, terminalID domain.
 		h.metrics.RecordCloseRejected(ctx, closeRejectedAlreadyClosed)
 		log.Warn("no open batch for the terminal — the day's batches are already closed", slog.Int("batches", batches))
 	case cmd.TerminalCount > 0 || cmd.TerminalAmount != 0:
+		saved := h.pending != nil
+		if saved {
+			requestedAt, err := time.Parse(time.RFC3339, cmd.RequestedAt)
+			if err != nil {
+				requestedAt = time.Now().UTC()
+			}
+			if err := h.pending.SavePendingClose(ctx, repository.PendingClose{
+				TerminalID: terminalID, BatchDate: date, Currency: cmd.Currency,
+				TerminalCount: cmd.TerminalCount, TerminalAmount: cmd.TerminalAmount,
+				EventID: cmd.EventID, RequestedAt: requestedAt,
+			}); err != nil {
+				return fmt.Errorf("save the totals of a close without batch: %w", err)
+			}
+		}
 		h.metrics.RecordCloseRejected(ctx, closeRejectedNoBatch)
-		log.Error("terminal reported sales for a day without any batch — they may still be retrying, or be lost")
+		// Con totals_saved, el cierre automático concilia contra ellos el lote que formen las ventas
+		// que lleguen después.
+		log.Error("terminal reported sales for a day without any batch — they may still be retrying, or be lost",
+			slog.Bool("totals_saved", saved))
 	default:
 		log.Info("no open batch for the terminal and no sales reported — nothing to close")
 	}
+	return nil
 }
 
 // ReleaseHeldBatch vuelve a conciliar un lote DISPUTED cuando ya no tiene revisiones de reversa
 // abiertas (ver SettlementBatch.Release). Si concilia, pasa a CLOSED, con auditoría, y se envía
 // al procesador. No hace nada si el lote no está DISPUTED o le quedan revisiones. Lo llaman el
 // cierre de una revisión, por el sistema o por un operador: si falla, el lote sigue DISPUTED y
-// ReleaseHeldBatches lo reintenta en el barrido siguiente del cierre automático.
+// ReleaseHeldBatches lo reintenta a los pocos minutos, aparte del cierre automático.
 func (h *BatchHandler) ReleaseHeldBatch(ctx context.Context, batchID string) error {
 	log := observability.FromContext(ctx).With(slog.String("batch_id", batchID))
 	var (
@@ -967,10 +1072,36 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 	if err != nil {
 		return false, fmt.Errorf("count open reviews: %w", err)
 	}
-	if err := batch.CloseWithBackendTotals(); err != nil {
+	// Si el terminal pidió el cierre del día antes de que hubiera un lote, se concilia contra sus
+	// totales, como en su cierre; si no, con los del backend.
+	var pending *repository.PendingClose
+	if h.pending != nil {
+		if pending, err = h.pending.FindPendingClose(ctx, batch.TerminalID(), batch.BatchDate(), batch.Currency()); err != nil {
+			return false, fmt.Errorf("find pending terminal close: %w", err)
+		}
+	}
+	if pending != nil {
+		count, amount, err := h.pendingTerminalTotals(ctx, batch, port.ProcessBatchCloseCommand{
+			TerminalCount: pending.TerminalCount, TerminalAmount: pending.TerminalAmount,
+		})
+		if err != nil {
+			return false, fmt.Errorf("terminal totals: %w", err)
+		}
+		if err := batch.RequestClose(); err != nil {
+			return false, fmt.Errorf("request close: %w", err)
+		}
+		if err := batch.Close(count, amount); err != nil {
+			return false, fmt.Errorf("close batch: %w", err)
+		}
+	} else if err := batch.CloseWithBackendTotals(); err != nil {
 		return false, fmt.Errorf("close batch: %w", err)
 	}
-	if openReviews > 0 {
+	switch {
+	case batch.Discrepancies() > 0:
+		if err := batch.MarkDisputed("terminal count/amount mismatch"); err != nil {
+			return false, fmt.Errorf("mark disputed: %w", err)
+		}
+	case openReviews > 0:
 		if err := batch.MarkDisputed(disputeReasonReversalReview); err != nil {
 			return false, fmt.Errorf("mark disputed: %w", err)
 		}
@@ -990,6 +1121,11 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 		if err := h.batchRepo.SaveTx(ctx, tx, batch); err != nil {
 			return err
 		}
+		if pending != nil {
+			if err := h.pending.DeletePendingCloseTx(ctx, tx, batch.TerminalID(), batch.BatchDate(), batch.Currency()); err != nil {
+				return err
+			}
+		}
 		// Un lote vacío (lo crea una reversa de otra fecha) no tiene nada que informar.
 		if len(batch.Transactions()) == 0 {
 			return nil
@@ -1003,13 +1139,27 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 		return false, nil
 	}
 	h.metrics.RecordBatchClosed(ctx, batch.Currency(), batch.State().String(), time.Since(closeStart))
-	log.Warn("batch closed automatically without terminal totals",
-		slog.String("batch_date", batch.BatchDate().Format("2006-01-02")),
-		slog.Int("tx_count", len(batch.Transactions())),
-	)
+	if pending != nil {
+		log.Warn("batch closed automatically against the totals of an earlier terminal close without batch",
+			slog.String("batch_date", batch.BatchDate().Format("2006-01-02")),
+			slog.Int("tx_count", len(batch.Transactions())),
+			slog.Int("terminal_count", pending.TerminalCount),
+			slog.Int64("terminal_amount", pending.TerminalAmount),
+			slog.Int("discrepancies", batch.Discrepancies()),
+		)
+	} else {
+		log.Warn("batch closed automatically without terminal totals",
+			slog.String("batch_date", batch.BatchDate().Format("2006-01-02")),
+			slog.Int("tx_count", len(batch.Transactions())),
+		)
+	}
 
 	if batch.State() == valueobject.BatchStateDisputed {
-		log.Warn("batch held — reversals under review")
+		if batch.Discrepancies() > 0 {
+			log.Warn("batch has discrepancies — marked as disputed", slog.Int("discrepancies", batch.Discrepancies()))
+		} else {
+			log.Warn("batch held — reversals under review")
+		}
 		return true, nil
 	}
 
@@ -1031,40 +1181,36 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 // Sin procesador configurado no es un error del mensaje: reintentarlo no cambia
 // nada, así que el batch queda en CLOSED para un reenvío manual (ResubmitBatch).
 func (h *BatchHandler) submitBatch(ctx context.Context, batch *aggregate.SettlementBatch) error {
-	confirmationID, err := submitToProcessor(ctx, h.processor, batch)
+	log := observability.FromContext(ctx).With(slog.String("batch_id", batch.ID()))
+	sent, err := sendToProcessor(ctx, h.processor, h.submissions, batch)
 	if errors.Is(err, service.ErrProcessorUnavailable) {
 		h.metrics.RecordSubmission(ctx, submissionUnavailable)
-		observability.FromContext(ctx).Warn("no settlement processor configured — batch remains CLOSED",
-			slog.String("batch_id", batch.ID()),
-		)
+		log.Warn("no settlement processor configured — batch remains CLOSED")
 		return nil
 	}
 	if err != nil {
 		h.metrics.RecordSubmission(ctx, submissionError)
 		return fmt.Errorf("submitBatch: processor submit: %w", err)
 	}
-	h.metrics.RecordSubmission(ctx, submissionSubmitted)
-
-	if err := batch.Submit(); err != nil {
-		return fmt.Errorf("submitBatch: %w", err)
+	if sent.recovered {
+		h.metrics.RecordSubmission(ctx, submissionRecovered)
+	} else {
+		h.metrics.RecordSubmission(ctx, submissionSubmitted)
 	}
-	if err := h.batchRepo.Save(ctx, batch); err != nil {
+
+	if _, err := markSubmitted(ctx, h.batchRepo, batch, func(b *aggregate.SettlementBatch) error {
+		return h.batchRepo.Save(ctx, b)
+	}); err != nil {
+		log.Error("batch accepted by processor but not saved as SUBMITTED — resubmit will not send it again",
+			slog.String("confirmation_id", sent.confirmationID), slog.String("error", err.Error()))
 		return fmt.Errorf("submitBatch: save: %w", err)
 	}
 
-	observability.FromContext(ctx).Info("batch submitted to processor",
-		slog.String("batch_id", batch.ID()),
-		slog.String("confirmation_id", confirmationID),
-	)
-	return nil
-}
-
-// submitToProcessor envía el batch, o devuelve ErrProcessorUnavailable si no hay
-// procesador configurado. Evita un nil pointer: en un handler de NATS, un panic
-// no se recupera y termina el proceso.
-func submitToProcessor(ctx context.Context, p service.SettlementProcessor, batch *aggregate.SettlementBatch) (string, error) {
-	if p == nil {
-		return "", service.ErrProcessorUnavailable
+	if sent.recovered {
+		log.Warn("batch was already accepted by the processor — marked SUBMITTED without sending it again",
+			slog.String("confirmation_id", sent.confirmationID))
+		return nil
 	}
-	return p.Submit(ctx, batch)
+	log.Info("batch submitted to processor", slog.String("confirmation_id", sent.confirmationID))
+	return nil
 }

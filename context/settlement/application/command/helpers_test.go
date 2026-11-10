@@ -89,7 +89,7 @@ func (f *fakeBatchRepo) FindOpenByTerminal(_ context.Context, _ domain.TerminalI
 	return f.findOpenResult, f.findOpenErr
 }
 
-func (f *fakeBatchRepo) FindOrCreateOpen(_ context.Context, _ domain.TerminalID, _ domain.MerchantID, date time.Time, currency string) (*aggregate.SettlementBatch, error) {
+func (f *fakeBatchRepo) FindOrCreateOpenTx(_ context.Context, _ pgx.Tx, _ domain.TerminalID, _ domain.MerchantID, date time.Time, currency string) (*aggregate.SettlementBatch, error) {
 	f.findOrCreateDate, f.findOrCreateCurrency = date, currency
 	return f.findOrCreateResult, f.findOrCreateErr
 }

@@ -544,6 +544,10 @@ func TestAdminRoutes_StaleBatchReturnsConflict(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.path, func(t *testing.T) {
 			repo := &fakeBatchRepo{findByIDResult: tc.batch, saveErr: repository.ErrStaleBatch}
+			if strings.HasSuffix(tc.path, "/resubmit") {
+				// Tras enviarlo, resubmit recarga el lote ante un conflicto: tiene que ver uno nuevo.
+				repo.findByIDFresh = func() *aggregate.SettlementBatch { return newClosedBatch(t) }
+			}
 			mux := newTestMux(newTestHandler(repo, &fakePool{}))
 			rec := httptest.NewRecorder()
 			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(`{"operator_id":"op-1"}`)))

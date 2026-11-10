@@ -108,8 +108,9 @@ marked as disputed`, `batch held — reversals under review` o `resubmit blocked
 
 **Causa:** la cantidad o el monto del terminal no coinciden con el backend. Las más comunes:
 
-Una venta que el terminal contó pero llegó después del cierre, por un reintento o desde la DLQ, **se agrega sola** al
-lote en disputa (log `late sale added to its disputed batch`, auditoría `LATE_SALE`). Si con ella coincide, el lote pasa
+Una venta o reversa que el terminal contó pero llegó después del cierre, por un reintento o desde la DLQ, **se agrega
+sola** al lote en disputa (log `late sale added to its disputed batch` o `late reversal ...`, auditoría `LATE_SALE` o
+`LATE_REVERSAL`). Si con ella coincide, el lote pasa
 a `CLOSED` y se envía. Esperá unos 12 minutos antes de intervenir en una disputa recién cerrada, y revisá la DLQ.
 
 | Causa | Cómo reconocerla |
@@ -187,9 +188,17 @@ había recibido `202`. El log y `posnet_settlement_batch_close_rejected_total{re
 Un `batch_date` distinto al de las ventas también da `no_batch`: el lote de las ventas sigue `OPEN`
 ([Escenario F](#escenario-f--lotes-abiertos-de-días-anteriores)).
 
-**Con `no_batch`, los totales del terminal están en el log** (`terminal_count`, `terminal_amount`): no se guardan en
-ningún otro lado. Anotalos. Si las ventas llegan después, abren un lote nuevo que el job cierra sin conciliar, porque
-no hay un lote en disputa que las espere.
+**Con `no_batch`, los totales del terminal se guardan** (log con `totals_saved=true`): si las ventas llegan después,
+abren un lote nuevo, y el cierre automático lo concilia contra esos totales (log `batch closed automatically against the
+totals of an earlier terminal close`). Si coincide, se envía; si no, queda `DISPUTED` como cualquier disputa
+([Escenario A](#escenario-a--lote-en-disputed)). No hace falta anotarlos:
+
+```sql
+SELECT terminal_id, batch_date, currency, terminal_count, terminal_amount, requested_at
+FROM settlement.pending_terminal_closes ORDER BY received_at DESC;
+```
+
+Una fila de hace días que sigue ahí es un día del que no llegó ninguna venta: revisá la DLQ y Authorization.
 
 **Diagnóstico:**
 
@@ -443,7 +452,7 @@ does not match`): ahí `ACCEPT` la deja excluida y `USE_PURCHASE_AMOUNT` la agre
 released`, auditoría `AUTO_RELEASE`). Si no concilia (log `still does not reconcile`, por ejemplo porque el terminal
 había contado la reversa que excluiste) o se cerró antes de `000007` sin aplicar `000010` (log `closed before its
 reconciliation was recorded`), sigue en `DISPUTED`. Si la liberación falló (log `could not release the held
-batch`), el job de cierre automático la reintenta en su barrido siguiente, cada 15 minutos (log `retrying the release
+batch`), se reintenta sola cada 5 minutos, aunque el cierre automático esté desactivado (log `retrying the release
 of a held batch`): no hace falta intervenir. Si no concilia:
 
 ```bash
@@ -534,8 +543,14 @@ operación.** Un `500` puede indicar que falta la
 migración de auditoría: el lote no cambió. Un `409` indica que otro proceso modificó el lote: hay
 que consultarlo y repetir. Un `{id}` que no sea un UUID responde `400 INVALID_ID`.
 
-**Si `resubmit` responde `500`, buscá `accepted by processor but not saved` en el log antes de repetirlo:** el
-procesador pudo haber aceptado el lote, y repetir lo enviaría dos veces.
+**Si `resubmit` responde `500`, se puede repetir:** si el procesador ya había aceptado el lote, la confirmación quedó en
+`batch_submissions` y el segundo `resubmit` no lo envía otra vez (log `already accepted by the processor`). Solo si el
+log dice `confirmation was not recorded`, la confirmación quedó solo en el log: repetirlo lo envía otra vez, y no
+duplica solo si el procesador respeta `batch_id` como clave de idempotencia.
+
+```sql
+SELECT attempts, last_attempt_at, confirmation_id FROM settlement.batch_submissions WHERE batch_id = '<batch_id>';
+```
 
 ```sql
 -- Quién hizo qué sobre un lote

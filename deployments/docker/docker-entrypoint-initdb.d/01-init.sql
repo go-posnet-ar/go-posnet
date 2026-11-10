@@ -310,6 +310,29 @@ CREATE TABLE IF NOT EXISTS settlement.maintenance_runs (
 INSERT INTO settlement.maintenance_runs (name, completed_by, details)
 VALUES ('reversal-recovery', '01-init.sql', 'Base nueva: no hay reversas anteriores sin descontar')
 ON CONFLICT (name) DO NOTHING;
+-- Envíos de lotes al procesador: un intento se registra antes de enviarlo y la confirmación al
+-- recibirla, para no enviar dos veces un lote que el procesador ya aceptó.
+CREATE TABLE IF NOT EXISTS settlement.batch_submissions (
+    batch_id         UUID        PRIMARY KEY REFERENCES settlement.settlement_batches (id),
+    attempts         INT         NOT NULL,
+    first_attempt_at TIMESTAMPTZ NOT NULL,
+    last_attempt_at  TIMESTAMPTZ NOT NULL,
+    confirmation_id  TEXT,
+    confirmed_at     TIMESTAMPTZ
+);
+-- Totales de un cierre del terminal sin ningún lote del día: el cierre automático concilia contra
+-- ellos el lote que formen las ventas que lleguen después.
+CREATE TABLE IF NOT EXISTS settlement.pending_terminal_closes (
+    terminal_id     UUID        NOT NULL,
+    batch_date      DATE        NOT NULL,
+    currency        CHAR(3)     NOT NULL,
+    terminal_count  INT         NOT NULL,
+    terminal_amount BIGINT      NOT NULL,
+    event_id        TEXT        NOT NULL,
+    requested_at    TIMESTAMPTZ NOT NULL,
+    received_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (terminal_id, batch_date, currency)
+);
 
 -- notification
 CREATE TABLE IF NOT EXISTS notification.notifications (

@@ -140,7 +140,7 @@ groups:
           description: "El cierre automático no los cerró. Revisar que SETTLEMENT_BATCH_CLOSE_HOUR no sea 0 y los logs (batch-close-failure.md, Escenario F)."
 
       # Envíos que no llegaron al procesador: avisa antes que LotesCerradosSinEnviar.
-      # El counter nace con el primer intento: ese primer incremento no lo ve increase().
+      # Las series nacen en 0 al arrancar el servicio: increase() ve también el primer fallo.
       - alert: EnvioAlProcesadorFallando
         expr: sum by (result) (increase(posnet_settlement_submissions_total{result=~"unavailable|error"}[1h])) > 0
         labels:

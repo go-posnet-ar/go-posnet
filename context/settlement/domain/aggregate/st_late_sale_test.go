@@ -95,3 +95,21 @@ func TestAddLateSale_AlreadyInTheBatch(t *testing.T) {
 		t.Errorf("AddLateSale(existing) = %v, %v, want false", added, err)
 	}
 }
+
+// Una reversa tardía se descuenta: con ella, el neto baja al que informó el terminal.
+func TestAddLateReversal(t *testing.T) {
+	// Una compra de 1000; el terminal informó la compra y su reversa: 2 transacciones, 0 neto.
+	b, existing := disputedByTerminal(t, aggregate.ReconciledWithTerminal, 2, 0)
+
+	added, err := b.AddLateReversal(existing, 1000, lateClosedAt.Add(-time.Minute))
+	if err != nil || !added {
+		t.Fatalf("AddLateReversal() = %v, %v, want true", added, err)
+	}
+	if b.Discrepancies() != 0 || b.Summary().ReversalCount() != 1 || b.Summary().TotalAmount().Cents() != 0 {
+		t.Errorf("discrepancies = %d, summary = %+v, want 0 with one reversal and 0 net", b.Discrepancies(), b.Summary())
+	}
+	// La misma reversa otra vez no se agrega: ya está en el lote.
+	if added, _ := b.AddLateReversal(existing, 1000, lateClosedAt.Add(-time.Minute)); added {
+		t.Error("AddLateReversal() added the same reversal twice")
+	}
+}

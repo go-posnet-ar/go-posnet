@@ -28,5 +28,10 @@ type EventPublisher interface {
 type SettlementProcessor interface {
 	// Submit envía el archivo de remesa del batch al procesador.
 	// Retorna el ID de confirmación del procesador.
+	//
+	// Tiene que ser idempotente por batch.ID(): el adaptador lo envía como clave de idempotencia,
+	// y el procesador responde la confirmación del envío anterior en vez de aceptarlo otra vez.
+	// Settlement no repite un envío con confirmación registrada, pero sí uno cuyo resultado no
+	// conoce: un error, un timeout o un corte después de enviarlo.
 	Submit(ctx context.Context, batch *aggregate.SettlementBatch) (string, error)
 }

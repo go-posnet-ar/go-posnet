@@ -124,6 +124,8 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	batchHandler.SetBatchReopens(batchRepo)
 	batchHandler.SetAuditLog(batchRepo)
 	batchHandler.SetTerminalDayBatches(batchRepo)
+	batchHandler.SetBatchSubmissions(batchRepo)
+	batchHandler.SetPendingTerminalCloses(batchRepo)
 	businessLocation, err := time.LoadLocation(cfg.Settlement.BusinessTimezone)
 	if err != nil {
 		return nil, fmt.Errorf("wire: load business timezone: %w", err)
@@ -135,6 +137,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	adminHandler := command.NewAdminHandler(batchRepo, processor)
 	adminHandler.ConfigureSettlement(pool, batchRepo, eventPub, outboxStore, cfg.Settlement.MDRPercent)
 	adminHandler.SetReversalReviews(batchRepo)
+	adminHandler.SetBatchSubmissions(batchRepo)
 	adminHandler.SetMerchantTimezones(batchRepo)
 	adminHandler.SetBusinessLocation(businessLocation)
 	adminHandler.SetBatchReleaser(batchHandler)
@@ -250,6 +253,10 @@ func (a *app) start(ctx context.Context) error {
 	go a.runBatchCloser(ctx)
 	slog.Info("batch closer job active")
 
+	// Reintento de las liberaciones fallidas — aparte del cierre: corre aunque esté deshabilitado
+	go a.runHeldReleaser(ctx)
+	slog.Info("held batch release retry active", slog.Duration("every", heldReleaseRetry))
+
 	return nil
 }
 
@@ -265,8 +272,7 @@ const batchCloseSweep = 15 * time.Minute
 // minuto, y también al arrancar, para no perder la corrida si el servicio estaba
 // caído a la hora de cierre; barre una vez por cada tramo de batchCloseSweep. Reintenta
 // mientras la última corrida tenga fallas. Cada lote se cierra después de la medianoche de su
-// comercio más el plazo configurado: eso lo decide la consulta, no la hora del job. En cada
-// barrido también reintenta liberar los lotes retenidos cuyas revisiones ya se cerraron.
+// comercio más el plazo configurado: eso lo decide la consulta, no la hora del job.
 func (a *app) runBatchCloser(ctx context.Context) {
 	if a.batchCloseHour == 0 {
 		slog.Info("automatic batch close disabled")
@@ -299,20 +305,6 @@ func (a *app) runBatchCloser(ctx context.Context) {
 		if failed == 0 {
 			lastSweep = sweep
 		}
-
-		// Un lote que no se liberó al cerrar su última revisión: se reintenta en cada barrido,
-		// sin repetir el barrido para él.
-		retried, releaseFailed, err := a.batchHandler.ReleaseHeldBatches(ctx)
-		if err != nil {
-			slog.Error("held batch release retry failed", slog.String("error", err.Error()))
-			return
-		}
-		if retried > 0 {
-			slog.Info("held batch release retry finished",
-				slog.Int("retried", retried),
-				slog.Int("failed", releaseFailed),
-			)
-		}
 	}
 
 	run(time.Now())
@@ -322,6 +314,38 @@ func (a *app) runBatchCloser(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			run(now)
+		}
+	}
+}
+
+// heldReleaseRetry es cada cuánto se reintenta liberar los lotes retenidos cuyas revisiones ya se
+// cerraron: lo que puede tardar en enviarse un lote cuya liberación falló.
+const heldReleaseRetry = 5 * time.Minute
+
+// runHeldReleaser reintenta liberar los lotes que no se liberaron al cerrar su última revisión,
+// al arrancar y cada heldReleaseRetry. Corre aparte del cierre automático: con
+// SETTLEMENT_BATCH_CLOSE_HOUR=0, o si el barrido de cierre falla, los lotes no quedan DISPUTED
+// hasta un resolve-dispute.
+func (a *app) runHeldReleaser(ctx context.Context) {
+	run := func() {
+		retried, failed, err := a.batchHandler.ReleaseHeldBatches(ctx)
+		if err != nil {
+			slog.Error("held batch release retry failed", slog.String("error", err.Error()))
+			return
+		}
+		if retried > 0 {
+			slog.Info("held batch release retry finished", slog.Int("retried", retried), slog.Int("failed", failed))
+		}
+	}
+	ticker := time.NewTicker(heldReleaseRetry)
+	defer ticker.Stop()
+	run()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
 		}
 	}
 }

@@ -21,6 +21,9 @@ type fakeBatchRepo struct {
 
 	findByIDResult *aggregate.SettlementBatch
 	findByIDErr    error
+	// findByIDFresh, si está, construye el lote en cada FindByID, como una base: un lote recargado
+	// no comparte los cambios en memoria del anterior.
+	findByIDFresh func() *aggregate.SettlementBatch
 
 	listResult []*aggregate.SettlementBatch
 	listErr    error
@@ -39,6 +42,9 @@ func (f *fakeBatchRepo) MerchantDayBatchesTx(context.Context, pgx.Tx, domain.Mer
 }
 
 func (f *fakeBatchRepo) FindByID(context.Context, string) (*aggregate.SettlementBatch, error) {
+	if f.findByIDFresh != nil {
+		return f.findByIDFresh(), f.findByIDErr
+	}
 	return f.findByIDResult, f.findByIDErr
 }
 
@@ -46,7 +52,7 @@ func (f *fakeBatchRepo) FindOpenByTerminal(context.Context, domain.TerminalID, t
 	return nil, nil
 }
 
-func (f *fakeBatchRepo) FindOrCreateOpen(context.Context, domain.TerminalID, domain.MerchantID, time.Time, string) (*aggregate.SettlementBatch, error) {
+func (f *fakeBatchRepo) FindOrCreateOpenTx(context.Context, pgx.Tx, domain.TerminalID, domain.MerchantID, time.Time, string) (*aggregate.SettlementBatch, error) {
 	return nil, nil
 }
 
@@ -86,7 +92,7 @@ func (p *panickyBatchRepo) FindOpenByTerminal(context.Context, domain.TerminalID
 	return nil, nil
 }
 
-func (p *panickyBatchRepo) FindOrCreateOpen(context.Context, domain.TerminalID, domain.MerchantID, time.Time, string) (*aggregate.SettlementBatch, error) {
+func (p *panickyBatchRepo) FindOrCreateOpenTx(context.Context, pgx.Tx, domain.TerminalID, domain.MerchantID, time.Time, string) (*aggregate.SettlementBatch, error) {
 	return nil, nil
 }
 

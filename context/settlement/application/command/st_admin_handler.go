@@ -35,6 +35,13 @@ type AdminHandler struct {
 	timezones  repository.MerchantTimezones // opcional
 	location   *time.Location               // zona de los comercios sin una propia; nil = UTC
 	releaser   BatchReleaser                // opcional; nil = cerrar una revisión no libera el lote
+
+	submissions repository.BatchSubmissions // opcional; nil = no registra los envíos y un reenvío puede duplicarlos
+}
+
+// SetBatchSubmissions registra los envíos al procesador: resubmit no envía otra vez un lote ya aceptado.
+func (h *AdminHandler) SetBatchSubmissions(s repository.BatchSubmissions) {
+	h.submissions = s
 }
 
 // BatchReleaser libera un lote retenido cuando se cierra su última revisión de reversa.
@@ -216,30 +223,32 @@ func (h *AdminHandler) ResubmitBatch(ctx context.Context, cmd port.ResubmitBatch
 		))
 	}
 
-	confirmationID, err := submitToProcessor(ctx, h.processor, batch)
+	sent, err := sendToProcessor(ctx, h.processor, h.submissions, batch)
 	if err != nil {
 		return fmt.Errorf("ResubmitBatch: processor submit: %w", err)
 	}
-	if err := batch.Submit(); err != nil {
-		return fmt.Errorf("ResubmitBatch: %w", err)
+	log := observability.FromContext(ctx).With(
+		slog.String("batch_id", batch.ID()),
+		slog.String("operator_id", cmd.OperatorID),
+		slog.String("confirmation_id", sent.confirmationID),
+	)
+	entry.ConfirmationID = sent.confirmationID
+	if sent.recovered {
+		entry.Reason = "already accepted by the processor in a previous submission: not sent again"
 	}
-	entry.ConfirmationID = confirmationID
-	if err := h.persist(ctx, batch, entry, nil); err != nil {
-		// El procesador ya aceptó: esta es la única copia del confirmation_id.
-		observability.FromContext(ctx).Error("batch accepted by processor but not saved — do not resubmit without checking",
-			slog.String("batch_id", batch.ID()),
-			slog.String("operator_id", cmd.OperatorID),
-			slog.String("confirmation_id", confirmationID),
-			slog.String("error", err.Error()),
-		)
+	if _, err := markSubmitted(ctx, h.batchRepo, batch, func(b *aggregate.SettlementBatch) error {
+		entry.FromState, entry.PreviousDiscrepancies = valueobject.BatchStateClosed.String(), b.Discrepancies()
+		return h.persist(ctx, b, entry, nil)
+	}); err != nil {
+		log.Error("batch accepted by processor but not saved as SUBMITTED", slog.String("error", err.Error()))
 		return fmt.Errorf("ResubmitBatch: save: %w", err)
 	}
 
-	observability.FromContext(ctx).Info("batch resubmitted to processor",
-		slog.String("batch_id", batch.ID()),
-		slog.String("operator_id", cmd.OperatorID),
-		slog.String("confirmation_id", confirmationID),
-	)
+	if sent.recovered {
+		log.Warn("batch was already accepted by the processor — marked SUBMITTED without sending it again")
+		return nil
+	}
+	log.Info("batch resubmitted to processor")
 	return nil
 }
 
@@ -638,7 +647,7 @@ func (h *AdminHandler) addAdjustment(ctx context.Context, tx pgx.Tx, review *rep
 	if err != nil {
 		return nil, err
 	}
-	open, err := h.batchRepo.FindOrCreateOpen(ctx, sent.TerminalID(), sent.MerchantID(), today, sent.Currency())
+	open, err := h.batchRepo.FindOrCreateOpenTx(ctx, tx, sent.TerminalID(), sent.MerchantID(), today, sent.Currency())
 	if err != nil {
 		return nil, fmt.Errorf("find or create the open batch: %w", err)
 	}

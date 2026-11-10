@@ -25,7 +25,7 @@ type fakeTerminalDays struct {
 	counted    int
 }
 
-func (f *fakeTerminalDays) FindLateSaleBatchTx(_ context.Context, _ pgx.Tx, _ domain.TerminalID, _ time.Time, _ string, authorizedAt time.Time) (string, error) {
+func (f *fakeTerminalDays) FindLateBatchTx(_ context.Context, _ pgx.Tx, _ domain.TerminalID, _ time.Time, _ string, authorizedAt time.Time) (string, error) {
 	f.lateAt = authorizedAt
 	return f.lateID, f.lateErr
 }
@@ -236,5 +236,125 @@ func TestProcessBatchClose_WithoutBatchSaysWhy(t *testing.T) {
 				t.Errorf("counted = %d, logs = %v, want %q", days.counted, logs.msgs, tc.want)
 			}
 		})
+	}
+}
+
+// lateReversalClosed es un lote DISPUTED con compras de 1000 y 500, cerrado contra un terminal
+// que informó 3 transacciones por 1000 neto: le falta la reversa de la de 500.
+func lateReversalClosed(t *testing.T, closedAt time.Time) (*aggregate.SettlementBatch, domain.TransactionID) {
+	t.Helper()
+	reversed := domain.NewTransactionID()
+	var txs []*entity.BatchTransaction
+	for _, p := range []struct {
+		id     domain.TransactionID
+		amount int64
+	}{{domain.NewTransactionID(), 1000}, {reversed, 500}} {
+		tx, err := entity.NewBatchTransaction("b-late", p.id, p.amount, "ARS", valueobject.BatchTxPurchase)
+		if err != nil {
+			t.Fatalf("NewBatchTransaction() error = %v", err)
+		}
+		txs = append(txs, tx)
+	}
+	count, amount := 3, int64(1000)
+	return aggregate.Reconstitute(aggregate.ReconstituteParams{
+		ID: "b-late", TerminalID: domain.NewTerminalID(), MerchantID: domain.NewMerchantID(),
+		BatchDate: closedAt.Truncate(24 * time.Hour), State: valueobject.BatchStateDisputed, Currency: "ARS",
+		Transactions: txs, CreatedAt: closedAt.Add(-time.Hour), ClosedAt: &closedAt,
+		Discrepancies: 1, ReconciledWith: aggregate.ReconciledWithTerminal, TerminalCount: &count, TerminalAmount: &amount,
+	}), reversed
+}
+
+func TestRegisterReversal_LateReversalCompletesItsDisputedBatch(t *testing.T) {
+	closedAt := time.Now().UTC().Truncate(time.Second)
+	tests := []struct {
+		name        string
+		purchase    bool // La compra se encuentra y coincide
+		amount      int64
+		wantState   valueobject.BatchState
+		wantDiscrep int
+		wantAudit   []string
+		wantReview  bool
+	}{
+		{"reconciles: released and sent", true, 500, valueobject.BatchStateSubmitted, 0,
+			[]string{repository.AuditActionLateReversal, repository.AuditActionAutoRelease}, false},
+		{"reconciles, but does not match its purchase: held", false, 500, valueobject.BatchStateDisputed, 0,
+			[]string{repository.AuditActionLateReversal}, true},
+		{"another amount: still disputed", true, 300, valueobject.BatchStateDisputed, 1,
+			[]string{repository.AuditActionLateReversal}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			late, reversed := lateReversalClosed(t, closedAt)
+			open := newOpenBatch(t, late.TerminalID(), late.MerchantID())
+			repo := &fakeBatchRepo{findByIDResult: late, findOrCreateResult: open}
+			pool := newMockPool(t)
+			expectClaimed(pool, 1)
+			processor := &fakeProcessor{confirmationID: "conf-1"}
+			h := newHandler(pool, repo, &fakePublisher{}, processor)
+			h.SetAuditLog(repo)
+			reviews := &fakeReviews{}
+			if tc.purchase {
+				reviews.purchase = &repository.ReversalPurchase{MerchantID: late.MerchantID().String(), AmountCents: 500, Currency: "ARS"}
+			}
+			h.SetReversalReviews(reviews)
+			days := &fakeTerminalDays{lateID: "b-late"}
+			h.SetTerminalDayBatches(days)
+
+			cmd := validReversalCmd()
+			cmd.TerminalID, cmd.MerchantID, cmd.OriginalTransactionID = late.TerminalID().String(), late.MerchantID().String(), reversed.String()
+			cmd.AmountCents = tc.amount
+			cmd.CompletedAt = closedAt.Add(-time.Minute).Format(time.RFC3339)
+			if err := h.RegisterReversal(context.Background(), cmd); err != nil {
+				t.Fatalf("RegisterReversal() error = %v", err)
+			}
+
+			if len(late.Transactions()) != 3 || len(open.Transactions()) != 0 {
+				t.Errorf("transactions: disputed %d, open %d, want 3 and 0", len(late.Transactions()), len(open.Transactions()))
+			}
+			if late.State() != tc.wantState || late.Discrepancies() != tc.wantDiscrep {
+				t.Errorf("state = %s, discrepancies = %d, want %s, %d", late.State(), late.Discrepancies(), tc.wantState, tc.wantDiscrep)
+			}
+			var actions []string
+			for _, e := range repo.auditEntries {
+				actions = append(actions, e.Action)
+			}
+			if len(actions) != len(tc.wantAudit) || actions[0] != tc.wantAudit[0] || (len(actions) > 1 && actions[1] != tc.wantAudit[1]) {
+				t.Errorf("audit = %v, want %v", actions, tc.wantAudit)
+			}
+			if (len(reviews.inserted) == 1) != tc.wantReview {
+				t.Errorf("reviews = %+v, want a review: %v", reviews.inserted, tc.wantReview)
+			}
+			if tc.wantReview && reviews.inserted[0].BatchID != "b-late" {
+				t.Errorf("review batch = %q, want the disputed batch", reviews.inserted[0].BatchID)
+			}
+			if (processor.calls == 1) != (tc.wantState == valueobject.BatchStateSubmitted) {
+				t.Errorf("processor calls = %d", processor.calls)
+			}
+		})
+	}
+}
+
+// Una reversa completada después del cierre, o sin hora conocida, va al lote OPEN como siempre.
+func TestRegisterReversal_NotLateGoesToTheOpenBatch(t *testing.T) {
+	closedAt := time.Now().UTC().Truncate(time.Second)
+	for _, completedAt := range []string{closedAt.Add(time.Minute).Format(time.RFC3339), "not-a-time"} {
+		late, reversed := lateReversalClosed(t, closedAt)
+		open := newOpenBatch(t, late.TerminalID(), late.MerchantID())
+		repo := &fakeBatchRepo{findByIDResult: late, findOrCreateResult: open}
+		pool := newMockPool(t)
+		expectClaimed(pool, 1)
+		h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{})
+		h.SetAuditLog(repo)
+		h.SetTerminalDayBatches(&fakeTerminalDays{lateID: "b-late"})
+
+		cmd := validReversalCmd()
+		cmd.TerminalID, cmd.MerchantID, cmd.OriginalTransactionID = late.TerminalID().String(), late.MerchantID().String(), reversed.String()
+		cmd.AmountCents, cmd.CompletedAt = 500, completedAt
+		if err := h.RegisterReversal(context.Background(), cmd); err != nil {
+			t.Fatalf("RegisterReversal(%s) error = %v", completedAt, err)
+		}
+		if len(late.Transactions()) != 2 || len(open.Transactions()) != 1 {
+			t.Errorf("%s: disputed %d, open %d, want 2 and 1", completedAt, len(late.Transactions()), len(open.Transactions()))
+		}
 	}
 }

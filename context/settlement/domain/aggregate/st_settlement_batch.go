@@ -263,8 +263,18 @@ func (b *SettlementBatch) Release() (released, changed bool, err error) {
 // estado: si ahora coincide, el lote se libera con Release. Devuelve false, sin cambiar nada, si
 // la venta no corresponde a este lote; entonces abre uno nuevo, como cualquier venta posterior.
 func (b *SettlementBatch) AddLateSale(transactionID domain.TransactionID, amountCents int64, authorizedAt time.Time) (bool, error) {
+	return b.addLate(transactionID, amountCents, valueobject.BatchTxPurchase, authorizedAt)
+}
+
+// AddLateReversal es AddLateSale para una reversa completada antes del cierre, que el terminal
+// contó pero llegó después. Se descuenta, como cualquier reversa.
+func (b *SettlementBatch) AddLateReversal(transactionID domain.TransactionID, amountCents int64, completedAt time.Time) (bool, error) {
+	return b.addLate(transactionID, amountCents, valueobject.BatchTxReversal, completedAt)
+}
+
+func (b *SettlementBatch) addLate(transactionID domain.TransactionID, amountCents int64, txType valueobject.BatchTransactionType, at time.Time) (bool, error) {
 	if b.state != valueobject.BatchStateDisputed || b.reconciledWith != ReconciledWithTerminal ||
-		b.terminalCount == nil || b.terminalAmount == nil || b.closedAt == nil || authorizedAt.After(*b.closedAt) {
+		b.terminalCount == nil || b.terminalAmount == nil || b.closedAt == nil || at.After(*b.closedAt) {
 		return false, nil
 	}
 	_, count, _, err := b.calculateSummary()
@@ -272,15 +282,15 @@ func (b *SettlementBatch) AddLateSale(transactionID domain.TransactionID, amount
 		return false, err
 	}
 	if count >= *b.terminalCount {
-		return false, nil // El terminal no contó más ventas de las que hay: esta no es suya
+		return false, nil // El terminal no contó más transacciones de las que hay: esta no es suya
 	}
 	for _, t := range b.transactions {
-		if t.TransactionID() == transactionID && t.Type() == valueobject.BatchTxPurchase {
+		if t.TransactionID() == transactionID && t.Type() == txType {
 			return false, nil
 		}
 	}
 
-	tx, err := entity.NewBatchTransaction(b.id, transactionID, amountCents, b.currency, valueobject.BatchTxPurchase)
+	tx, err := entity.NewBatchTransaction(b.id, transactionID, amountCents, b.currency, txType)
 	if err != nil {
 		return false, fmt.Errorf("settlement_batch: create batch transaction: %w", err)
 	}

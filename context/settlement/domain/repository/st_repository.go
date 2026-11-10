@@ -38,10 +38,11 @@ type SettlementBatchRepository interface {
 	// Retorna nil si no existe — se creará uno nuevo al recibir la primera transacción.
 	FindOpenByTerminal(ctx context.Context, terminalID domain.TerminalID, date time.Time, currency string) (*aggregate.SettlementBatch, error)
 
-	// FindOrCreateOpen recupera el batch OPEN del terminal o lo crea si no existe.
+	// FindOrCreateOpenTx recupera el batch OPEN del terminal o lo crea si no existe, dentro de tx:
+	// si tx se revierte, el lote creado también.
 	// Garantiza que hay un solo batch OPEN por terminal, día y moneda. El lote viene sin sus
 	// transacciones, para agregarle una: no puede calcular totales ni cerrarse.
-	FindOrCreateOpen(ctx context.Context, terminalID domain.TerminalID, merchantID domain.MerchantID, date time.Time, currency string) (*aggregate.SettlementBatch, error)
+	FindOrCreateOpenTx(ctx context.Context, tx pgx.Tx, terminalID domain.TerminalID, merchantID domain.MerchantID, date time.Time, currency string) (*aggregate.SettlementBatch, error)
 
 	// ListByMerchantDate lista todos los batches de un comercio en una fecha.
 	// Usado para generar el reporte de liquidación diaria.
@@ -75,10 +76,11 @@ const (
 	AuditActionResolveDispute  = "RESOLVE_DISPUTE"
 	AuditActionSettle          = "SETTLE"
 	AuditActionRecoverReversal = "RECOVER_REVERSAL"
-	AuditActionRedate          = "REDATE"       // El cambio de zona del comercio movió el lote a otra fecha
-	AuditActionAutoRelease     = "AUTO_RELEASE" // Se cerró la última revisión y el lote concilia: pasa a CLOSED
-	AuditActionAdjustment      = "ADJUSTMENT"   // El lote recibió la corrección de un lote ya enviado
-	AuditActionLateSale        = "LATE_SALE"    // Llegó tarde una venta que el terminal había contado al cerrar
+	AuditActionRedate          = "REDATE"        // El cambio de zona del comercio movió el lote a otra fecha
+	AuditActionAutoRelease     = "AUTO_RELEASE"  // Se cerró la última revisión y el lote concilia: pasa a CLOSED
+	AuditActionAdjustment      = "ADJUSTMENT"    // El lote recibió la corrección de un lote ya enviado
+	AuditActionLateSale        = "LATE_SALE"     // Llegó tarde una venta que el terminal había contado al cerrar
+	AuditActionLateReversal    = "LATE_REVERSAL" // Llegó tarde una reversa que el terminal había contado al cerrar
 
 	AuditActionReviewAccept            = "REVIEW_ACCEPT"
 	AuditActionReviewUsePurchaseAmount = "REVIEW_USE_PURCHASE_AMOUNT"
@@ -111,16 +113,52 @@ type BatchReopens interface {
 	WasReopened(ctx context.Context, batchID string) (bool, error)
 }
 
-// TerminalDayBatches busca los lotes de un terminal en un día, para las ventas y los cierres que
-// llegan tarde.
+// TerminalDayBatches busca los lotes de un terminal en un día, para las ventas, reversas y cierres
+// que llegan tarde.
 type TerminalDayBatches interface {
-	// FindLateSaleBatchTx devuelve el lote DISPUTED del terminal, fecha y moneda al que le falta
-	// una venta autorizada en authorizedAt: concilió contra el terminal, cerró después de esa hora
-	// y el terminal contó más transacciones de las que tiene. Vacío si no hay ninguno.
-	FindLateSaleBatchTx(ctx context.Context, tx pgx.Tx, terminalID domain.TerminalID, date time.Time, currency string, authorizedAt time.Time) (string, error)
+	// FindLateBatchTx devuelve el lote DISPUTED del terminal, fecha y moneda al que le falta una
+	// venta o reversa ocurrida en at: concilió contra el terminal, cerró después de esa hora y el
+	// terminal contó más transacciones de las que tiene. Vacío si no hay ninguno.
+	FindLateBatchTx(ctx context.Context, tx pgx.Tx, terminalID domain.TerminalID, date time.Time, currency string, at time.Time) (string, error)
 
 	// CountTerminalDayBatches cuenta los lotes del terminal en esa fecha y moneda, en cualquier estado.
 	CountTerminalDayBatches(ctx context.Context, terminalID domain.TerminalID, date time.Time, currency string) (int, error)
+}
+
+// PendingClose son los totales de un cierre del terminal que no encontró ningún lote del día.
+type PendingClose struct {
+	TerminalID     domain.TerminalID
+	BatchDate      time.Time
+	Currency       string
+	TerminalCount  int
+	TerminalAmount int64
+	EventID        string
+	RequestedAt    time.Time
+}
+
+// PendingTerminalCloses guarda los cierres sin lote, para que el cierre automático concilie
+// contra ellos el lote que formen las ventas que lleguen después.
+type PendingTerminalCloses interface {
+	// SavePendingClose guarda los totales. Si ya hay unos del mismo día, quedan los del pedido
+	// más nuevo.
+	SavePendingClose(ctx context.Context, p PendingClose) error
+
+	// FindPendingClose devuelve los totales guardados del terminal en esa fecha y moneda, o nil.
+	FindPendingClose(ctx context.Context, terminalID domain.TerminalID, date time.Time, currency string) (*PendingClose, error)
+
+	// DeletePendingCloseTx borra los totales al usarlos, o cuando un cierre más nuevo los reemplaza.
+	DeletePendingCloseTx(ctx context.Context, tx pgx.Tx, terminalID domain.TerminalID, date time.Time, currency string) error
+}
+
+// BatchSubmissions registra los envíos al procesador aparte del lote, para no enviar dos veces uno
+// que el procesador ya aceptó: si falla guardar el lote en SUBMITTED, la confirmación queda.
+type BatchSubmissions interface {
+	// StartSubmission registra un intento de envío, confirmado antes de llamar al procesador.
+	// Devuelve la confirmación de un envío anterior aceptado, o vacío si no hay ninguno.
+	StartSubmission(ctx context.Context, batchID string) (confirmationID string, err error)
+
+	// ConfirmSubmission guarda la confirmación del procesador. No reemplaza una anterior.
+	ConfirmSubmission(ctx context.Context, batchID, confirmationID string) error
 }
 
 // Motivos por los que una reversa queda en revisión.

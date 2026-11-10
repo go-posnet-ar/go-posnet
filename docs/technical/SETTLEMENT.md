@@ -161,11 +161,13 @@ Al recibir `auth.approved`:
 
 1. Valida los IDs, la moneda y el monto, y calcula el día de negocio de `authorized_at`.
 2. Marca el evento en `processed_events` dentro de una transacción.
-3. Busca el lote `OPEN` del terminal para ese día y moneda o lo crea, en una transacción `SERIALIZABLE` aparte.
+3. Busca el lote `OPEN` del terminal para ese día y moneda o lo crea, en la misma transacción: si algo falla,
+   tampoco queda el lote creado.
 4. Agrega la transacción, guarda el lote y [compara la reversa](#52-reversa) si había una esperando esta compra,
    en la transacción del paso 2.
 
-Si algo falla, nada de los pasos 2 y 4 se confirma, y el evento se reintenta.
+Si algo falla, nada de los pasos 2 a 4 se confirma, y el evento se reintenta. Antes, el lote se creaba en una
+transacción aparte: si la venta fallaba, quedaba un lote vacío que el job cerraba.
 
 ### 5.2 Reversa
 
@@ -216,9 +218,10 @@ lotes de antes de `000007`, aunque el lote lo haya cerrado el job: es la compara
 
 La liberación queda en la auditoría como `AUTO_RELEASE`, con `operator_id` `system`. Corre después de cerrar la
 revisión, en su propia transacción: si falla, la revisión ya está cerrada y el lote sigue `DISPUTED`, con un log
-`could not release the held batch`. **El job de cierre automático la reintenta en cada barrido,** para los lotes
-`DISPUTED` sin discrepancias, con la referencia guardada y sin revisiones abiertas (log `retrying the release of a
-held batch`). Un lote que se volvió a conciliar y no coincide ya tiene discrepancias: el job no lo vuelve a tomar.
+`could not release the held batch`. **Se reintenta al arrancar y cada 5 minutos,** para los lotes `DISPUTED` sin
+discrepancias, con la referencia guardada y sin revisiones abiertas (log `retrying the release of a held batch`). Corre
+aparte del cierre automático: también con `SETTLEMENT_BATCH_CLOSE_HOUR=0`, y aunque falle el barrido de cierre. Un lote
+que se volvió a conciliar y no coincide ya tiene discrepancias: no se vuelve a tomar.
 
 **Una reversa excluida vuelve si llega su compra.** `EXCLUDE` sobre una revisión `PURCHASE_NOT_FOUND` saca la
 reversa porque la compra no estaba. Si la compra llega después y coincide, la reversa se agrega al lote de la compra,
@@ -249,6 +252,11 @@ libera, también como `AUTO_RELEASE`, los dos con `operator_id` `system`. La mé
 lo cuenta por `result`: `released`, `held` (coincide, pero una revisión lo retiene) o `disputed`.
 
 Sin `authorized_at` legible no se puede saber si la venta es anterior al cierre: abre un lote nuevo.
+
+**Una reversa anterior al cierre que llega después** sigue las mismas reglas, con su `completed_at`: se descuenta del
+lote en disputa que le faltaba. Antes de decidir si el lote se libera, se compara con su compra, como cualquier
+reversa ([§5.2](#52-reversa)): si no coinciden, la revisión se abre en ese lote y lo retiene. Queda en la auditoría como
+`LATE_REVERSAL`, y la métrica es `posnet_settlement_late_reversals_total`, con los mismos `result`.
 
 ### 5.4 Cierre de lote
 
@@ -322,8 +330,10 @@ Si no hay un lote `OPEN` para esa fecha, se confirma sin hacer nada, y la misma 
 | El día no tiene lotes y el terminal informó ventas | `no_batch` | `ERROR` con los totales del terminal, y alerta `CierreSinLote`: las ventas se están reintentando, están en la DLQ o no llegaron |
 | Sin lotes ni ventas | — | `INFO`: un día sin actividad |
 
-Con `no_batch`, los totales del terminal no se guardan: solo quedan en el log. Si las ventas llegan después, abren un
-lote nuevo, que el job cierra sin conciliar.
+**Con `no_batch`, los totales del terminal se guardan** en `pending_terminal_closes` (log con `totals_saved=true`). Si
+las ventas llegan después, abren un lote nuevo, y el [cierre automático](#56-cierre-automático) lo concilia contra esos
+totales en vez de cerrarlo con los del backend. Si de dos pedidos del mismo día, queda el más nuevo; un cierre posterior
+del terminal que encuentra el lote los reemplaza y los borra. Si no se pueden guardar, el cierre se reintenta.
 
 Las fechas de los lotes creados antes del día de negocio siguen en UTC.
 
@@ -335,8 +345,12 @@ terminal lo cierre él y concilie. Con `SETTLEMENT_BATCH_CLOSE_HOUR=0` queda des
 
 1. Busca los lotes `OPEN` de **días de negocio anteriores** que ya vencieron, en la zona de cada comercio. No
    toca el lote del día, porque sigue recibiendo ventas.
-2. Los cierra con los totales del backend: **no hay conciliación**, porque el terminal no informó los
-   suyos, y por eso tampoco hay discrepancias.
+2. Si el terminal pidió el cierre de ese día cuando todavía no había ningún lote (`no_batch`), **concilia contra
+   esos totales**, con la misma regla que su cierre, incluido el acumulado del día ([5.4](#54-cierre-de-lote)),
+   y los borra. Con discrepancias, queda `DISPUTED`: una venta que todavía llegue tarde lo puede completar
+   ([5.3](#53-aprobación-después-del-cierre)). Log `batch closed automatically against the totals of an earlier terminal
+   close`.
+   Si no, lo cierra con los totales del backend: **no hay conciliación**, y por eso tampoco hay discrepancias.
 3. Encola `batch-closed` en la misma transacción y envía el lote al procesador. Un lote vacío solo se cierra.
    **Con una revisión de reversa abierta, queda en `DISPUTED`, sin enviarse.**
 
@@ -344,8 +358,8 @@ Un evento sintético en `processed_events`, determinístico por lote y día, evi
 el mismo lote. Si falla el cierre de un lote, el job sigue con los demás y reintenta en el minuto
 siguiente.
 
-En cada barrido, el job también **reintenta liberar los lotes retenidos** cuyas revisiones ya se cerraron (ver
-[5.2](#52-reversa)). Uno que falla se reintenta en el barrido siguiente.
+Los lotes retenidos cuyas revisiones ya se cerraron se reintentan liberar aparte, cada 5 minutos (ver
+[5.2](#52-reversa)).
 
 ### 5.7 Disputas
 
@@ -398,9 +412,32 @@ evento con el total acumulado.
 | NATS no disponible al publicar | Los eventos esperan en el outbox; alerta `OutboxSettlementTrabado` | **Sí**, al volver NATS |
 | Cierre sin procesador configurado | Queda `CLOSED` | Con `resubmit` |
 | El procesador falla | Queda `CLOSED` | Con `resubmit` |
+| El procesador acepta y falla guardar `SUBMITTED` | Queda `CLOSED`, con la confirmación en `batch_submissions` | Con `resubmit`, que no lo envía otra vez (ver [Envío al procesador](#envío-al-procesador)) |
 | El terminal nunca pide el cierre | El job lo cierra sin conciliar | **Sí** |
 | Falla el cierre automático de un lote | Reintenta en el minuto siguiente | **Sí** |
 | Falla el guardado de `settle` o de su evento | `500`; el lote sigue `SUBMITTED` | Con operador: repetir `settle` |
+
+### Envío al procesador
+
+Cada envío, tras un cierre, una liberación o un `resubmit`, se registra en `batch_submissions` **antes** de llamar
+al procesador, y la confirmación apenas la recibe, aparte del lote:
+
+| Situación | Resultado |
+|---|---|
+| Ya hay una confirmación registrada | No se envía otra vez: el lote pasa a `SUBMITTED` con esa confirmación. Log `already accepted by the processor`, `result="recovered"` en `posnet_settlement_submissions_total` y, en `resubmit`, la auditoría lo dice en `reason` |
+| No se puede registrar el intento | No se envía: sin el registro no habría forma de saber después que se envió |
+| El procesador acepta y no se puede guardar la confirmación | Se reintenta tres veces. Si sigue fallando, log `confirmation was not recorded` y el lote se marca `SUBMITTED` igual |
+| Otro proceso cambió el lote mientras se enviaba | Se recarga y se marca `SUBMITTED` si sigue `CLOSED`. Si ya no está `CLOSED` (por ejemplo, lo retuvo una revisión), queda como está, con la confirmación registrada |
+
+Un intento sin confirmación (un error, un timeout o un corte después de enviarlo) se repite con el mismo `batch_id`.
+**El adaptador del procesador tiene que enviarlo como clave de idempotencia,** para que el procesador responda la
+confirmación anterior en vez de aceptarlo otra vez. El simulado no envía nada, así que no le afecta.
+
+```sql
+-- Envíos de un lote: intentos y confirmación
+SELECT attempts, first_attempt_at, last_attempt_at, confirmation_id, confirmed_at
+FROM settlement.batch_submissions WHERE batch_id = '<batch_id>';
+```
 
 ### 5.10 Concurrencia
 
@@ -767,8 +804,10 @@ hace nada, [`migrations/settlement/`](../../migrations/settlement/) se aplica a 
 | `outbox` | Eventos pendientes de publicar | PK `id`; índice `created_at` |
 | `reversal_reviews` | Reversas que no coinciden con su compra | PK `transaction_id`; FK `batch_id`; índice `created_at` de las abiertas |
 | `batch_audit_log` | Cambios de estado hechos por operadores | PK `id`; FK `batch_id`; índice `(batch_id, created_at)` |
+| `pending_terminal_closes` | Totales de un cierre del terminal sin ningún lote del día, hasta que el cierre automático los usa | PK `(terminal_id, batch_date, currency)` |
 | `merchant_timezones` | Zona de negocio de los comercios que no usan la general | PK `merchant_id` |
 | `maintenance_runs` | Tareas de mantenimiento ya ejecutadas en el entorno, como la recuperación de reversas | PK `name` |
+| `batch_submissions` | Envíos al procesador: intentos y confirmación (ver [Envío al procesador](#envío-al-procesador)) | PK y FK `batch_id` |
 
 | Índice | Para qué sirve |
 |---|---|
@@ -781,8 +820,8 @@ Con 2.000 lotes y 400.000 transacciones, cargar un lote pasó de recorrer toda l
 
 ### Aplicar la migración
 
-**Una base existente necesita `000001` y de `000003` a `000009` antes de desplegar esta versión del servicio, y
-`000010` después de `000007`.**
+**Una base existente necesita `000001`, de `000003` a `000009`, `000011` y `000012` antes de desplegar esta versión
+del servicio, y `000010` después de `000007`.**
 `01-init.sql` solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
 
 ```bash
@@ -796,9 +835,11 @@ psql "$POSTGRES_DSN" -f migrations/settlement/000007_release_held_batches.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000008_maintenance_runs.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000009_batch_adjustments.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000010_backfill_held_batches.up.sql
+psql "$POSTGRES_DSN" -f migrations/settlement/000011_batch_submissions.up.sql
+psql "$POSTGRES_DSN" -f migrations/settlement/000012_pending_terminal_closes.up.sql
 ```
 
-Son idempotentes y, salvo `000010`, no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
+Son idempotentes y, salvo `000010` y `000011`, no tocan los datos. Se probaron sobre una base con el schema anterior: el resultado
 coincide con el de una base nueva.
 
 **Con una tabla faltante, o una columna de `000007` o `000009`, `/readyz` responde `503` con `database schema incomplete`,** y el
@@ -814,7 +855,11 @@ marcha, porque solo agregan tablas o columnas que admiten `NULL`. **Sin `000010`
 `000007` no se liberan solos:** no tienen referencia de conciliación. `000010` solo completa la referencia de los
 lotes `DISPUTED` sin discrepancias que tienen revisiones; el job los libera en su barrido siguiente. **Sin `000008`, `/metrics` deja de informar los lotes que requieren
 atención,** y `/readyz` responde `503`. No inserta ninguna fila: después hay que ejecutar
-`settlement-recover-reversals` (Escenario E), o la alerta `ReversasSinRecuperar` sigue activa.
+`settlement-recover-reversals` (Escenario E), o la alerta `ReversasSinRecuperar` sigue activa. **Sin `000011`,
+`/readyz` responde `503` y falla cada envío al procesador:** sin registrar el intento, no se envía, y el lote queda
+`CLOSED`. `000011` copia las confirmaciones que `resubmit` guardaba en la auditoría; las de los envíos tras un cierre no
+se guardaban en ningún lado, y esos lotes quedan sin fila. **Sin `000012`, `/readyz` responde `503` y un cierre sin
+lote con ventas falla y se reintenta** hasta agotar las entregas y pasar a la DLQ.
 
 `000002` crea los índices con `CONCURRENTLY`, sin bloquear las escrituras, y por eso no puede correr dentro de
 una transacción: no usar `psql -1`. Si se interrumpe, puede dejar un índice inválido: hay que borrarlo y volver
@@ -830,7 +875,10 @@ mismo: los comercios configurados vuelven a la zona general. `000007_release_hel
 la referencia de conciliación de los lotes y la acción de las revisiones. `000008_maintenance_runs.down.sql` también:
 se pierde el registro de la recuperación. `000009_batch_adjustments.down.sql` exige lo mismo, y falla sin cambiar nada
 si ya hay ajustes: la versión anterior los sumaría como compras. `000010_backfill_held_batches.down.sql` no revierte
-nada: los lotes completados ya pudieron enviarse.
+nada: los lotes completados ya pudieron enviarse. `000011_batch_submissions.down.sql` exige volver antes a una versión
+que no use la tabla, y se pierden las confirmaciones de los envíos tras un cierre, que solo se guardan ahí.
+`000012_pending_terminal_closes.down.sql` exige lo mismo: los totales que todavía no se usaron se pierden, y esos lotes
+se cierran sin conciliar.
 
 ### Auditoría de operadores
 
@@ -840,13 +888,13 @@ lote no cambia.
 
 | Columna | Contenido |
 |---|---|
-| `action` | `FORCE_CLOSE`, `RESUBMIT`, `RESUBMIT_BLOCKED`, `REOPEN`, `RESOLVE_DISPUTE` o `SETTLE`; `REVIEW_*` al cerrar una revisión; `ADJUSTMENT` en el lote que recibe una corrección; `REDATE` y `AUTO_RELEASE`, del sistema |
+| `action` | `FORCE_CLOSE`, `RESUBMIT`, `RESUBMIT_BLOCKED`, `REOPEN`, `RESOLVE_DISPUTE` o `SETTLE`; `REVIEW_*` al cerrar una revisión; `ADJUSTMENT` en el lote que recibe una corrección; `REDATE`, `LATE_SALE`, `LATE_REVERSAL` y `AUTO_RELEASE`, del sistema |
 | `operator_id` | El `name` del token. Con `SETTLEMENT_ADMIN_API_KEY`, lo que declaró quien llama |
 | `reason` | Lo que declaró quien llama. Solo existe en `reopen`, `resolve-dispute` y las revisiones |
 | `from_state`, `to_state` | Estado antes y después |
 | `previous_discrepancies` | Discrepancias antes del cambio |
 | `total_amount` | Total después del cambio; vacío si el lote se reabrió |
-| `confirmation_id` | Lo que devolvió el procesador en un `resubmit` |
+| `confirmation_id` | Lo que devolvió el procesador en un `resubmit`, o la confirmación anterior si no se envió otra vez. Todos los envíos están en `batch_submissions` |
 | `created_at` | Fecha y hora del cambio |
 
 ```sql
@@ -858,17 +906,17 @@ ORDER BY created_at;
 
 **No se auditan** las operaciones rechazadas, porque no cambian nada, ni los cierres del terminal o del job
 automático, que no los hace un operador. Sí se auditan dos cambios del sistema que siguen a un operador: el lote que
-movió un cambio de zona (`REDATE`), la venta que llegó después del cierre (`LATE_SALE`) y el que liberó el cierre de
-una revisión o una venta tardía (`AUTO_RELEASE`); los dos últimos, con `operator_id` `system`. Las operaciones anteriores a `000004` solo están en los logs.
+movió un cambio de zona (`REDATE`), la venta o reversa que llegó después del cierre (`LATE_SALE`, `LATE_REVERSAL`) y el
+que liberó el cierre de una revisión o una transacción tardía (`AUTO_RELEASE`); los tres últimos, con `operator_id` `system`. Las operaciones anteriores a `000004` solo están en los logs.
 
 ### Costo por aprobación
 
-Una venta, una reversa o un ajuste carga solo la fila del lote, sin sus transacciones (`FindOrCreateOpen`), e
+Una venta, una reversa o un ajuste carga solo la fila del lote, sin sus transacciones (`FindOrCreateOpenTx`), e
 inserta solo la nueva: el lote lleva la cuenta de las que ya están guardadas. El costo por evento no depende
 del tamaño del lote. Un lote cargado así no puede calcular totales: `Close`, `Release` y `AddLateSale` fallan
 con `ErrTransactionsNotLoaded`, en vez de calcularlos sin las transacciones que faltan.
 
-El cierre, la liberación, una venta tardía y las operaciones de administración cargan el lote completo
+El cierre, la liberación, una venta o reversa tardía y las operaciones de administración cargan el lote completo
 (`FindByID`, `FindOpenByTerminal`). Si una transacción no se puede leer, por un tipo desconocido o un corte a
 mitad de la lectura, el lote no se carga.
 
@@ -887,7 +935,7 @@ el pool de Postgres.
 | `posnet_settlement_reversals_total` | Counter | — | Reversas procesadas; incluye duplicados que no agregan fila |
 | `posnet_settlement_batches_total` | Counter | `currency`, `state` | Cierres, por estado resultante: `CLOSED` o `DISPUTED`. Los cierres anteriores a esta versión figuran como `CLOSED` |
 | `posnet_settlement_batch_duration_seconds` | Histogram | — | Duración del cierre |
-| `posnet_settlement_submissions_total` | Counter | `result` | Envíos tras un cierre: `submitted`, `unavailable` o `error`. No incluye `resubmit` |
+| `posnet_settlement_submissions_total` | Counter | `result` | Envíos tras un cierre: `submitted`, `recovered` (ya aceptado antes: no se envió otra vez), `unavailable` o `error`. No incluye `resubmit` |
 | `posnet_settlement_batches_attention` | Gauge | `reason` | Lotes que requieren atención (ver abajo). Consulta la base en cada scrape |
 | `posnet_settlement_outbox_stuck` | Gauge | — | Eventos en el outbox desde hace más de 1 minuto |
 | `posnet_settlement_reversals_in_review` | Gauge | — | Revisiones de reversas abiertas desde hace más de 15 minutos, para dar tiempo a una compra demorada |
@@ -895,6 +943,7 @@ el pool de Postgres.
 | `posnet_settlement_batch_close_rejected_total` | Counter | `reason` | Cierres del terminal que no cerraron nada: rechazados por su `batch_date` (`future`, `too_old` o `not_reopened`) o sin un lote `OPEN` (`already_closed` o `no_batch`). Las series nacen en 0 |
 | `posnet_settlement_dead_letters` | Gauge | — | Eventos en la DLQ. Consulta NATS en cada scrape |
 | `posnet_settlement_late_sales_total` | Counter | `result` | Ventas agregadas a su lote en disputa después del cierre: `released`, `held` o `disputed` |
+| `posnet_settlement_late_reversals_total` | Counter | `result` | Lo mismo, para las reversas |
 
 También se exponen métricas del pool de Postgres y de mensajes NATS, incluida
 `posnet_nats_messages_failed_total{kind="exhausted"}` para los eventos que agotaron las entregas.
@@ -1049,7 +1098,6 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 |---|---|---|
 | Notification no muestra los ajustes | `batch-closed` y `settlement.completed` los informan aparte, pero Notification todavía no lee esos campos: el comercio ve el total sin la explicación | `nt_nats_subscriber.go` |
 | Sin especificación del procesador | Un ajuste viaja dentro del total del lote siguiente. El adaptador tiene el desglose en el lote (`Summary().AdjustmentAmount()` y las transacciones `ADJUSTMENT`), pero hasta conocer el formato no se sabe si hay que informarlos aparte | `ADJUSTMENT` |
-| La liberación se reintenta solo con el job | Con `SETTLEMENT_BATCH_CLOSE_HOUR=0`, una liberación fallida no se reintenta: el lote sigue `DISPUTED` hasta un `resolve-dispute` | `ReleaseHeldBatches` |
 
 ### Ciclo de vida del lote
 
@@ -1059,13 +1107,14 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | La confirmación de liquidación es manual | Un operador debe llamar a `settle`, sin una referencia del procesador | `SettleBatch` |
 | Nadie consume `settlement.completed` | El comercio no recibe el neto liquidado: Notification no se suscribe | `nt_nats_subscriber.go` |
 | Evento adicional por lotes tardíos | Un lote abierto después de la liquidación diaria genera otro evento con el total acumulado | `enqueueCompletedIfDone` |
-| El cierre automático no concilia | Los lotes se envían con los totales del backend, sin comparar con el terminal | `CloseStaleBatches` |
+| El cierre automático concilia solo tras un cierre sin lote | Si el terminal nunca pidió el cierre del día, el lote se envía con los totales del backend, sin comparar con el terminal | `CloseStaleBatches` |
 | `force-close` no concilia | El operador asume que los totales del backend son correctos | `ForceClose` |
-| Doble envío posible | Si el procesador acepta y falla el guardado o la auditoría, el lote queda `CLOSED`, y `resubmit` lo enviaría otra vez. En `resubmit` queda el log `accepted by processor but not saved` con el `confirmation_id` | `submitBatch`, `ResubmitBatch` |
+| Un envío sin resultado conocido se repite | Si el procesador falla, demora o se corta después de aceptar, el intento queda sin confirmación y el siguiente lo envía otra vez. No duplica solo si el procesador respeta `batch_id` como clave de idempotencia, lo que depende de su especificación | `sendToProcessor` |
+| Un lote retenido después de enviarse conserva la primera confirmación | Si una revisión lo retuvo mientras se enviaba y después cambian sus totales, el siguiente envío reusa la confirmación del anterior, con los totales viejos | `sendToProcessor` |
 | `resolve-dispute` no notifica | Si los totales cambian, Notification solo conoce los del primer cierre | `ResolveDispute` |
 | La auditoría no tiene API ni protección propia | Se consulta por SQL, y quien tenga acceso de escritura a la base puede modificarla | `batch_audit_log` |
 | `force-close`, `resubmit` y `settle` no piden motivo | Su auditoría queda sin `reason`. Exigirlo cambiaría el contrato de la API | `st_http_handler.go` |
-| Lotes vacíos en `CLOSED` | Los lotes vacíos que cierra el job quedan en `CLOSED` para siempre y aparecen en la API. No cuentan para las alertas | `autoCloseBatch` |
+| Lotes vacíos en `CLOSED` | Una venta que falla ya no deja su lote creado, pero un lote puede quedar vacío si una revisión excluye su única reversa. El job lo cierra y queda en `CLOSED` para siempre. No cuenta para las alertas | `autoCloseBatch` |
 
 ### Seguridad
 
@@ -1088,8 +1137,7 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | Los eventos publicados no llevan la traza | El Relay publica sin el contexto del pedido: la traza del cierre no continúa en Notification. Se correlaciona por `correlation_id` | `pkg/outbox` |
 | Una fila que no se puede publicar frena a las demás | El ciclo se revierte ante el primer fallo. Hoy solo ocurre si NATS o el stream no están disponibles | `pkg/outbox` |
 | El terminal no se entera de un cierre sin lote | Terminal Gateway ya respondió `202`. Settlement lo cuenta y, si el terminal informó ventas, alerta con `CierreSinLote`, pero responderle requiere un evento que Terminal Gateway consuma | `closeWithoutBatch` |
-| Los totales de un cierre sin lote no se guardan | Con `no_batch`, solo quedan en el log: las ventas que lleguen después abren un lote que el job cierra sin conciliar | `closeWithoutBatch` |
+| Los totales de un cierre sin lote que nunca se usan quedan guardados | Si no llega ninguna venta de ese día, la fila de `pending_terminal_closes` no se borra. No molesta, pero hay que limpiarla a mano | `pending_terminal_closes` |
 | La DLQ no se reprocesa sola | Al resolverse la causa, alguien tiene que llamar a `replay`. Sin eso, los eventos esperan en la DLQ con la alerta activa | `DeadLetterQueue` |
 | El reproceso de la DLQ no tiene auditoría propia | Quién reprocesó o descartó queda solo en los logs | `st_http_dead_letters.go` |
-| Una reversa tardía no vuelve a su lote cerrado | La venta tardía se agrega al lote en disputa; una reversa en la misma situación entra en el lote abierto, como cualquier reversa | `RegisterReversal` |
 | Sin migraciones automáticas | Los cambios de schema hay que aplicarlos a mano en las bases existentes | `pkg/pgutil/migrate.go` |

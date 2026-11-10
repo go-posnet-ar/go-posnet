@@ -151,3 +151,32 @@ CREATE TABLE IF NOT EXISTS settlement.maintenance_runs (
     completed_by TEXT        NOT NULL,
     details      TEXT
 );
+
+-- ─── batch_submissions (envíos al procesador) ───────────────────────────────────
+-- Migración 000011. Un intento se registra antes de llamar al procesador y la confirmación al
+-- recibirla: confirmation_id NULL es un intento sin resultado conocido.
+
+CREATE TABLE IF NOT EXISTS settlement.batch_submissions (
+    batch_id         UUID        PRIMARY KEY REFERENCES settlement.settlement_batches (id),
+    attempts         INT         NOT NULL,
+    first_attempt_at TIMESTAMPTZ NOT NULL,
+    last_attempt_at  TIMESTAMPTZ NOT NULL,
+    confirmation_id  TEXT,
+    confirmed_at     TIMESTAMPTZ
+);
+
+-- ─── pending_terminal_closes (cierres del terminal sin lote) ──────────────────────
+-- Migración 000012. Totales de un cierre sin ningún lote del día; los consume el cierre automático
+-- del lote que se forme después, o un cierre posterior del terminal.
+
+CREATE TABLE IF NOT EXISTS settlement.pending_terminal_closes (
+    terminal_id     UUID        NOT NULL,
+    batch_date      DATE        NOT NULL,
+    currency        CHAR(3)     NOT NULL,
+    terminal_count  INT         NOT NULL,
+    terminal_amount BIGINT      NOT NULL,
+    event_id        TEXT        NOT NULL,
+    requested_at    TIMESTAMPTZ NOT NULL,
+    received_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (terminal_id, batch_date, currency)
+);

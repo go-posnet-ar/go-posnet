@@ -48,7 +48,7 @@ func (f *fakeBatchRepo) FindOpenByTerminal(context.Context, domain.TerminalID, t
 	return nil, nil
 }
 
-func (f *fakeBatchRepo) FindOrCreateOpen(context.Context, domain.TerminalID, domain.MerchantID, time.Time, string) (*aggregate.SettlementBatch, error) {
+func (f *fakeBatchRepo) FindOrCreateOpenTx(context.Context, pgx.Tx, domain.TerminalID, domain.MerchantID, time.Time, string) (*aggregate.SettlementBatch, error) {
 	return nil, nil
 }
 

@@ -39,6 +39,7 @@ type Metrics struct {
 	submissions   metric.Int64Counter
 	closeRejected metric.Int64Counter
 	lateSales     metric.Int64Counter
+	lateReversals metric.Int64Counter
 }
 
 // Valores del label reason de posnet_settlement_batch_close_rejected_total.
@@ -65,6 +66,7 @@ const (
 	submissionSubmitted   = "submitted"
 	submissionUnavailable = "unavailable"
 	submissionError       = "error"
+	submissionRecovered   = "recovered" // Ya lo había aceptado un envío anterior: no se envió otra vez
 )
 
 const (
@@ -110,7 +112,7 @@ func NewMetrics() (*Metrics, error) {
 		return nil, err
 	}
 	submissions, err := m.Int64Counter("posnet_settlement_submissions",
-		metric.WithDescription("Intentos de envío al procesador tras un cierre, por result."))
+		metric.WithDescription("Intentos de envío al procesador tras un cierre, por result. recovered: un envío anterior ya lo había aceptado, y no se envió otra vez."))
 	if err != nil {
 		return nil, err
 	}
@@ -128,14 +130,25 @@ func NewMetrics() (*Metrics, error) {
 		return nil, err
 	}
 
+	lateReversals, err := m.Int64Counter("posnet_settlement_late_reversals",
+		metric.WithDescription("Reversas que llegaron después del cierre de su lote en disputa, que el terminal había contado, por result."),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// Las series nacen en 0: increase() no ve el primer incremento de una serie nueva, y una alerta
 	// sobre el primer rechazo no se dispararía.
 	ctx := context.Background()
 	for _, reason := range []string{closeRejectedFuture, closeRejectedTooOld, closeRejectedNotReopened, closeRejectedNoBatch, closeRejectedAlreadyClosed} {
 		closeRejected.Add(ctx, 0, metric.WithAttributes(attribute.String("reason", reason)))
 	}
+	for _, result := range []string{submissionSubmitted, submissionUnavailable, submissionError, submissionRecovered} {
+		submissions.Add(ctx, 0, metric.WithAttributes(attribute.String("result", result)))
+	}
 	for _, result := range []string{lateSaleReleased, lateSaleDisputed, lateSaleHeld} {
 		lateSales.Add(ctx, 0, metric.WithAttributes(attribute.String("result", result)))
+		lateReversals.Add(ctx, 0, metric.WithAttributes(attribute.String("result", result)))
 	}
 
 	return &Metrics{
@@ -146,7 +159,16 @@ func NewMetrics() (*Metrics, error) {
 		submissions:   submissions,
 		closeRejected: closeRejected,
 		lateSales:     lateSales,
+		lateReversals: lateReversals,
 	}, nil
+}
+
+// RecordLateReversal cuenta una reversa agregada a un lote en disputa después de su cierre. Nil-safe.
+func (m *Metrics) RecordLateReversal(ctx context.Context, result string) {
+	if m == nil {
+		return
+	}
+	m.lateReversals.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
 }
 
 // RecordLateSale cuenta una venta agregada a un lote en disputa después de su cierre. Nil-safe.
