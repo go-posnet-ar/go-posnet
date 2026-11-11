@@ -12,6 +12,10 @@ import (
 // El lote no se envió y permanece en CLOSED hasta que un operador lo reenvíe.
 var ErrProcessorUnavailable = errors.New("settlement processor unavailable")
 
+// ErrSubmissionRejected indica que el procesador rechazó el lote por su contenido. No se reintenta:
+// el mismo lote daría el mismo rechazo. El adaptador lo envuelve con el motivo.
+var ErrSubmissionRejected = errors.New("settlement processor rejected the batch")
+
 // EventPublisher arma los eventos del BC. No los publica: el handler los guarda en el
 // outbox, en la misma transacción que el batch, y el Relay los envía a JetStream.
 type EventPublisher interface {

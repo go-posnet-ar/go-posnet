@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -37,6 +38,32 @@ type AdminHandler struct {
 	releaser   BatchReleaser                // opcional; nil = cerrar una revisión no libera el lote
 
 	submissions repository.BatchSubmissions // opcional; nil = no registra los envíos y un reenvío puede duplicarlos
+
+	metrics       *Metrics // opcional; nil = no cuenta
+	requireReason bool     // force-close, resubmit y settle rechazan un pedido sin reason
+}
+
+// SetMetrics habilita las métricas de las operaciones de administración.
+func (h *AdminHandler) SetMetrics(m *Metrics) {
+	h.metrics = m
+}
+
+// RequireReason hace obligatorio el reason de force-close, resubmit y settle. Sin esto, un pedido
+// sin reason se acepta y se cuenta.
+func (h *AdminHandler) RequireReason(required bool) {
+	h.requireReason = required
+}
+
+// checkReason cuenta un pedido sin reason y, si es obligatorio, lo rechaza.
+func (h *AdminHandler) checkReason(ctx context.Context, action, reason string) error {
+	if strings.TrimSpace(reason) != "" {
+		return nil
+	}
+	h.metrics.RecordMissingReason(ctx, action)
+	if h.requireReason {
+		return pkgerrors.NewValidationError("reason cannot be empty for audit")
+	}
+	return nil
 }
 
 // SetBatchSubmissions registra los envíos al procesador: resubmit no envía otra vez un lote ya aceptado.
@@ -123,6 +150,9 @@ func (h *AdminHandler) ForceClose(ctx context.Context, cmd port.ForceCloseComman
 	if cmd.OperatorID == "" {
 		return pkgerrors.NewValidationError("operator_id cannot be empty for audit")
 	}
+	if err := h.checkReason(ctx, repository.AuditActionForceClose, cmd.Reason); err != nil {
+		return err
+	}
 
 	batch, err := h.batchRepo.FindByID(ctx, cmd.BatchID)
 	if err != nil {
@@ -138,11 +168,15 @@ func (h *AdminHandler) ForceClose(ctx context.Context, cmd port.ForceCloseComman
 		)
 	}
 	entry := repository.BatchAuditEntry{
-		Action: repository.AuditActionForceClose, OperatorID: cmd.OperatorID,
+		Action: repository.AuditActionForceClose, OperatorID: cmd.OperatorID, Reason: cmd.Reason,
 		FromState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
 	}
 	if err := batch.CloseWithBackendTotals(); err != nil {
 		return fmt.Errorf("ForceClose: close: %w", err)
+	}
+	// Sin transacciones no hay nada que enviar: queda VOID, como en los otros cierres.
+	if err := voidIfEmpty(batch); err != nil {
+		return fmt.Errorf("ForceClose: %w", err)
 	}
 	err = h.persist(ctx, batch, entry, func(tx pgx.Tx) error {
 		// Un lote vacío no tiene nada que informar, igual que en el cierre automático.
@@ -158,6 +192,7 @@ func (h *AdminHandler) ForceClose(ctx context.Context, cmd port.ForceCloseComman
 	observability.FromContext(ctx).Warn("batch force-closed by operator",
 		slog.String("batch_id", batch.ID()),
 		slog.String("operator_id", cmd.OperatorID),
+		slog.String("reason", cmd.Reason),
 		slog.Int("tx_count", len(batch.Transactions())),
 		slog.Int64("total_amount", batch.Summary().TotalAmount().Cents()),
 	)
@@ -179,6 +214,9 @@ func (h *AdminHandler) ResubmitBatch(ctx context.Context, cmd port.ResubmitBatch
 	if cmd.OperatorID == "" {
 		return pkgerrors.NewValidationError("operator_id cannot be empty for audit")
 	}
+	if err := h.checkReason(ctx, repository.AuditActionResubmit, cmd.Reason); err != nil {
+		return err
+	}
 
 	batch, err := h.batchRepo.FindByID(ctx, cmd.BatchID)
 	if err != nil {
@@ -196,7 +234,7 @@ func (h *AdminHandler) ResubmitBatch(ctx context.Context, cmd port.ResubmitBatch
 	// lo saca con ReopenBatch o ResolveDispute. Cubre los lotes de ForceClose y los
 	// que quedaron en CLOSED porque falló el guardado de DISPUTED durante el cierre.
 	entry := repository.BatchAuditEntry{
-		Action: repository.AuditActionResubmit, OperatorID: cmd.OperatorID,
+		Action: repository.AuditActionResubmit, OperatorID: cmd.OperatorID, Reason: cmd.Reason,
 		FromState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
 	}
 	openReviews, err := h.openReviews(ctx, batch.ID())
@@ -224,6 +262,14 @@ func (h *AdminHandler) ResubmitBatch(ctx context.Context, cmd port.ResubmitBatch
 	}
 
 	sent, err := sendToProcessor(ctx, h.processor, h.submissions, batch)
+	if errors.Is(err, repository.ErrSubmittedTotalsChanged) {
+		observability.FromContext(ctx).Error("resubmit refused — batch totals changed since it was sent to the processor",
+			slog.String("batch_id", batch.ID()),
+			slog.String("operator_id", cmd.OperatorID),
+			slog.String("error", err.Error()),
+		)
+		return fmt.Errorf("ResubmitBatch: %w", err)
+	}
 	if err != nil {
 		return fmt.Errorf("ResubmitBatch: processor submit: %w", err)
 	}
@@ -234,7 +280,7 @@ func (h *AdminHandler) ResubmitBatch(ctx context.Context, cmd port.ResubmitBatch
 	)
 	entry.ConfirmationID = sent.confirmationID
 	if sent.recovered {
-		entry.Reason = "already accepted by the processor in a previous submission: not sent again"
+		entry.Reason = joinReasons(cmd.Reason, "already accepted by the processor in a previous submission: not sent again")
 	}
 	if _, err := markSubmitted(ctx, h.batchRepo, batch, func(b *aggregate.SettlementBatch) error {
 		entry.FromState, entry.PreviousDiscrepancies = valueobject.BatchStateClosed.String(), b.Discrepancies()
@@ -353,6 +399,9 @@ func (h *AdminHandler) SettleBatch(ctx context.Context, cmd port.SettleBatchComm
 	if cmd.OperatorID == "" {
 		return pkgerrors.NewValidationError("operator_id cannot be empty for audit")
 	}
+	if err := h.checkReason(ctx, repository.AuditActionSettle, cmd.Reason); err != nil {
+		return err
+	}
 
 	batch, err := h.batchRepo.FindByID(ctx, cmd.BatchID)
 	if err != nil {
@@ -368,7 +417,7 @@ func (h *AdminHandler) SettleBatch(ctx context.Context, cmd port.SettleBatchComm
 	}
 
 	entry := repository.BatchAuditEntry{
-		Action: repository.AuditActionSettle, OperatorID: cmd.OperatorID,
+		Action: repository.AuditActionSettle, OperatorID: cmd.OperatorID, Reason: cmd.Reason,
 		FromState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
 	}
 	if err := batch.MarkSettled(); err != nil {
@@ -384,8 +433,17 @@ func (h *AdminHandler) SettleBatch(ctx context.Context, cmd port.SettleBatchComm
 	observability.FromContext(ctx).Info("batch settled by operator",
 		slog.String("batch_id", batch.ID()),
 		slog.String("operator_id", cmd.OperatorID),
+		slog.String("reason", cmd.Reason),
 	)
 	return nil
+}
+
+// joinReasons une el motivo del operador con el del sistema, si hay ambos.
+func joinReasons(operator, system string) string {
+	if strings.TrimSpace(operator) == "" {
+		return system
+	}
+	return operator + " — " + system
 }
 
 // enqueueCompletedIfDone encola SettlementCompleted si ya se liquidaron todos los

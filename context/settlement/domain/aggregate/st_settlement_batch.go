@@ -378,6 +378,24 @@ func (b *SettlementBatch) Submit() error {
 	return nil
 }
 
+// ErrBatchNotEmpty indica que se intentó anular un lote con transacciones.
+var ErrBatchNotEmpty = errors.New("batch has transactions")
+
+// Void cierra para siempre un lote CLOSED sin transacciones: no tiene nada que enviar ni liquidar.
+// Antes quedaba en CLOSED sin salida.
+func (b *SettlementBatch) Void() error {
+	if !b.txsLoaded {
+		return fmt.Errorf("settlement_batch %s: %w", b.id, ErrTransactionsNotLoaded)
+	}
+	if len(b.transactions) > 0 {
+		return fmt.Errorf("settlement_batch %s: cannot void: %w", b.id, ErrBatchNotEmpty)
+	}
+	return b.transition(valueobject.BatchStateVoid)
+}
+
+// IsEmpty indica que el lote se cargó con sus transacciones y no tiene ninguna.
+func (b *SettlementBatch) IsEmpty() bool { return b.txsLoaded && len(b.transactions) == 0 }
+
 // MarkSettled marca el lote como liquidado exitosamente.
 func (b *SettlementBatch) MarkSettled() error {
 	if b.summary == nil && b.state.CanTransitionTo(valueobject.BatchStateSettled) {

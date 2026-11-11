@@ -766,7 +766,9 @@ func TestCloseStaleBatches_NoProcessorKeepsClosed(t *testing.T) {
 	}
 }
 
-func TestCloseStaleBatches_EmptyBatchIsClosedSilently(t *testing.T) {
+// Un lote vacío queda VOID, el estado final de los lotes sin nada que enviar: en CLOSED quedaba
+// para siempre.
+func TestCloseStaleBatches_EmptyBatchIsVoided(t *testing.T) {
 	batch := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
 	repo := &fakeBatchRepo{staleIDs: []string{batch.ID()}, findByIDResult: batch}
 	pool := newMockPool(t)
@@ -781,8 +783,8 @@ func TestCloseStaleBatches_EmptyBatchIsClosedSilently(t *testing.T) {
 	if publisher.buildBatchClosedCalls != 0 || processor.calls != 0 {
 		t.Errorf("publish calls = %d, submit calls = %d, want 0, 0", publisher.buildBatchClosedCalls, processor.calls)
 	}
-	if got := repo.lastSaved().State(); got != valueobject.BatchStateClosed {
-		t.Errorf("State() = %v, want %v", got, valueobject.BatchStateClosed)
+	if got := repo.lastSaved().State(); got != valueobject.BatchStateVoid {
+		t.Errorf("State() = %v, want %v", got, valueobject.BatchStateVoid)
 	}
 }
 

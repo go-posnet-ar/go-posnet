@@ -35,12 +35,24 @@ type submission struct {
 //
 // Sin registro de envíos (submissions nil) envía siempre, como antes. Si no puede registrar el
 // intento, no envía: sin el registro, no habría forma de saber que ya se envió.
+//
+// Si un intento anterior se hizo con otros totales, no envía y devuelve
+// repository.ErrSubmittedTotalsChanged: el procesador puede tener aceptada la remesa anterior, y
+// reenviarla podría pagarse dos veces. Reusar su confirmación liquidaría totales que el procesador
+// no conoce.
 func sendToProcessor(ctx context.Context, p service.SettlementProcessor, submissions repository.BatchSubmissions, batch *aggregate.SettlementBatch) (submission, error) {
 	if p == nil {
 		return submission{}, service.ErrProcessorUnavailable
 	}
 	if submissions != nil {
-		previous, err := submissions.StartSubmission(ctx, batch.ID())
+		totals, err := submissionTotals(batch)
+		if err != nil {
+			return submission{}, err
+		}
+		previous, err := submissions.StartSubmission(ctx, batch.ID(), totals)
+		if errors.Is(err, repository.ErrSubmittedTotalsChanged) {
+			return submission{}, err
+		}
 		if err != nil {
 			return submission{}, fmt.Errorf("record submission attempt: %w", err)
 		}
@@ -56,6 +68,20 @@ func sendToProcessor(ctx context.Context, p service.SettlementProcessor, submiss
 		recordConfirmation(ctx, submissions, batch.ID(), confirmationID)
 	}
 	return submission{confirmationID: confirmationID}, nil
+}
+
+// submissionTotals son los totales que recibe el procesador.
+func submissionTotals(batch *aggregate.SettlementBatch) (repository.SubmissionTotals, error) {
+	summary := batch.Summary()
+	if summary == nil {
+		return repository.SubmissionTotals{}, fmt.Errorf("batch %s has no summary: it was not closed", batch.ID())
+	}
+	return repository.SubmissionTotals{
+		TotalCount:       summary.TotalCount(),
+		TotalAmount:      summary.TotalAmount().Cents(),
+		AdjustmentCount:  summary.AdjustmentCount(),
+		AdjustmentAmount: summary.AdjustmentAmount(),
+	}, nil
 }
 
 // recordConfirmation guarda la confirmación, con unos pocos reintentos. Si no puede, el lote se

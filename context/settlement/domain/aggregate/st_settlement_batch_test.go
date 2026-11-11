@@ -1,6 +1,7 @@
 package aggregate_test
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -646,5 +647,42 @@ func TestMarkPersisted_IncrementsVersion(t *testing.T) {
 	b.MarkPersisted()
 	if b.Version() != 1 {
 		t.Errorf("Version() = %d, want 1", b.Version())
+	}
+}
+
+// ─── Void ─────────────────────────────────────────────────────────────────────
+
+func TestVoid(t *testing.T) {
+	empty := newOpenBatch(t)
+	if err := empty.CloseWithBackendTotals(); err != nil {
+		t.Fatalf("CloseWithBackendTotals() error = %v", err)
+	}
+	if !empty.IsEmpty() {
+		t.Fatal("IsEmpty() = false, want true")
+	}
+	if err := empty.Void(); err != nil || empty.State() != valueobject.BatchStateVoid {
+		t.Fatalf("Void() = %v, state %s, want nil and VOID", err, empty.State())
+	}
+
+	withTx := newOpenBatch(t)
+	if err := withTx.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	if err := withTx.CloseWithBackendTotals(); err != nil {
+		t.Fatalf("CloseWithBackendTotals() error = %v", err)
+	}
+	if err := withTx.Void(); !errors.Is(err, aggregate.ErrBatchNotEmpty) {
+		t.Errorf("Void() error = %v, want ErrBatchNotEmpty", err)
+	}
+
+	// Un lote cargado sin sus transacciones no se puede saber si está vacío.
+	notLoaded := aggregate.Reconstitute(aggregate.ReconstituteParams{
+		ID: "b-1", State: valueobject.BatchStateClosed, Currency: "ARS", TransactionsNotLoaded: true,
+	})
+	if notLoaded.IsEmpty() {
+		t.Error("IsEmpty() = true for a batch without its transactions, want false")
+	}
+	if err := notLoaded.Void(); !errors.Is(err, aggregate.ErrTransactionsNotLoaded) {
+		t.Errorf("Void() error = %v, want ErrTransactionsNotLoaded", err)
 	}
 }

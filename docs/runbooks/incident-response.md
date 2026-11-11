@@ -98,6 +98,7 @@ verificar NATS por separado.
 | `LotesEnDisputa` | [Escenario A](batch-close-failure.md#escenario-a--lote-en-disputed) |
 | `LotesCerradosSinEnviar`, `EnvioAlProcesadorFallando` | [Escenario C](batch-close-failure.md#escenario-c--lote-en-closed-sin-enviar) |
 | `LotesAbiertosVencidos` | [Escenario F](batch-close-failure.md#escenario-f--lotes-abiertos-de-días-anteriores) |
+| `LoteConTotalesCambiados` | [Escenario J](batch-close-failure.md#escenario-j--lote-enviado-con-otros-totales). **No hacer `resubmit` a la fuerza:** el procesador puede tener la remesa anterior |
 | `GoroutineLeakSospechoso`, `HeapCreciente` | Dashboard de runtime. En Notification, revisar envíos a Terminal Gateway, que no tienen timeout |
 
 ---

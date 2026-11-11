@@ -650,6 +650,9 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 				return fmt.Errorf("mark disputed: %w", err)
 			}
 		}
+		if err := voidIfEmpty(batch); err != nil {
+			return err
+		}
 
 		return pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
 			inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
@@ -702,6 +705,10 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 			slog.String("batch_id", batch.ID()),
 			slog.Int("discrepancies", batch.Discrepancies()),
 		)
+		return nil
+	}
+	if batch.State() == valueobject.BatchStateVoid {
+		log.Info("empty batch closed as VOID — nothing to submit", slog.String("batch_id", batch.ID()))
 		return nil
 	}
 
@@ -805,6 +812,11 @@ func (h *BatchHandler) ReleaseHeldBatch(ctx context.Context, batchID string) err
 			batch = loaded
 			return nil
 		}
+		if rel {
+			if err := voidIfEmpty(loaded); err != nil {
+				return err
+			}
+		}
 		err = pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
 			if err := h.batchRepo.SaveTx(ctx, tx, loaded); err != nil {
 				return err
@@ -838,8 +850,9 @@ func (h *BatchHandler) ReleaseHeldBatch(ctx context.Context, batchID string) err
 		log.Warn("batch has no open reviews but still does not reconcile — stays DISPUTED", slog.Int("discrepancies", batch.Discrepancies()))
 		return nil
 	}
-	log.Warn("held batch released — no open reviews and it reconciles", slog.String("reconciled_with", batch.ReconciledWith()))
-	if len(batch.Transactions()) == 0 {
+	log.Warn("held batch released — no open reviews and it reconciles",
+		slog.String("reconciled_with", batch.ReconciledWith()), slog.String("state", batch.State().String()))
+	if batch.State() == valueobject.BatchStateVoid {
 		return nil
 	}
 	// Ya quedó CLOSED: si el envío falla, se reintenta con ResubmitBatch, como tras un cierre.
@@ -1106,6 +1119,9 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 			return false, fmt.Errorf("mark disputed: %w", err)
 		}
 	}
+	if err := voidIfEmpty(batch); err != nil {
+		return false, err
+	}
 
 	eventID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("settlement-auto-close:"+batchID+":"+runDate)).String()
 	processed := false
@@ -1163,8 +1179,9 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 		return true, nil
 	}
 
-	// Un lote vacío no tiene nada que enviar.
-	if len(batch.Transactions()) == 0 {
+	// Un lote vacío quedó VOID: no tiene nada que enviar.
+	if batch.State() == valueobject.BatchStateVoid {
+		log.Info("empty batch closed as VOID — nothing to submit")
 		return true, nil
 	}
 
@@ -1173,6 +1190,18 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 		log.Error("automatic batch submit failed", slog.String("error", err.Error()))
 	}
 	return true, nil
+}
+
+// voidIfEmpty anula un lote que quedó CLOSED sin transacciones, en el mismo guardado del cierre o
+// de la liberación: no tiene nada que enviar ni liquidar, y en CLOSED quedaba para siempre.
+func voidIfEmpty(batch *aggregate.SettlementBatch) error {
+	if batch.State() != valueobject.BatchStateClosed || !batch.IsEmpty() {
+		return nil
+	}
+	if err := batch.Void(); err != nil {
+		return fmt.Errorf("void empty batch: %w", err)
+	}
+	return nil
 }
 
 // submitBatch envía la remesa al procesador externo y, si acepta el envío,
@@ -1186,6 +1215,13 @@ func (h *BatchHandler) submitBatch(ctx context.Context, batch *aggregate.Settlem
 	if errors.Is(err, service.ErrProcessorUnavailable) {
 		h.metrics.RecordSubmission(ctx, submissionUnavailable)
 		log.Warn("no settlement processor configured — batch remains CLOSED")
+		return nil
+	}
+	// Como sin procesador, reintentar no cambia nada: queda CLOSED y lo informa la alerta.
+	if errors.Is(err, repository.ErrSubmittedTotalsChanged) {
+		h.metrics.RecordSubmission(ctx, submissionTotalsChanged)
+		log.Error("batch totals changed since it was sent to the processor — not sent again, batch remains CLOSED",
+			slog.String("error", err.Error()))
 		return nil
 	}
 	if err != nil {

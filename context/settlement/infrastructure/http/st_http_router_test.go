@@ -11,6 +11,7 @@ import (
 	"github.com/juantevez/go-posnet/context/settlement/application/query"
 	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
+	"github.com/juantevez/go-posnet/pkg/domain"
 	"github.com/juantevez/go-posnet/pkg/observability"
 )
 
@@ -180,6 +181,9 @@ func TestNewRouter_AdminAuth(t *testing.T) {
 
 func TestNewRouter_ValidTokenReachesHandler(t *testing.T) {
 	b := newBatch(t)
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
 	router := newRouterFor(&fakeBatchRepo{findByIDResult: b}, &fakePool{})
 
 	req := httptest.NewRequest(http.MethodPost, "/batches/"+b.ID()+"/force-close", strings.NewReader(`{"operator_id":"op-1"}`))

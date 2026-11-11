@@ -19,6 +19,16 @@ type BatchQueryHandler struct {
 	reviews         repository.ReversalReviewLog
 	timezones       repository.MerchantTimezones
 	defaultTimezone string
+	audit           repository.BatchAuditReader
+}
+
+// MaxListedAuditEntries acota la auditoría que devuelve la API para un lote. Un lote tiene pocos
+// registros: llegar al límite indica otra cosa, y la respuesta lo informa.
+const MaxListedAuditEntries = 500
+
+// ConfigureAudit habilita la consulta de la auditoría de los lotes.
+func (h *BatchQueryHandler) ConfigureAudit(audit repository.BatchAuditReader) {
+	h.audit = audit
 }
 
 // ConfigureReviews habilita la consulta de las revisiones de reversas.
@@ -188,4 +198,45 @@ func (h *BatchQueryHandler) MerchantTimezone(ctx context.Context, merchantID str
 		return &port.MerchantTimezoneResult{MerchantID: merchant.String(), Timezone: h.defaultTimezone, Source: "default"}, nil
 	}
 	return &port.MerchantTimezoneResult{MerchantID: merchant.String(), Timezone: name, Source: "merchant"}, nil
+}
+
+// GetBatchAudit devuelve la auditoría de un lote, del registro más viejo al más nuevo. truncated
+// indica que hay más registros que MaxListedAuditEntries.
+func (h *BatchQueryHandler) GetBatchAudit(ctx context.Context, batchID string) (entries []port.AuditEntryResult, truncated bool, err error) {
+	ctx, span := observability.StartSpan(ctx, "query.GetBatchAudit")
+	defer span.End()
+
+	if batchID == "" {
+		return nil, false, pkgerrors.NewValidationError("batch_id cannot be empty")
+	}
+	if h.audit == nil {
+		return nil, false, fmt.Errorf("GetBatchAudit: audit is not configured")
+	}
+	stored, err := h.audit.ListBatchAudit(ctx, batchID, MaxListedAuditEntries+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("GetBatchAudit: %w", err)
+	}
+	// Sin registros, el lote puede no existir: un 404 lo distingue de un lote sin cambios manuales.
+	if len(stored) == 0 {
+		batch, err := h.batchRepo.FindByID(ctx, batchID)
+		if err != nil {
+			return nil, false, fmt.Errorf("GetBatchAudit: find batch: %w", err)
+		}
+		if batch == nil {
+			return nil, false, pkgerrors.NewNotFoundError("SettlementBatch", batchID)
+		}
+	}
+	if len(stored) > MaxListedAuditEntries {
+		stored, truncated = stored[:MaxListedAuditEntries], true
+	}
+	entries = make([]port.AuditEntryResult, 0, len(stored))
+	for _, e := range stored {
+		entries = append(entries, port.AuditEntryResult{
+			ID: e.ID, Action: e.Action, OperatorID: e.OperatorID, Reason: e.Reason,
+			FromState: e.FromState, ToState: e.ToState, PreviousDiscrepancies: e.PreviousDiscrepancies,
+			TotalAmount: e.TotalAmount, ConfirmationID: e.ConfirmationID,
+			CreatedAt: e.CreatedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return entries, truncated, nil
 }

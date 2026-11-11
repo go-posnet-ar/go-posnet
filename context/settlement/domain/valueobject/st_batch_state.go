@@ -14,12 +14,15 @@ const (
 	BatchStateSubmitted    BatchState = "SUBMITTED"     // Enviado al procesador externo
 	BatchStateSettled      BatchState = "SETTLED"       // Liquidado — fondos transferidos
 	BatchStateDisputed     BatchState = "DISPUTED"      // En disputa — discrepancias detectadas
+	// BatchStateVoid es un lote cerrado sin transacciones: no hay nada que enviar ni liquidar.
+	// Queda así cuando una revisión excluye su única reversa, o lo crea una reversa de otro día.
+	BatchStateVoid BatchState = "VOID"
 )
 
 // IsTerminal indica si el estado es final. DISPUTED no lo es: un operador puede
 // reabrir el lote o aceptar los totales del backend (ver AdminHandler).
 func (s BatchState) IsTerminal() bool {
-	return s == BatchStateSettled
+	return s == BatchStateSettled || s == BatchStateVoid
 }
 
 // CanTransitionTo valida si la transición al nuevo estado es válida.
@@ -27,7 +30,7 @@ func (s BatchState) CanTransitionTo(next BatchState) bool {
 	allowed := map[BatchState][]BatchState{
 		BatchStateOpen:         {BatchStatePendingClose},
 		BatchStatePendingClose: {BatchStateClosed, BatchStateDisputed},
-		BatchStateClosed:       {BatchStateSubmitted, BatchStateDisputed}, // Close() detecta discrepancias y marca disputa de inmediato
+		BatchStateClosed:       {BatchStateSubmitted, BatchStateDisputed, BatchStateVoid}, // Close() detecta discrepancias y marca disputa de inmediato; Void() si está vacío
 		BatchStateSubmitted:    {BatchStateSettled, BatchStateDisputed},
 		BatchStateDisputed:     {BatchStateSubmitted, BatchStateOpen, BatchStateClosed}, // Reopen / ResolveDispute
 	}
@@ -44,7 +47,7 @@ func (s BatchState) String() string { return string(s) }
 func ParseBatchState(s string) (BatchState, error) {
 	switch BatchState(s) {
 	case BatchStateOpen, BatchStatePendingClose, BatchStateClosed,
-		BatchStateSubmitted, BatchStateSettled, BatchStateDisputed:
+		BatchStateSubmitted, BatchStateSettled, BatchStateDisputed, BatchStateVoid:
 		return BatchState(s), nil
 	}
 	return "", fmt.Errorf("unknown batch state %q", s)

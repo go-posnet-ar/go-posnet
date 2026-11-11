@@ -29,6 +29,7 @@ import (
 //	posnet_settlement_reversal_recovery_pending → posnet_settlement_reversal_recovery_pending
 //	posnet_settlement_dead_letters → posnet_settlement_dead_letters
 //	posnet_settlement_late_sales → posnet_settlement_late_sales_total{result}
+//	posnet_settlement_admin_missing_reason → posnet_settlement_admin_missing_reason_total{action}
 //
 // El label "bc" lo inyecta Prometheus como target label (prometheus.yml).
 type Metrics struct {
@@ -40,6 +41,7 @@ type Metrics struct {
 	closeRejected metric.Int64Counter
 	lateSales     metric.Int64Counter
 	lateReversals metric.Int64Counter
+	missingReason metric.Int64Counter
 }
 
 // Valores del label reason de posnet_settlement_batch_close_rejected_total.
@@ -67,6 +69,8 @@ const (
 	submissionUnavailable = "unavailable"
 	submissionError       = "error"
 	submissionRecovered   = "recovered" // Ya lo había aceptado un envío anterior: no se envió otra vez
+	// submissionTotalsChanged: un envío anterior se hizo con otros totales. No se envió: queda CLOSED.
+	submissionTotalsChanged = "totals_changed"
 )
 
 const (
@@ -137,13 +141,20 @@ func NewMetrics() (*Metrics, error) {
 		return nil, err
 	}
 
+	missingReason, err := m.Int64Counter("posnet_settlement_admin_missing_reason",
+		metric.WithDescription("Operaciones de force-close, resubmit o settle pedidas sin reason, por action. Con SETTLEMENT_REQUIRE_REASON=true se rechazan."),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// Las series nacen en 0: increase() no ve el primer incremento de una serie nueva, y una alerta
 	// sobre el primer rechazo no se dispararía.
 	ctx := context.Background()
 	for _, reason := range []string{closeRejectedFuture, closeRejectedTooOld, closeRejectedNotReopened, closeRejectedNoBatch, closeRejectedAlreadyClosed} {
 		closeRejected.Add(ctx, 0, metric.WithAttributes(attribute.String("reason", reason)))
 	}
-	for _, result := range []string{submissionSubmitted, submissionUnavailable, submissionError, submissionRecovered} {
+	for _, result := range []string{submissionSubmitted, submissionUnavailable, submissionError, submissionRecovered, submissionTotalsChanged} {
 		submissions.Add(ctx, 0, metric.WithAttributes(attribute.String("result", result)))
 	}
 	for _, result := range []string{lateSaleReleased, lateSaleDisputed, lateSaleHeld} {
@@ -151,7 +162,12 @@ func NewMetrics() (*Metrics, error) {
 		lateReversals.Add(ctx, 0, metric.WithAttributes(attribute.String("result", result)))
 	}
 
+	for _, action := range []string{repository.AuditActionForceClose, repository.AuditActionResubmit, repository.AuditActionSettle} {
+		missingReason.Add(ctx, 0, metric.WithAttributes(attribute.String("action", action)))
+	}
+
 	return &Metrics{
+		missingReason: missingReason,
 		authApproved:  authApproved,
 		reversals:     reversals,
 		batches:       batches,
@@ -185,6 +201,14 @@ func (m *Metrics) RecordSubmission(ctx context.Context, result string) {
 		return
 	}
 	m.submissions.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
+}
+
+// RecordMissingReason cuenta una operación de administración pedida sin reason. Nil-safe.
+func (m *Metrics) RecordMissingReason(ctx context.Context, action string) {
+	if m == nil {
+		return
+	}
+	m.missingReason.Add(ctx, 1, metric.WithAttributes(attribute.String("action", action)))
 }
 
 // RecordCloseRejected cuenta un pedido de cierre rechazado por su batch_date. Nil-safe.
@@ -231,7 +255,7 @@ func (m *Metrics) RecordBatchClosed(ctx context.Context, currency, state string,
 func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *time.Location, closeGrace time.Duration) error {
 	gauge, err := observability.Meter("posnet.settlement").Int64ObservableGauge(
 		"posnet_settlement_batches_attention",
-		metric.WithDescription("Lotes que requieren atención, por reason: disputed, closed_unsent u open_overdue."),
+		metric.WithDescription("Lotes que requieren atención, por reason: disputed, closed_unsent, open_overdue o totals_changed."),
 	)
 	if err != nil {
 		return err
@@ -274,6 +298,7 @@ func RegisterBatchAttentionGauge(counter repository.BatchAttentionCounter, loc *
 			observe("disputed", counts.Disputed)
 			observe("closed_unsent", counts.ClosedUnsent)
 			observe("open_overdue", counts.OpenOverdue)
+			observe("totals_changed", counts.TotalsChanged)
 			o.ObserveInt64(outboxGauge, counts.OutboxStuck)
 			o.ObserveInt64(reviewGauge, counts.ReversalsInReview)
 			var pending int64

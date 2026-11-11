@@ -98,6 +98,9 @@ func TestForceClose_SaveError(t *testing.T) {
 
 func TestForceClose_Success(t *testing.T) {
 	b := newOpenBatch(t, domain.NewTerminalID(), domain.NewMerchantID())
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
 	repo := &fakeBatchRepo{findByIDResult: b}
 	h := command.NewAdminHandler(repo, &fakeProcessor{})
 
@@ -121,6 +124,16 @@ func TestForceClose_Success(t *testing.T) {
 
 func newClosedBatch(t *testing.T) *aggregate.SettlementBatch {
 	t.Helper()
+	// Un lote CLOSED siempre tiene totales: los calcula el cierre. Sin ellos no se envía.
+	ars, _ := domain.ParseCurrency("ARS")
+	amount, err := domain.NewMoney(1000, ars)
+	if err != nil {
+		t.Fatalf("NewMoney() error = %v", err)
+	}
+	summary, err := valueobject.NewBatchSummary(1, amount, 1, amount, 0, domain.Money{})
+	if err != nil {
+		t.Fatalf("NewBatchSummary() error = %v", err)
+	}
 	return aggregate.Reconstitute(aggregate.ReconstituteParams{
 		ID:         "batch-1",
 		TerminalID: domain.NewTerminalID(),
@@ -129,6 +142,7 @@ func newClosedBatch(t *testing.T) *aggregate.SettlementBatch {
 		State:      valueobject.BatchStateClosed,
 		Currency:   "ARS",
 		CreatedAt:  time.Now(),
+		Summary:    &summary,
 	})
 }
 
@@ -429,6 +443,10 @@ func TestForceClose_EmptyBatchEnqueuesNothing(t *testing.T) {
 	}
 	if publisher.buildBatchClosedCalls != 0 {
 		t.Errorf("BuildBatchClosed calls = %d, want 0", publisher.buildBatchClosedCalls)
+	}
+	// Sin transacciones no hay nada que enviar: queda VOID, como en los otros cierres.
+	if b.State() != valueobject.BatchStateVoid {
+		t.Errorf("State() = %v, want %v", b.State(), valueobject.BatchStateVoid)
 	}
 }
 

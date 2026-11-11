@@ -20,11 +20,25 @@ type fakeSubmissions struct {
 	confirmErr error
 	starts     int
 	confirmed  []string
+	// sent son los totales del primer intento. Un intento con otros totales devuelve
+	// SubmittedTotalsChangedError, como la base.
+	sent   *repository.SubmissionTotals
+	totals []repository.SubmissionTotals
 }
 
-func (f *fakeSubmissions) StartSubmission(context.Context, string) (string, error) {
+func (f *fakeSubmissions) StartSubmission(_ context.Context, _ string, totals repository.SubmissionTotals) (string, error) {
+	f.totals = append(f.totals, totals)
+	if f.startErr != nil {
+		return "", f.startErr
+	}
+	if f.sent != nil && *f.sent != totals {
+		return "", &repository.SubmittedTotalsChangedError{Sent: *f.sent, Current: totals, ConfirmationID: f.previous}
+	}
 	f.starts++
-	return f.previous, f.startErr
+	if f.sent == nil {
+		f.sent = &totals
+	}
+	return f.previous, nil
 }
 
 func (f *fakeSubmissions) ConfirmSubmission(_ context.Context, _ string, confirmationID string) error {
@@ -166,5 +180,45 @@ func TestResubmit_StaleSaveAfterSubmitReloads(t *testing.T) {
 				t.Errorf("saves = %d, want %d", repo.saves, tc.wantSaves)
 			}
 		})
+	}
+}
+
+// El caso de la brecha: el procesador aceptó el lote con unos totales, una revisión lo retuvo y los
+// totales cambiaron. No se reenvía ni se marca SUBMITTED con la confirmación anterior.
+func TestResubmit_TotalsChangedSinceSentIsRefused(t *testing.T) {
+	repo := &fakeBatchRepo{findByIDResult: newClosedBatch(t)}
+	processor := &fakeProcessor{confirmationID: "conf-2"}
+	subs := &fakeSubmissions{previous: "conf-1", sent: &repository.SubmissionTotals{TotalCount: 99, TotalAmount: 1}}
+
+	err := resubmit(t, repo, processor, subs)
+	if !errors.Is(err, repository.ErrSubmittedTotalsChanged) {
+		t.Fatalf("ResubmitBatch() error = %v, want ErrSubmittedTotalsChanged", err)
+	}
+	var detail *repository.SubmittedTotalsChangedError
+	if !errors.As(err, &detail) || detail.ConfirmationID != "conf-1" || detail.Sent.TotalCount != 99 {
+		t.Errorf("detail = %+v, want the previous submission", detail)
+	}
+	if processor.calls != 0 || repo.saveCallCount != 0 {
+		t.Errorf("calls = %d, saves = %d, want 0 and 0", processor.calls, repo.saveCallCount)
+	}
+}
+
+// Los totales que se registran son los del lote: los que recibe el procesador.
+func TestResubmit_RecordsTheBatchTotals(t *testing.T) {
+	batch := newClosedBatch(t)
+	repo := &fakeBatchRepo{findByIDResult: batch}
+	subs := &fakeSubmissions{}
+
+	if err := resubmit(t, repo, &fakeProcessor{confirmationID: "conf-1"}, subs); err != nil {
+		t.Fatalf("ResubmitBatch() error = %v", err)
+	}
+	want := repository.SubmissionTotals{
+		TotalCount:       batch.Summary().TotalCount(),
+		TotalAmount:      batch.Summary().TotalAmount().Cents(),
+		AdjustmentCount:  batch.Summary().AdjustmentCount(),
+		AdjustmentAmount: batch.Summary().AdjustmentAmount(),
+	}
+	if len(subs.totals) != 1 || subs.totals[0] != want {
+		t.Errorf("totals = %+v, want [%+v]", subs.totals, want)
 	}
 }

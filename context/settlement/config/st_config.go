@@ -66,11 +66,11 @@ type SettlementConfig struct {
 	// El job revisa cada 15 minutos todo el día. La alerta de lotes vencidos usa el mismo plazo.
 	BatchCloseGrace time.Duration
 
-	// SubmitRetries es la cantidad de reintentos al enviar el archivo de remesa
-	// al procesador externo antes de marcar el batch como DISPUTED.
+	// SubmitRetries es la cantidad de reintentos de un envío al procesador que falla, además del
+	// primer intento. Si se agotan, el lote queda CLOSED para un resubmit.
 	SubmitRetries int
 
-	// SubmitTimeout es el timeout para la llamada al procesador externo.
+	// SubmitTimeout es el plazo de cada intento de envío al procesador. 0 = sin plazo.
 	SubmitTimeout time.Duration
 
 	// Processor selecciona el procesador externo: ProcessorNone o ProcessorMock.
@@ -91,6 +91,11 @@ type SettlementConfig struct {
 	// AdminTokensFile es el archivo con los tokens nombrados: nombre, rol, SHA-256 y
 	// vencimiento. Se relee sin reiniciar. Sin esto ni AdminAPIKey, la API queda deshabilitada.
 	AdminTokensFile string
+
+	// RequireReason exige reason en force-close, resubmit y settle. Sin esto, un pedido sin
+	// reason se acepta y se cuenta en posnet_settlement_admin_missing_reason_total: es la etapa
+	// de transición para que quienes usan la API lo empiecen a enviar.
+	RequireReason bool
 
 	// TrustedProxies son los CIDR, separados por coma, cuyo X-Forwarded-For se acepta.
 	TrustedProxies string
@@ -170,6 +175,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.Settlement.BatchCloseGrace = grace
+
+	requireReason, err := strictBool("SETTLEMENT_REQUIRE_REASON", false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Settlement.RequireReason = requireReason
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -287,6 +298,21 @@ func strictDuration(key string, defaultVal time.Duration) (time.Duration, error)
 		return 0, fmt.Errorf("config: %s %q is not a duration (e.g. 30m): %w", key, v, err)
 	}
 	return d, nil
+}
+
+// strictBool lee true o false y falla con cualquier otro valor: un error de tipeo no puede
+// desactivar en silencio una exigencia.
+func strictBool(key string, defaultVal bool) (bool, error) {
+	switch v := os.Getenv(key); v {
+	case "":
+		return defaultVal, nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("config: %s %q must be true or false", key, v)
+	}
 }
 
 func envDuration(key string, defaultVal time.Duration) time.Duration {

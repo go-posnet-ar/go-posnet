@@ -4,6 +4,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -81,6 +82,7 @@ const (
 	AuditActionAdjustment      = "ADJUSTMENT"    // El lote recibió la corrección de un lote ya enviado
 	AuditActionLateSale        = "LATE_SALE"     // Llegó tarde una venta que el terminal había contado al cerrar
 	AuditActionLateReversal    = "LATE_REVERSAL" // Llegó tarde una reversa que el terminal había contado al cerrar
+	AuditActionVoid            = "VOID"          // Lote CLOSED sin transacciones, anulado por la migración 000014
 
 	AuditActionReviewAccept            = "REVIEW_ACCEPT"
 	AuditActionReviewUsePurchaseAmount = "REVIEW_USE_PURCHASE_AMOUNT"
@@ -105,6 +107,19 @@ type BatchAuditEntry struct {
 // el cambio: sin registro, el cambio no se confirma.
 type BatchAuditLog interface {
 	InsertAuditTx(ctx context.Context, tx pgx.Tx, entry BatchAuditEntry) error
+}
+
+// StoredAuditEntry es un registro de auditoría guardado.
+type StoredAuditEntry struct {
+	BatchAuditEntry
+	ID        string
+	CreatedAt time.Time
+}
+
+// BatchAuditReader lee la auditoría de un lote. Es un puerto aparte porque solo lo usa la API.
+type BatchAuditReader interface {
+	// ListBatchAudit devuelve los registros del lote, del más viejo al más nuevo, hasta limit.
+	ListBatchAudit(ctx context.Context, batchID string, limit int) ([]StoredAuditEntry, error)
 }
 
 // BatchReopens informa si un operador reabrió un lote: es lo que permite que un terminal lo
@@ -150,12 +165,46 @@ type PendingTerminalCloses interface {
 	DeletePendingCloseTx(ctx context.Context, tx pgx.Tx, terminalID domain.TerminalID, date time.Time, currency string) error
 }
 
+// SubmissionTotals son los totales con los que se envía un lote: los que el procesador recibe.
+type SubmissionTotals struct {
+	TotalCount       int
+	TotalAmount      int64 // Centavos, con los ajustes
+	AdjustmentCount  int
+	AdjustmentAmount int64 // Centavos, con signo
+}
+
+// ErrSubmittedTotalsChanged indica que el lote ya se envió con otros totales. No se envía otra vez:
+// el procesador podría tener la remesa anterior aceptada, y un segundo envío podría pagarse dos
+// veces. El lote queda retenido hasta que un operador lo resuelva con el procesador.
+var ErrSubmittedTotalsChanged = errors.New("batch totals changed since it was sent to the processor")
+
+// SubmittedTotalsChangedError detalla ErrSubmittedTotalsChanged.
+type SubmittedTotalsChangedError struct {
+	Sent           SubmissionTotals
+	Current        SubmissionTotals
+	ConfirmationID string // Vacío si el envío anterior no tiene resultado conocido
+}
+
+func (e *SubmittedTotalsChangedError) Error() string {
+	return fmt.Sprintf("%s: sent count=%d amount=%d adjustments=%d/%d, now count=%d amount=%d adjustments=%d/%d",
+		ErrSubmittedTotalsChanged.Error(),
+		e.Sent.TotalCount, e.Sent.TotalAmount, e.Sent.AdjustmentCount, e.Sent.AdjustmentAmount,
+		e.Current.TotalCount, e.Current.TotalAmount, e.Current.AdjustmentCount, e.Current.AdjustmentAmount,
+	)
+}
+
+func (e *SubmittedTotalsChangedError) Unwrap() error { return ErrSubmittedTotalsChanged }
+
 // BatchSubmissions registra los envíos al procesador aparte del lote, para no enviar dos veces uno
 // que el procesador ya aceptó: si falla guardar el lote en SUBMITTED, la confirmación queda.
 type BatchSubmissions interface {
 	// StartSubmission registra un intento de envío, confirmado antes de llamar al procesador.
 	// Devuelve la confirmación de un envío anterior aceptado, o vacío si no hay ninguno.
-	StartSubmission(ctx context.Context, batchID string) (confirmationID string, err error)
+	//
+	// El primer intento guarda los totales. Si un intento anterior, con o sin confirmación, se hizo
+	// con otros totales, no registra nada y devuelve *SubmittedTotalsChangedError: el procesador
+	// puede tener aceptado el envío anterior.
+	StartSubmission(ctx context.Context, batchID string, totals SubmissionTotals) (confirmationID string, err error)
 
 	// ConfirmSubmission guarda la confirmación del procesador. No reemplaza una anterior.
 	ConfirmSubmission(ctx context.Context, batchID, confirmationID string) error
@@ -313,6 +362,7 @@ var ErrOpenBatchConflict = errors.New("an open batch already exists for the new 
 type BatchAttentionCounts struct {
 	Disputed          int64 // En DISPUTED
 	ClosedUnsent      int64 // En CLOSED, con transacciones, desde antes del corte
+	TotalsChanged     int64 // En CLOSED, enviados antes con otros totales: no se reenvían solos
 	OpenOverdue       int64 // En OPEN, de un día de negocio anterior
 	OutboxStuck       int64 // Eventos en el outbox desde antes del corte
 	ReversalsInReview int64 // Revisiones de reversas abiertas desde antes del corte

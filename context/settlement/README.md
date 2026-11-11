@@ -99,7 +99,8 @@ config/
 | `SETTLEMENT_BUSINESS_TIMEZONE` | `America/Argentina/Buenos_Aires` | Zona horaria del día de negocio |
 | `SETTLEMENT_ADMIN_API_KEY` | — | Token de las operaciones de escritura (mínimo 32 caracteres). Vacío, quedan deshabilitadas |
 | `SETTLEMENT_SUBMIT_RETRIES` | `3` | Reintentos de envío al procesador |
-| `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | Timeout de envío |
+| `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | Plazo de cada intento de envío; `0` no pone plazo |
+| `SETTLEMENT_REQUIRE_REASON` | `false` | Con `true`, `force-close`, `resubmit` y `settle` exigen `reason` |
 
 ## Correr localmente
 

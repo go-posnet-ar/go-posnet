@@ -41,12 +41,14 @@ type ProcessBatchCloseCommand struct {
 type ForceCloseCommand struct {
 	BatchID    string
 	OperatorID string // Para auditoría
+	Reason     string // Opcional, salvo con SETTLEMENT_REQUIRE_REASON=true
 }
 
 // ResubmitBatchCommand reintenta el envío al procesador de un batch CLOSED.
 type ResubmitBatchCommand struct {
 	BatchID    string
 	OperatorID string // Para auditoría
+	Reason     string // Opcional, salvo con SETTLEMENT_REQUIRE_REASON=true
 }
 
 // ReopenBatchCommand devuelve un batch en disputa a OPEN.
@@ -67,6 +69,7 @@ type ResolveDisputeCommand struct {
 type SettleBatchCommand struct {
 	BatchID    string
 	OperatorID string // Para auditoría
+	Reason     string // Opcional, salvo con SETTLEMENT_REQUIRE_REASON=true
 }
 
 // ResolveReversalReviewCommand cierra la revisión de una reversa.
@@ -109,6 +112,20 @@ type BatchResult struct {
 	ClosedAt         string
 	SubmittedAt      string
 	SettledAt        string
+}
+
+// AuditEntryResult es un registro de la auditoría de un lote.
+type AuditEntryResult struct {
+	ID                    string `json:"id"`
+	Action                string `json:"action"`
+	OperatorID            string `json:"operator_id"`
+	Reason                string `json:"reason,omitempty"`
+	FromState             string `json:"from_state"`
+	ToState               string `json:"to_state"`
+	PreviousDiscrepancies int    `json:"previous_discrepancies"`
+	TotalAmount           *int64 `json:"total_amount"`
+	ConfirmationID        string `json:"confirmation_id,omitempty"`
+	CreatedAt             string `json:"created_at"`
 }
 
 // ReversalReviewResult es una revisión abierta de una reversa.

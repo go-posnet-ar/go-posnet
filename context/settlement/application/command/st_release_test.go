@@ -338,3 +338,52 @@ func TestReleaseHeldBatches_ListError(t *testing.T) {
 		t.Fatal("ReleaseHeldBatches() error = nil, want error")
 	}
 }
+
+// El caso de la brecha: el procesador aceptó el lote, una revisión lo retuvo mientras se enviaba y
+// sus totales cambiaron. Al liberarse, queda CLOSED: no se reenvía ni se marca SUBMITTED con la
+// confirmación anterior.
+func TestReleaseHeldBatch_SentWithOtherTotalsStaysClosed(t *testing.T) {
+	held := heldBatch(t, valueobject.BatchStateDisputed, aggregate.ReconciledWithBackend, 0, 0)
+	pool := newMockPool(t)
+	expectReleaseTx(pool)
+	repo := &fakeBatchRepo{findByIDResult: held}
+	processor := &fakeProcessor{confirmationID: "conf-2"}
+	h := newHandler(pool, repo, &fakePublisher{}, processor)
+	h.SetReversalReviews(&fakeReviews{})
+	h.SetAuditLog(repo)
+	h.SetBatchSubmissions(&fakeSubmissions{previous: "conf-1", sent: &repository.SubmissionTotals{TotalCount: 2, TotalAmount: 500}})
+
+	if err := h.ReleaseHeldBatch(context.Background(), "b-1"); err != nil {
+		t.Fatalf("ReleaseHeldBatch() error = %v", err)
+	}
+	if held.State() != valueobject.BatchStateClosed || processor.calls != 0 {
+		t.Errorf("state = %s, processor calls = %d, want CLOSED and 0", held.State(), processor.calls)
+	}
+}
+
+// Una revisión que excluye la única reversa deja el lote vacío: al liberarse queda VOID, sin
+// enviarse, y la auditoría lo dice.
+func TestReleaseHeldBatch_EmptyBatchIsVoided(t *testing.T) {
+	empty := aggregate.Reconstitute(aggregate.ReconstituteParams{
+		ID: "b-1", TerminalID: domain.NewTerminalID(), MerchantID: domain.NewMerchantID(),
+		BatchDate: time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC), State: valueobject.BatchStateDisputed, Currency: "ARS",
+		CreatedAt: time.Now(), ReconciledWith: aggregate.ReconciledWithBackend,
+	})
+	pool := newMockPool(t)
+	expectReleaseTx(pool)
+	repo := &fakeBatchRepo{findByIDResult: empty}
+	processor := &fakeProcessor{confirmationID: "conf-1"}
+	h := newHandler(pool, repo, &fakePublisher{}, processor)
+	h.SetReversalReviews(&fakeReviews{})
+	h.SetAuditLog(repo)
+
+	if err := h.ReleaseHeldBatch(context.Background(), "b-1"); err != nil {
+		t.Fatalf("ReleaseHeldBatch() error = %v", err)
+	}
+	if empty.State() != valueobject.BatchStateVoid || processor.calls != 0 {
+		t.Errorf("state = %s, processor calls = %d, want VOID and 0", empty.State(), processor.calls)
+	}
+	if len(repo.auditEntries) != 1 || repo.auditEntries[0].ToState != "VOID" {
+		t.Errorf("audit = %+v, want an AUTO_RELEASE entry to VOID", repo.auditEntries)
+	}
+}

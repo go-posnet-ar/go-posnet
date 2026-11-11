@@ -19,6 +19,7 @@ func TestBatchState_IsTerminal(t *testing.T) {
 		{valueobject.BatchStateSubmitted, false},
 		{valueobject.BatchStateSettled, true},
 		{valueobject.BatchStateDisputed, false},
+		{valueobject.BatchStateVoid, true},
 	}
 
 	for _, tc := range tests {
@@ -33,7 +34,7 @@ func TestBatchState_IsTerminal(t *testing.T) {
 // ─── BatchState.CanTransitionTo ───────────────────────────────────────────────
 
 // allowedTransitions refleja la matriz esperada de transiciones válidas.
-// Se usa para probar exhaustivamente las 6x6 combinaciones posibles.
+// Se usa para probar exhaustivamente las 7x7 combinaciones posibles.
 var allowedTransitions = map[valueobject.BatchState]map[valueobject.BatchState]bool{
 	valueobject.BatchStateOpen: {
 		valueobject.BatchStatePendingClose: true,
@@ -45,6 +46,7 @@ var allowedTransitions = map[valueobject.BatchState]map[valueobject.BatchState]b
 	valueobject.BatchStateClosed: {
 		valueobject.BatchStateSubmitted: true,
 		valueobject.BatchStateDisputed:  true,
+		valueobject.BatchStateVoid:      true,
 	},
 	valueobject.BatchStateSubmitted: {
 		valueobject.BatchStateSettled:  true,
@@ -56,6 +58,7 @@ var allowedTransitions = map[valueobject.BatchState]map[valueobject.BatchState]b
 		valueobject.BatchStateClosed:    true,
 	},
 	valueobject.BatchStateSettled: {},
+	valueobject.BatchStateVoid:    {},
 }
 
 func TestBatchState_CanTransitionTo_Matrix(t *testing.T) {
@@ -66,6 +69,7 @@ func TestBatchState_CanTransitionTo_Matrix(t *testing.T) {
 		valueobject.BatchStateSubmitted,
 		valueobject.BatchStateSettled,
 		valueobject.BatchStateDisputed,
+		valueobject.BatchStateVoid,
 	}
 
 	for _, from := range allStates {
@@ -110,6 +114,7 @@ func TestParseBatchState(t *testing.T) {
 		{"SUBMITTED", valueobject.BatchStateSubmitted, false},
 		{"SETTLED", valueobject.BatchStateSettled, false},
 		{"DISPUTED", valueobject.BatchStateDisputed, false},
+		{"VOID", valueobject.BatchStateVoid, false},
 		{"open", "", true},
 		{"", "", true},
 		{"UNKNOWN", "", true},

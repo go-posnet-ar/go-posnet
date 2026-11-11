@@ -31,7 +31,7 @@ export AUTH="Authorization: Bearer <token>"
 falta aplicar las [migraciones](../technical/SETTLEMENT.md#aplicar-la-migración). `/readyz` lo confirma: responde `503`
 con `database schema incomplete`, y Docker muestra el contenedor `unhealthy`.
 
-Revisado contra el código el 2026-11-10. Detalle técnico en
+Revisado contra el código el 2026-11-11. Detalle técnico en
 [SETTLEMENT.md](../technical/SETTLEMENT.md). Puerto HTTP en Docker Compose: `8084`.
 
 | Síntoma | Escenario |
@@ -44,6 +44,7 @@ Revisado contra el código el 2026-11-10. Detalle técnico en
 | Lote `OPEN` de días anteriores | [F](#escenario-f--lotes-abiertos-de-días-anteriores) |
 | Lote en `SUBMITTED` que no se liquida | [G](#escenario-g--confirmar-la-liquidación) |
 | Eventos en la DLQ, alerta `EventosEnDLQSettlement` | [I](#escenario-i--eventos-en-la-dlq) |
+| Lote en `CLOSED` que no se reenvía, alerta `LoteConTotalesCambiados`, `resubmit` responde `409 SUBMITTED_TOTALS_CHANGED` | [J](#escenario-j--lote-enviado-con-otros-totales) |
 
 ## Contexto del flujo
 
@@ -54,7 +55,7 @@ Terminal Gateway publica `posnet.transaction.batch-close.v1`, y `settlement-batc
 2. Calcula los totales del backend y los compara con los del terminal.
 3. En una transacción, marca el evento, **guarda el lote en `CLOSED`, o en `DISPUTED` si hay discrepancias**,
    y encola `settlement.batch-closed` en el outbox. Si algo falla, el lote sigue `OPEN` y se reintenta.
-4. Con discrepancias, termina.
+4. Con discrepancias, termina. Sin transacciones, queda `VOID` y termina: no hay nada que enviar.
 5. Sin discrepancias: lo envía al procesador. Sin procesador, queda en `CLOSED`.
 
 El Relay publica el evento a NATS por separado, con reintentos.
@@ -66,7 +67,8 @@ El Relay publica el evento a NATS por separado, con reintentos.
       OPEN ──► CLOSED ──► SUBMITTED ──► SETTLED    DISPUTED
                  │  ▲                                ▲  │
                  │  └────────── resolve-dispute ─────┼──┘
-                 └──────── con discrepancias ────────┘
+                 ├──────── con discrepancias ────────┘
+                 └──► VOID   (sin transacciones)
 ```
 
 `PENDING_CLOSE` existe, pero no se guarda nunca: el cierre lo atraviesa en un solo paso.
@@ -227,15 +229,16 @@ FROM settlement.settlement_batches WHERE id = '<batch_id>';
 | Log o causa | Qué significa |
 |---|---|
 | `no settlement processor configured` | `SETTLEMENT_PROCESSOR=none`. También aumenta `posnet_settlement_submissions_total{result="unavailable"}` |
-| `submitBatch: processor submit` | Falló el procesador. La reentrega no reintenta el envío, porque ya no hay un lote `OPEN` |
+| `submitBatch: processor submit` | Falló el procesador, después de `SETTLEMENT_SUBMIT_RETRIES` reintentos (log `retrying batch submission`). La reentrega no reintenta el envío, porque ya no hay un lote `OPEN` |
+| `totals changed since it was sent to the processor` | Ya se envió con otros totales: [Escenario J](#escenario-j--lote-enviado-con-otros-totales). **No hagas `resubmit` a la fuerza** |
 | `discrepancies` mayor que 0 | Viene de una versión anterior: un `force-close` antes de la corrección, o un fallo al guardar `DISPUTED` durante el cierre |
 | Pasó por `force-close` | Un cierre forzado no envía el lote: hay que hacer `resubmit` |
-| Lote sin transacciones | Lote vacío cerrado por el job. No requiere acción |
+| Lote sin transacciones | Lote vacío anterior a la migración `000014`, que lo pasa a `VOID`. Si sigue en `CLOSED`, el procesador ya lo había aceptado: `resubmit` lo marca `SUBMITTED` sin enviarlo |
 
 **Resolución:**
 
 ```bash
-curl -X POST http://<host>:8084/batches/<batch_id>/resubmit -H "$AUTH" -d '{"operator_id":"<tu_usuario>"}'
+curl -X POST http://<host>:8084/batches/<batch_id>/resubmit -H "$AUTH" -d '{"operator_id":"<tu_usuario>","reason":"<ticket>"}'
 ```
 
 | Respuesta | Qué significa | Qué hacer |
@@ -244,7 +247,8 @@ curl -X POST http://<host>:8084/batches/<batch_id>/resubmit -H "$AUTH" -d '{"ope
 | `503 PROCESSOR_UNAVAILABLE` | No hay procesador configurado | El lote queda en `CLOSED`, sin riesgo. **No lo fuerces:** esperá a tener un procesador, o activá `mock` solo en desarrollo |
 | `400`, "moved to DISPUTED" | Tenía discrepancias y **no se envió** | Escenario A |
 | `400`, otro estado | El lote no está en `CLOSED` | Verificá su estado |
-| `409` | Otro proceso modificó el lote | Consultá el estado y repetí |
+| `409 SUBMITTED_TOTALS_CHANGED` | Ya se envió con otros totales, y **no se envió otra vez** | [Escenario J](#escenario-j--lote-enviado-con-otros-totales) |
+| `409 CONFLICT` | Otro proceso modificó el lote | Consultá el estado y repetí |
 | `500` | Falló el procesador o la base de datos | Revisá los logs y reintentá |
 
 **Riesgo cuando exista un procesador real:** si el procesador acepta y falla el guardado, el lote queda en
@@ -517,14 +521,70 @@ la DLQ y salta `EventoSettlementPerdido`: seguí [nats-dlq-reprocess.md](nats-dl
 
 ---
 
+## Escenario J — Lote enviado con otros totales
+
+**Síntoma:** alerta `LoteConTotalesCambiados`, `posnet_settlement_batches_attention{reason="totals_changed"}` mayor que
+0, log `totals changed since it was sent to the processor`, o `resubmit` responde `409 SUBMITTED_TOTALS_CHANGED`. El lote
+está en `CLOSED`.
+
+**Causa:** el lote se envió al procesador, y mientras se enviaba una revisión de reversa lo retuvo. Después, la revisión
+o una transacción tardía cambió sus totales, y el lote se liberó. Settlement **no lo reenvía ni lo marca `SUBMITTED`**:
+
+- Reenviarlo podría pagarse dos veces, si el procesador ya tiene la remesa anterior.
+- Marcarlo con la confirmación anterior liquidaría totales que el procesador no conoce.
+
+También pasa si el intento anterior no tiene resultado conocido (un timeout o un corte): el procesador pudo haberlo
+aceptado.
+
+**Diagnóstico:**
+
+```sql
+-- Lo que se envió y lo que tiene el lote ahora
+SELECT s.attempts, s.confirmation_id, s.confirmed_at,
+       s.total_count AS enviado_cantidad, s.total_amount AS enviado_monto,
+       s.adjustment_count AS enviado_ajustes, s.adjustment_amount AS enviado_monto_ajustes,
+       b.total_count, b.total_amount, b.adjustment_count, b.adjustment_amount
+FROM settlement.batch_submissions s JOIN settlement.settlement_batches b ON b.id = s.batch_id
+WHERE s.batch_id = '<batch_id>';
+```
+
+```bash
+# Qué lo cambió: revisiones, ventas o reversas tardías, liberación
+curl -s http://<host>:8084/batches/<batch_id>/audit -H "$AUTH" | jq '.entries[] | {created_at, action, operator_id, reason, to_state, total_amount}'
+```
+
+**Resolución:** no hay una salida por API, porque depende de lo que admita el procesador. Hoy, con `mock`, nada se
+envió de verdad. Con un procesador real:
+
+1. **Confirmá con el procesador qué recibió** para ese `batch_id`, y con qué totales.
+2. **Si no lo recibió,** el envío anterior falló sin aceptarse: con aprobación, actualizá los totales de
+   `batch_submissions` a los del lote, en una transacción, y hacé `resubmit`.
+
+   ```sql
+   BEGIN;
+   UPDATE settlement.batch_submissions s
+   SET total_count = b.total_count, total_amount = b.total_amount,
+       adjustment_count = COALESCE(b.adjustment_count, 0), adjustment_amount = COALESCE(b.adjustment_amount, 0)
+   FROM settlement.settlement_batches b
+   WHERE b.id = s.batch_id AND s.batch_id = '<batch_id>' AND s.confirmation_id IS NULL
+   RETURNING s.*;
+   -- COMMIT; o ROLLBACK;
+   ```
+
+3. **Si lo recibió con los totales anteriores,** hay que corregir la diferencia según lo que defina el procesador:
+   reemplazar la remesa o informar un ajuste. Es una decisión financiera: escalala con el ticket y el diagnóstico.
+
+---
+
 ## Referencia — endpoints
 
 | Endpoint | Sobre qué estado | Resultado |
 |---|---|---|
 | `GET /batches/{id}` | Cualquiera | Estado y totales. Un lote `OPEN` muestra totales en 0. Los campos están en PascalCase (`State`, `TotalCount`) |
+| `GET /batches/{id}/audit` | Cualquiera | Quién hizo qué sobre el lote, del registro más viejo al más nuevo |
 | `GET /merchants/{merchant_id}/batches?date=YYYY-MM-DD` | Cualquiera | Lotes del comercio, que pueden ser varios por terminal; `date` es obligatorio |
-| `POST /batches/{id}/force-close` | Solo `OPEN`; otros, `400` | Pasa a `CLOSED` |
-| `POST /batches/{id}/resubmit` | Solo `CLOSED`; otros, `400` | Pasa a `SUBMITTED`, o a `DISPUTED` si tiene discrepancias o una reversa en revisión. Sin procesador, `503` |
+| `POST /batches/{id}/force-close` | Solo `OPEN`; otros, `400` | Pasa a `CLOSED`, o a `VOID` si no tiene transacciones |
+| `POST /batches/{id}/resubmit` | Solo `CLOSED`; otros, `400` | Pasa a `SUBMITTED`, o a `DISPUTED` si tiene discrepancias o una reversa en revisión. Sin procesador, `503`. Ya enviado con otros totales, `409` ([Escenario J](#escenario-j--lote-enviado-con-otros-totales)) |
 | `POST /batches/{id}/reopen` | Solo `DISPUTED`; otros, `400` | Pasa a `OPEN` |
 | `POST /batches/{id}/resolve-dispute` | Solo `DISPUTED`, sin reversas en revisión; otros, `400` | Pasa a `CLOSED`, con los totales del backend |
 | `POST /batches/{id}/settle` | Solo `SUBMITTED`; otros, `400` | Pasa a `SETTLED` |
@@ -536,8 +596,10 @@ la DLQ y salta `EventoSettlementPerdido`: seguí [nats-dlq-reprocess.md](nats-dl
 | `POST /dead-letters/{sequence}/replay` | — | Procesa el evento y lo borra de la DLQ ([Escenario I](#escenario-i--eventos-en-la-dlq)) |
 | `POST /dead-letters/{sequence}/discard` | — | Borra el evento sin procesarlo; exige `reason` |
 
-Todos los `POST` y `PUT` exigen un operador, que sale del token o de `operator_id`; `reopen` y `resolve-dispute`, también `reason`. Esos datos
-quedan en la [auditoría](../technical/SETTLEMENT.md#auditoría-de-operadores). Con un token del archivo, el operador es
+Todos los `POST` y `PUT` exigen un operador, que sale del token o de `operator_id`; `reopen` y `resolve-dispute`, también `reason`.
+`force-close`, `resubmit` y `settle` aceptan `reason`: **enviálo siempre**, porque con `SETTLEMENT_REQUIRE_REASON=true`
+pasa a ser obligatorio. Esos datos quedan en la [auditoría](../technical/SETTLEMENT.md#auditoría-de-operadores), que se
+consulta con `GET /batches/{id}/audit` y no se puede modificar. Con un token del archivo, el operador es
 el nombre del token. **Con `SETTLEMENT_ADMIN_API_KEY`, lo declara quien llama: anotá también en el ticket quién hizo la
 operación.** Un `500` puede indicar que falta la
 migración de auditoría: el lote no cambió. Un `409` indica que otro proceso modificó el lote: hay
@@ -552,16 +614,15 @@ duplica solo si el procesador respeta `batch_id` como clave de idempotencia.
 SELECT attempts, last_attempt_at, confirmation_id FROM settlement.batch_submissions WHERE batch_id = '<batch_id>';
 ```
 
-```sql
--- Quién hizo qué sobre un lote
-SELECT created_at, action, operator_id, reason, from_state, to_state
-FROM settlement.batch_audit_log WHERE batch_id = '<batch_id>' ORDER BY created_at;
+```bash
+# Quién hizo qué sobre un lote
+curl -s http://<host>:8084/batches/<batch_id>/audit -H "$AUTH" | jq
 ```
 
 **Sobre `force-close`:**
 
 - Cierra con los totales del backend, **sin conciliar**: asumís que son correctos.
-- Encola `batch-closed`, salvo que el lote esté vacío.
+- Encola `batch-closed`, salvo que el lote esté vacío. Un lote vacío queda `VOID`: no hay nada que enviar.
 - No envía el lote: hay que hacer `resubmit`.
 - Las ventas posteriores del terminal abren un lote nuevo, que hay que volver a cerrar.
 

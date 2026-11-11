@@ -110,6 +110,22 @@ CREATE TABLE IF NOT EXISTS settlement.batch_audit_log (
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_batch_audit_log_batch ON settlement.batch_audit_log (batch_id, created_at);
+-- Solo admite altas (000015): UPDATE, DELETE y TRUNCATE fallan.
+CREATE OR REPLACE FUNCTION settlement.reject_audit_change() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'settlement.batch_audit_log is append-only: % is not allowed', TG_OP
+        USING ERRCODE = 'insufficient_privilege';
+END;
+$$;
+DROP TRIGGER IF EXISTS batch_audit_log_no_update ON settlement.batch_audit_log;
+CREATE TRIGGER batch_audit_log_no_update
+    BEFORE UPDATE OR DELETE ON settlement.batch_audit_log
+    FOR EACH ROW EXECUTE FUNCTION settlement.reject_audit_change();
+DROP TRIGGER IF EXISTS batch_audit_log_no_truncate ON settlement.batch_audit_log;
+CREATE TRIGGER batch_audit_log_no_truncate
+    BEFORE TRUNCATE ON settlement.batch_audit_log
+    FOR EACH STATEMENT EXECUTE FUNCTION settlement.reject_audit_change();
 
 -- ─── reversal_reviews (reversas que no coinciden con su compra) ──────────────
 
@@ -162,7 +178,12 @@ CREATE TABLE IF NOT EXISTS settlement.batch_submissions (
     first_attempt_at TIMESTAMPTZ NOT NULL,
     last_attempt_at  TIMESTAMPTZ NOT NULL,
     confirmation_id  TEXT,
-    confirmed_at     TIMESTAMPTZ
+    confirmed_at     TIMESTAMPTZ,
+    -- Totales del primer intento (000013): otro intento con totales distintos no se envía.
+    total_count       INT,
+    total_amount      BIGINT,
+    adjustment_count  INT,
+    adjustment_amount BIGINT
 );
 
 -- ─── pending_terminal_closes (cierres del terminal sin lote) ──────────────────────

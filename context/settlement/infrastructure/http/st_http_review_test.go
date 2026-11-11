@@ -239,3 +239,57 @@ func TestNewWritesRequireAdminToken(t *testing.T) {
 		}
 	}
 }
+
+type fakeAuditReader struct {
+	entries []repository.StoredAuditEntry
+	err     error
+}
+
+func (f *fakeAuditReader) ListBatchAudit(context.Context, string, int) ([]repository.StoredAuditEntry, error) {
+	return f.entries, f.err
+}
+
+func auditMux(repo *fakeBatchRepo, reader *fakeAuditReader) *http.ServeMux {
+	q := query.NewBatchQueryHandler(repo)
+	q.ConfigureAudit(reader)
+	return newTestMux(NewHandler(q, command.NewAdminHandler(repo, &fakeProcessor{}), &fakePool{}))
+}
+
+func TestGetBatchAudit_HTTP(t *testing.T) {
+	const batchID = "3f9a2c1e-8b7d-4e6f-a5c4-1d2e3f4a5b6c"
+	entries := []repository.StoredAuditEntry{{
+		ID: "a-1", CreatedAt: time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC),
+		BatchAuditEntry: repository.BatchAuditEntry{BatchID: batchID, Action: "SETTLE", OperatorID: "op-1", FromState: "SUBMITTED", ToState: "SETTLED"},
+	}}
+	cases := []struct {
+		name   string
+		path   string
+		repo   *fakeBatchRepo
+		reader *fakeAuditReader
+		want   int
+	}{
+		{"lista", "/batches/" + batchID + "/audit", &fakeBatchRepo{}, &fakeAuditReader{entries: entries}, 200},
+		{"lote inexistente", "/batches/" + batchID + "/audit", &fakeBatchRepo{}, &fakeAuditReader{}, 404},
+		{"id inválido", "/batches/nope/audit", &fakeBatchRepo{}, &fakeAuditReader{}, 400},
+		{"falla la base", "/batches/" + batchID + "/audit", &fakeBatchRepo{}, &fakeAuditReader{err: errors.New("db down")}, 500},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := serve(auditMux(tc.repo, tc.reader), http.MethodGet, tc.path, "")
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d, body = %s", rec.Code, tc.want, rec.Body)
+			}
+			if tc.want != 200 {
+				return
+			}
+			body := decodeJSON(t, rec.Body.Bytes())
+			first := body["entries"].([]any)[0].(map[string]any)
+			if body["count"] != float64(1) || body["truncated"] != false || first["action"] != "SETTLE" || first["created_at"] != "2026-11-05T12:00:00Z" {
+				t.Errorf("body = %v", body)
+			}
+			if _, ok := first["reason"]; ok {
+				t.Errorf("reason = %v, want it omitted when empty", first["reason"])
+			}
+		})
+	}
+}

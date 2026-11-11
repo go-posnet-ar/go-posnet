@@ -83,3 +83,14 @@ groups:
           summary: "Settlement agotó las entregas de {{ $labels.subject }}"
           description: "Un evento no se reintentará, no llegó a la DLQ y falta en los lotes. Buscar 'dead letter could not be published' en los logs y seguir nats-dlq-reprocess.md."
 
+
+      # Lote que el procesador recibió con otros totales: no se reenvía ni se liquida solo, porque
+      # el procesador puede tener la remesa anterior aceptada. Queda CLOSED hasta resolverlo.
+      # Investigar: docs/runbooks/batch-close-failure.md, Escenario J.
+      - alert: LoteConTotalesCambiados
+        expr: max(posnet_settlement_batches_attention{reason="totals_changed"}) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} lotes en CLOSED con totales distintos de los enviados"
+          description: "Un lote se envió al procesador, una revisión lo retuvo y sus totales cambiaron. No se reenvía: podría pagarse dos veces. Buscar 'totals changed since it was sent' en los logs (batch-close-failure.md, Escenario J)."

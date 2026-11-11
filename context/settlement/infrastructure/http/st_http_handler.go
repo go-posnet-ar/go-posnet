@@ -49,6 +49,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET  /healthz", h.handleHealth)
 	mux.HandleFunc("GET  /readyz", h.handleReady)
 	mux.HandleFunc("GET  /batches/{id}", requireBatchID(h.handleGetBatch))
+	mux.HandleFunc("GET  /batches/{id}/audit", requireBatchID(h.handleGetBatchAudit))
 	mux.HandleFunc("GET  /merchants/{merchant_id}/batches", h.handleListBatches)
 	mux.HandleFunc("POST /batches/{id}/force-close", requireBatchID(h.handleForceClose))
 	mux.HandleFunc("POST /batches/{id}/resubmit", requireBatchID(h.handleResubmitBatch))
@@ -136,6 +137,25 @@ func (h *Handler) handleGetBatch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// GET /batches/{id}/audit
+func (h *Handler) handleGetBatchAudit(w http.ResponseWriter, r *http.Request) {
+	ctx, span := observability.StartSpan(r.Context(), "http.GetBatchAudit")
+	defer span.End()
+
+	entries, truncated, err := h.queryHandler.GetBatchAudit(ctx, r.PathValue("id"))
+	if err != nil {
+		var notFound *pkgerrors.NotFoundError
+		if errors.As(err, &notFound) {
+			writeJSON(w, http.StatusNotFound, errResp("NOT_FOUND", "batch not found"))
+			return
+		}
+		observability.RecordError(ctx, err)
+		writeJSON(w, http.StatusInternalServerError, errResp("INTERNAL", "internal error"))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": entries, "count": len(entries), "truncated": truncated})
+}
+
 // GET /merchants/{merchant_id}/batches?date=2025-06-04
 func (h *Handler) handleListBatches(w http.ResponseWriter, r *http.Request) {
 	ctx, span := observability.StartSpan(r.Context(), "http.ListBatches")
@@ -167,6 +187,7 @@ func (h *Handler) handleForceClose(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		OperatorID string `json:"operator_id"`
+		Reason     string `json:"reason"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, errResp("INVALID_BODY", "invalid request body"))
@@ -181,6 +202,7 @@ func (h *Handler) handleForceClose(w http.ResponseWriter, r *http.Request) {
 	cmd := port.ForceCloseCommand{
 		BatchID:    r.PathValue("id"),
 		OperatorID: op,
+		Reason:     body.Reason,
 	}
 
 	if err := h.adminHandler.ForceClose(ctx, cmd); err != nil {
@@ -212,6 +234,7 @@ func (h *Handler) handleResubmitBatch(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		OperatorID string `json:"operator_id"`
+		Reason     string `json:"reason"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, errResp("INVALID_BODY", "invalid request body"))
@@ -226,6 +249,7 @@ func (h *Handler) handleResubmitBatch(w http.ResponseWriter, r *http.Request) {
 	cmd := port.ResubmitBatchCommand{
 		BatchID:    r.PathValue("id"),
 		OperatorID: op,
+		Reason:     body.Reason,
 	}
 
 	if err := h.adminHandler.ResubmitBatch(ctx, cmd); err != nil {
@@ -241,6 +265,10 @@ func (h *Handler) handleResubmitBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, repository.ErrStaleBatch) {
 			writeJSON(w, http.StatusConflict, errResp("CONFLICT", "batch was modified concurrently; retry"))
+			return
+		}
+		if errors.Is(err, repository.ErrSubmittedTotalsChanged) {
+			writeJSON(w, http.StatusConflict, errResp("SUBMITTED_TOTALS_CHANGED", err.Error()))
 			return
 		}
 		if errors.Is(err, service.ErrProcessorUnavailable) {
@@ -316,6 +344,7 @@ func (h *Handler) handleSettleBatch(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		OperatorID string `json:"operator_id"`
+		Reason     string `json:"reason"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, errResp("INVALID_BODY", "invalid request body"))
@@ -330,6 +359,7 @@ func (h *Handler) handleSettleBatch(w http.ResponseWriter, r *http.Request) {
 	err := h.adminHandler.SettleBatch(ctx, port.SettleBatchCommand{
 		BatchID:    r.PathValue("id"),
 		OperatorID: op,
+		Reason:     body.Reason,
 	})
 	h.writeAdminResult(w, r, err, "settled")
 }

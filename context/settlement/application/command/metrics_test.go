@@ -130,7 +130,7 @@ func attentionByReason(t *testing.T, reader *sdkmetric.ManualReader) map[string]
 
 func TestBatchAttentionGauge_ReportsEveryReason(t *testing.T) {
 	reader := newTestReader(t)
-	counter := &fakeAttentionCounter{counts: repository.BatchAttentionCounts{Disputed: 2, OpenOverdue: 1, OutboxStuck: 4, ReversalsInReview: 5, RecoveryPending: true}}
+	counter := &fakeAttentionCounter{counts: repository.BatchAttentionCounts{Disputed: 2, OpenOverdue: 1, TotalsChanged: 3, OutboxStuck: 4, ReversalsInReview: 5, RecoveryPending: true}}
 	loc := time.FixedZone("BA", -3*60*60)
 	if err := command.RegisterBatchAttentionGauge(counter, loc, 0); err != nil {
 		t.Fatalf("RegisterBatchAttentionGauge() error = %v", err)
@@ -156,7 +156,7 @@ func TestBatchAttentionGauge_ReportsEveryReason(t *testing.T) {
 	got := attentionByReason(t, reader)
 
 	// closed_unsent en 0 también se informa: sin la serie, la alerta no podría resolverse.
-	want := map[string]int64{"disputed": 2, "closed_unsent": 0, "open_overdue": 1}
+	want := map[string]int64{"disputed": 2, "closed_unsent": 0, "open_overdue": 1, "totals_changed": 3}
 	if len(got) != len(want) {
 		t.Fatalf("attention = %v, want %v", got, want)
 	}

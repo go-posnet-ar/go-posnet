@@ -638,3 +638,34 @@ func TestReadyz_NATS(t *testing.T) {
 		})
 	}
 }
+
+// Con SETTLEMENT_REQUIRE_REASON=true, el reason del body llega al comando, y sin él responde 400.
+func TestAdminOperations_RequireReason(t *testing.T) {
+	const id = "11111111-1111-4111-8111-111111111111"
+	cases := []struct {
+		name, path, body string
+		want             int
+	}{
+		{"force-close con reason", "/batches/" + id + "/force-close", `{"operator_id":"op-1","reason":"terminal roto"}`, http.StatusOK},
+		{"force-close sin reason", "/batches/" + id + "/force-close", `{"operator_id":"op-1"}`, http.StatusBadRequest},
+		{"resubmit sin reason", "/batches/" + id + "/resubmit", `{"operator_id":"op-1"}`, http.StatusBadRequest},
+		{"settle sin reason", "/batches/" + id + "/settle", `{"operator_id":"op-1","reason":" "}`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := &fakeBatchRepo{findByIDResult: newBatch(t)}
+			admin := command.NewAdminHandler(repo, &fakeProcessor{})
+			admin.RequireReason(true)
+			mux := newTestMux(NewHandler(query.NewBatchQueryHandler(repo), admin, &fakePool{}))
+
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)))
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d, body = %s", rec.Code, tc.want, rec.Body)
+			}
+			if tc.want == http.StatusBadRequest && !strings.Contains(rec.Body.String(), "reason") {
+				t.Errorf("body = %s, want it to mention the reason", rec.Body)
+			}
+		})
+	}
+}

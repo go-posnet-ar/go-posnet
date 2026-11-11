@@ -167,6 +167,7 @@ var requiredColumns = []string{
 	"settlement.reversal_reviews.action",
 	"settlement.settlement_batches.adjustment_count",
 	"settlement.settlement_batches.adjustment_amount",
+	"settlement.batch_submissions.total_amount",
 }
 
 // MissingTables devuelve las tablas y columnas requeridas que no existen en la base.
@@ -227,6 +228,37 @@ func (r *SettlementBatchRepo) InsertAuditTx(ctx context.Context, tx pgx.Tx, e re
 		return fmt.Errorf("InsertAuditTx: %w", err)
 	}
 	return nil
+}
+
+// ListBatchAudit devuelve la auditoría del lote, del registro más viejo al más nuevo.
+func (r *SettlementBatchRepo) ListBatchAudit(ctx context.Context, batchID string, limit int) ([]repository.StoredAuditEntry, error) {
+	const q = `
+		SELECT id, batch_id, action, operator_id, COALESCE(reason, ''), from_state, to_state,
+		       previous_discrepancies, total_amount, COALESCE(confirmation_id, ''), created_at
+		FROM settlement.batch_audit_log
+		WHERE batch_id = $1
+		ORDER BY created_at, id
+		LIMIT $2
+	`
+	rows, err := r.pool.Query(ctx, q, batchID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("ListBatchAudit: query: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []repository.StoredAuditEntry
+	for rows.Next() {
+		var e repository.StoredAuditEntry
+		if err := rows.Scan(&e.ID, &e.BatchID, &e.Action, &e.OperatorID, &e.Reason, &e.FromState, &e.ToState,
+			&e.PreviousDiscrepancies, &e.TotalAmount, &e.ConfirmationID, &e.CreatedAt); err != nil {
+			return nil, fmt.Errorf("ListBatchAudit: scan: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ListBatchAudit: rows: %w", err)
+	}
+	return entries, nil
 }
 
 // lockReversalPair serializa la compra y la reversa de una misma transacción. Sin esto,
@@ -492,20 +524,56 @@ func (r *SettlementBatchRepo) DeletePendingCloseTx(ctx context.Context, tx pgx.T
 
 // StartSubmission registra el intento fuera de cualquier transacción del llamador: tiene que estar
 // confirmado antes de llamar al procesador.
-func (r *SettlementBatchRepo) StartSubmission(ctx context.Context, batchID string) (string, error) {
+//
+// El primer intento guarda los totales. Los siguientes solo se registran si los totales son los
+// mismos: si no, el UPDATE no toca la fila, no devuelve nada, y se informa lo que se envió antes.
+// Una fila sin totales (anterior a 000013) los toma del intento actual.
+func (r *SettlementBatchRepo) StartSubmission(ctx context.Context, batchID string, totals repository.SubmissionTotals) (string, error) {
 	const q = `
-		INSERT INTO settlement.batch_submissions (batch_id, attempts, first_attempt_at, last_attempt_at)
-		VALUES ($1, 1, now(), now())
+		INSERT INTO settlement.batch_submissions AS s
+			(batch_id, attempts, first_attempt_at, last_attempt_at,
+			 total_count, total_amount, adjustment_count, adjustment_amount)
+		VALUES ($1, 1, now(), now(), $2, $3, $4, $5)
 		ON CONFLICT (batch_id) DO UPDATE SET
-			attempts        = settlement.batch_submissions.attempts + 1,
-			last_attempt_at = now()
+			attempts          = s.attempts + 1,
+			last_attempt_at   = now(),
+			total_count       = EXCLUDED.total_count,
+			total_amount      = EXCLUDED.total_amount,
+			adjustment_count  = EXCLUDED.adjustment_count,
+			adjustment_amount = EXCLUDED.adjustment_amount
+		WHERE s.total_amount IS NULL
+		   OR (s.total_count, s.total_amount, s.adjustment_count, s.adjustment_amount)
+		    = (EXCLUDED.total_count, EXCLUDED.total_amount, EXCLUDED.adjustment_count, EXCLUDED.adjustment_amount)
 		RETURNING COALESCE(confirmation_id, '')
 	`
 	var confirmationID string
-	if err := r.pool.QueryRow(ctx, q, batchID).Scan(&confirmationID); err != nil {
+	err := r.pool.QueryRow(ctx, q, batchID,
+		totals.TotalCount, totals.TotalAmount, totals.AdjustmentCount, totals.AdjustmentAmount,
+	).Scan(&confirmationID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", r.submittedTotalsChanged(ctx, batchID, totals)
+	}
+	if err != nil {
 		return "", fmt.Errorf("StartSubmission: %w", err)
 	}
 	return confirmationID, nil
+}
+
+// submittedTotalsChanged arma el error con los totales del envío anterior.
+func (r *SettlementBatchRepo) submittedTotalsChanged(ctx context.Context, batchID string, current repository.SubmissionTotals) error {
+	const q = `
+		SELECT total_count, total_amount, adjustment_count, adjustment_amount, COALESCE(confirmation_id, '')
+		FROM settlement.batch_submissions WHERE batch_id = $1
+	`
+	e := &repository.SubmittedTotalsChangedError{Current: current}
+	err := r.pool.QueryRow(ctx, q, batchID).Scan(
+		&e.Sent.TotalCount, &e.Sent.TotalAmount, &e.Sent.AdjustmentCount, &e.Sent.AdjustmentAmount, &e.ConfirmationID,
+	)
+	if err != nil {
+		// Sin el detalle, el lote igual tiene que quedar retenido.
+		return fmt.Errorf("StartSubmission: %w (could not read the previous submission: %v)", repository.ErrSubmittedTotalsChanged, err)
+	}
+	return fmt.Errorf("StartSubmission: %w", e)
 }
 
 // ConfirmSubmission guarda la confirmación del procesador, salvo que ya haya una.
@@ -1085,14 +1153,19 @@ func (r *SettlementBatchRepo) CountBatchesNeedingAttention(ctx context.Context, 
 			COUNT(*) FILTER (WHERE b.state = 'OPEN' AND b.batch_date < ($2::timestamptz AT TIME ZONE COALESCE(m.timezone, $3))::date),
 			(SELECT COUNT(*) FROM settlement.outbox WHERE created_at < $4),
 			(SELECT COUNT(*) FROM settlement.reversal_reviews WHERE resolved_at IS NULL AND created_at < $5),
-			NOT EXISTS (SELECT 1 FROM settlement.maintenance_runs WHERE name = $6)
+			NOT EXISTS (SELECT 1 FROM settlement.maintenance_runs WHERE name = $6),
+			COUNT(*) FILTER (WHERE b.state = 'CLOSED' AND s.total_amount IS NOT NULL
+				AND (s.total_count, s.total_amount, s.adjustment_count, s.adjustment_amount)
+				    IS DISTINCT FROM (COALESCE(b.total_count, 0), COALESCE(b.total_amount, 0),
+				                      COALESCE(b.adjustment_count, 0), COALESCE(b.adjustment_amount, 0)))
 		FROM settlement.settlement_batches b
 		LEFT JOIN settlement.merchant_timezones m ON m.merchant_id = b.merchant_id
+		LEFT JOIN settlement.batch_submissions s ON s.batch_id = b.id
 		WHERE b.state IN ('DISPUTED', 'CLOSED', 'OPEN')
 	`
 	var c repository.BatchAttentionCounts
 	err := r.pool.QueryRow(ctx, q, closedBefore, now, defaultTimezone, outboxBefore, reviewBefore, repository.MaintenanceReversalRecovery).
-		Scan(&c.Disputed, &c.ClosedUnsent, &c.OpenOverdue, &c.OutboxStuck, &c.ReversalsInReview, &c.RecoveryPending)
+		Scan(&c.Disputed, &c.ClosedUnsent, &c.OpenOverdue, &c.OutboxStuck, &c.ReversalsInReview, &c.RecoveryPending, &c.TotalsChanged)
 	if err != nil {
 		return repository.BatchAttentionCounts{}, fmt.Errorf("CountBatchesNeedingAttention: %w", err)
 	}

@@ -18,6 +18,7 @@ var optionalEnvKeys = []string{
 	"OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION", "OTEL_EXPORTER_OTLP_ENDPOINT", "ENVIRONMENT",
 	"SETTLEMENT_MDR_PERCENT", "SETTLEMENT_BATCH_CLOSE_HOUR", "SETTLEMENT_BATCH_CLOSE_GRACE",
 	"SETTLEMENT_SUBMIT_RETRIES", "SETTLEMENT_SUBMIT_TIMEOUT", "SETTLEMENT_PROCESSOR", "SETTLEMENT_BUSINESS_TIMEZONE", "SETTLEMENT_ADMIN_API_KEY",
+	"SETTLEMENT_REQUIRE_REASON",
 }
 
 func clearOptionalEnv(t *testing.T) {
@@ -512,6 +513,42 @@ func TestLoad_BatchCloseHourIsDeprecated(t *testing.T) {
 			}
 			if cfg.Settlement.BatchCloseHourDeprecated != tc.wantDeprecated {
 				t.Errorf("BatchCloseHourDeprecated = %v, want %v", cfg.Settlement.BatchCloseHourDeprecated, tc.wantDeprecated)
+			}
+		})
+	}
+}
+
+func TestLoad_RequireReason(t *testing.T) {
+	tests := []struct {
+		value   string
+		want    bool
+		wantErr bool
+	}{
+		{"", false, false},
+		{"true", true, false},
+		{"false", false, false},
+		// Un error de tipeo no puede dejar la exigencia desactivada sin avisar.
+		{"yes", false, true},
+		{"TRUE", false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.value, func(t *testing.T) {
+			clearOptionalEnv(t)
+			setRequiredEnv(t)
+			t.Setenv("SETTLEMENT_REQUIRE_REASON", tc.value)
+
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "SETTLEMENT_REQUIRE_REASON") {
+					t.Fatalf("Load() error = %v, want it to name SETTLEMENT_REQUIRE_REASON", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Settlement.RequireReason != tc.want {
+				t.Errorf("RequireReason = %v, want %v", cfg.Settlement.RequireReason, tc.want)
 			}
 		})
 	}

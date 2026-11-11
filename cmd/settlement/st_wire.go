@@ -101,7 +101,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 
 	// SettlementProcessor — adaptador hacia el procesador externo (Visa/MC).
 	// TODO: agregar el adaptador real cuando esté implementado.
-	processor := newProcessor(cfg.Settlement.Processor)
+	processor := newProcessor(cfg.Settlement.Processor, cfg.Settlement.SubmitRetries, cfg.Settlement.SubmitTimeout)
 
 	// ── Aplicación ─────────────────────────────────────────────────────────────
 	batchHandler := command.NewBatchHandler(
@@ -135,6 +135,11 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 		return nil, fmt.Errorf("wire: register batch attention gauge: %w", err)
 	}
 	adminHandler := command.NewAdminHandler(batchRepo, processor)
+	adminHandler.SetMetrics(settlementMetrics)
+	adminHandler.RequireReason(cfg.Settlement.RequireReason)
+	if !cfg.Settlement.RequireReason {
+		slog.Warn("force-close, resubmit and settle accept requests without a reason — set SETTLEMENT_REQUIRE_REASON=true once clients send it")
+	}
 	adminHandler.ConfigureSettlement(pool, batchRepo, eventPub, outboxStore, cfg.Settlement.MDRPercent)
 	adminHandler.SetReversalReviews(batchRepo)
 	adminHandler.SetBatchSubmissions(batchRepo)
@@ -143,6 +148,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	adminHandler.SetBatchReleaser(batchHandler)
 	queryHandler := query.NewBatchQueryHandler(batchRepo)
 	queryHandler.ConfigureReviews(batchRepo)
+	queryHandler.ConfigureAudit(batchRepo)
 	queryHandler.ConfigureTimezones(batchRepo, cfg.Settlement.BusinessTimezone)
 
 	// ── Adaptadores de entrada ─────────────────────────────────────────────────
@@ -203,12 +209,13 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	}, nil
 }
 
-// newProcessor selecciona el procesador externo. Sin procesador (nil), los lotes
-// quedan en CLOSED: BatchHandler y AdminHandler lo manejan como ErrProcessorUnavailable.
-func newProcessor(mode string) service.SettlementProcessor {
+// newProcessor selecciona el procesador externo, con un plazo por intento y reintentos. Sin
+// procesador (nil), los lotes quedan en CLOSED: BatchHandler y AdminHandler lo manejan como
+// ErrProcessorUnavailable.
+func newProcessor(mode string, retries int, timeout time.Duration) service.SettlementProcessor {
 	if mode == config.ProcessorMock {
 		slog.Warn("settlement processor is a mock — batches are marked SUBMITTED without being sent")
-		return stprocessor.NewMockProcessor()
+		return stprocessor.NewRetryingProcessor(stprocessor.NewMockProcessor(), retries, timeout)
 	}
 	slog.Warn("no settlement processor configured — closed batches will not be submitted")
 	return nil

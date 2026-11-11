@@ -786,14 +786,14 @@ func TestCountBatchesNeedingAttention(t *testing.T) {
 
 	pool.ExpectQuery("FROM settlement.settlement_batches").
 		WithArgs(closedBefore, now, "UTC", outboxBefore, reviewBefore, "reversal-recovery").
-		WillReturnRows(pgxmock.NewRows([]string{"disputed", "closed", "open", "outbox", "reviews", "recovery"}).AddRow(int64(3), int64(2), int64(1), int64(4), int64(5), true))
+		WillReturnRows(pgxmock.NewRows([]string{"disputed", "closed", "open", "outbox", "reviews", "recovery", "totals_changed"}).AddRow(int64(3), int64(2), int64(1), int64(4), int64(5), true, int64(6)))
 
 	got, err := repo.CountBatchesNeedingAttention(context.Background(), now, "UTC", closedBefore, outboxBefore, reviewBefore)
 	if err != nil {
 		t.Fatalf("CountBatchesNeedingAttention() error = %v", err)
 	}
-	if got.Disputed != 3 || got.ClosedUnsent != 2 || got.OpenOverdue != 1 || got.OutboxStuck != 4 || got.ReversalsInReview != 5 || !got.RecoveryPending {
-		t.Errorf("counts = %+v, want {3 2 1 4 5 true}", got)
+	if got.Disputed != 3 || got.ClosedUnsent != 2 || got.OpenOverdue != 1 || got.OutboxStuck != 4 || got.ReversalsInReview != 5 || !got.RecoveryPending || got.TotalsChanged != 6 {
+		t.Errorf("counts = %+v, want {3 2 6 1 4 5 true}", got)
 	}
 }
 
@@ -1644,16 +1644,56 @@ func TestFindByID_IncompleteTransactionsFail(t *testing.T) {
 	}
 }
 
+var submissionTotals = repository.SubmissionTotals{TotalCount: 3, TotalAmount: 1500, AdjustmentCount: 1, AdjustmentAmount: -200}
+
 func TestStartSubmission_ReturnsPreviousConfirmation(t *testing.T) {
 	for _, prev := range []string{"", "conf-1"} {
 		pool := newMockPool(t)
 		pool.ExpectQuery("INSERT INTO settlement.batch_submissions").
-			WithArgs("batch-1").
+			WithArgs("batch-1", 3, int64(1500), 1, int64(-200)).
 			WillReturnRows(pgxmock.NewRows([]string{"confirmation_id"}).AddRow(prev))
-		got, err := postgres.NewSettlementBatchRepo(pool).StartSubmission(context.Background(), "batch-1")
+		got, err := postgres.NewSettlementBatchRepo(pool).StartSubmission(context.Background(), "batch-1", submissionTotals)
 		if err != nil || got != prev {
 			t.Errorf("StartSubmission() = %q, %v, want %q", got, err, prev)
 		}
+	}
+}
+
+// Si el intento anterior se hizo con otros totales, el upsert no toca la fila y se informa lo que
+// se envió antes.
+func TestStartSubmission_TotalsChanged(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectQuery("INSERT INTO settlement.batch_submissions").
+		WithArgs("batch-1", 3, int64(1500), 1, int64(-200)).
+		WillReturnRows(pgxmock.NewRows([]string{"confirmation_id"}))
+	pool.ExpectQuery("FROM settlement.batch_submissions WHERE batch_id").
+		WithArgs("batch-1").
+		WillReturnRows(pgxmock.NewRows([]string{"total_count", "total_amount", "adjustment_count", "adjustment_amount", "confirmation_id"}).
+			AddRow(4, int64(2000), 1, int64(-200), "conf-1"))
+
+	_, err := postgres.NewSettlementBatchRepo(pool).StartSubmission(context.Background(), "batch-1", submissionTotals)
+	var detail *repository.SubmittedTotalsChangedError
+	if !errors.As(err, &detail) {
+		t.Fatalf("StartSubmission() error = %v, want SubmittedTotalsChangedError", err)
+	}
+	if detail.ConfirmationID != "conf-1" || detail.Sent.TotalAmount != 2000 || detail.Current != submissionTotals {
+		t.Errorf("detail = %+v", detail)
+	}
+}
+
+// Sin el detalle, el lote igual queda retenido.
+func TestStartSubmission_TotalsChangedWithoutDetail(t *testing.T) {
+	pool := newMockPool(t)
+	pool.ExpectQuery("INSERT INTO settlement.batch_submissions").
+		WithArgs("batch-1", 3, int64(1500), 1, int64(-200)).
+		WillReturnRows(pgxmock.NewRows([]string{"confirmation_id"}))
+	pool.ExpectQuery("FROM settlement.batch_submissions WHERE batch_id").
+		WithArgs("batch-1").
+		WillReturnError(errors.New("connection reset"))
+
+	_, err := postgres.NewSettlementBatchRepo(pool).StartSubmission(context.Background(), "batch-1", submissionTotals)
+	if !errors.Is(err, repository.ErrSubmittedTotalsChanged) {
+		t.Fatalf("StartSubmission() error = %v, want ErrSubmittedTotalsChanged", err)
 	}
 }
 
@@ -1743,5 +1783,24 @@ func TestPendingTerminalCloses(t *testing.T) {
 		WillReturnResult(pgxmock.NewResult("DELETE", 1))
 	if err := repo.DeletePendingCloseTx(context.Background(), beginTx(t, pool), terminal, date, "ARS"); err != nil {
 		t.Fatalf("DeletePendingCloseTx() error = %v", err)
+	}
+}
+
+func TestListBatchAudit(t *testing.T) {
+	pool := newMockPool(t)
+	amount := int64(1500)
+	created := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	pool.ExpectQuery("FROM settlement.batch_audit_log").
+		WithArgs("batch-1", 10).
+		WillReturnRows(pgxmock.NewRows([]string{"id", "batch_id", "action", "operator_id", "reason", "from_state", "to_state",
+			"previous_discrepancies", "total_amount", "confirmation_id", "created_at"}).
+			AddRow("a-1", "batch-1", "SETTLE", "op-1", "", "SUBMITTED", "SETTLED", 0, &amount, "", created))
+
+	got, err := postgres.NewSettlementBatchRepo(pool).ListBatchAudit(context.Background(), "batch-1", 10)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("ListBatchAudit() = %v, %v, want one entry", got, err)
+	}
+	if got[0].ID != "a-1" || got[0].Action != "SETTLE" || *got[0].TotalAmount != 1500 || !got[0].CreatedAt.Equal(created) {
+		t.Errorf("entry = %+v", got[0])
 	}
 }
