@@ -221,6 +221,7 @@ actuales, haya cerrado la revisión el sistema o un operador. El cierre guarda c
 |---|---|---|---|
 | Por el terminal | Los totales que informó el terminal | Pasa a `CLOSED` y se envía | Sigue `DISPUTED`, con las discrepancias recalculadas |
 | Por el job, `force-close` o `resolve-dispute` | Nada: no hay totales del terminal | Pasa a `CLOSED` y se envía | — |
+| Por el job, retenido por `SETTLEMENT_AUTO_CLOSE_POLICY=hold` (`NONE`) | Nada: **no se libera solo** | — | Sigue `DISPUTED` hasta `resolve-dispute` o `reopen` |
 | Antes de `000007` | Los totales que guardó el cierre, que `000010` copia como los del terminal | Pasa a `CLOSED` y se envía | Sigue `DISPUTED`, con las discrepancias recalculadas |
 
 Un lote retenido solo por revisiones cerró sin discrepancias: lo que informó el terminal coincidía con los totales
@@ -364,6 +365,11 @@ terminal lo cierre él y concilie. Con `SETTLEMENT_BATCH_CLOSE_HOUR=0` queda des
    ([5.3](#53-aprobación-después-del-cierre)). Log `batch closed automatically against the totals of an earlier terminal
    close`.
    Si no, lo cierra con los totales del backend: **no hay conciliación**, y por eso tampoco hay discrepancias.
+   Queda `reconciled_with` `BACKEND`, se cuenta en `posnet_settlement_unreconciled_closes_total` y lo dice el log
+   `batch closed automatically without terminal totals`. **Con `SETTLEMENT_AUTO_CLOSE_POLICY=hold`, no se envía:**
+   queda `DISPUTED`, con `reconciled_with` `NONE`, hasta que un operador lo resuelva con `resolve-dispute`, que acepta
+   los totales del backend, o con `reopen`, para que el terminal vuelva a cerrar. El job de liberación no lo toca. Con
+   `submit`, el default, se envía como antes. Un lote vacío queda `VOID` con cualquiera de las dos.
 3. Encola `batch-closed` en la misma transacción y envía el lote al procesador. Un lote vacío queda `VOID`, sin
    evento ni envío.
    **Con una revisión de reversa abierta, queda en `DISPUTED`, sin enviarse.**
@@ -408,8 +414,16 @@ neto = bruto − redondeo(bruto × MDR / 100)
 La verificación usa un advisory lock por comercio y fecha: si se liquidan en paralelo los dos últimos lotes,
 el segundo ve lo que confirmó el primero, y sale un solo evento.
 
-Si después un terminal del mismo comercio abre otro lote para esa fecha, al liquidarlo se publica otro
-evento con el total acumulado.
+**Cada resumen es una revisión.** El primero de un comercio, día y moneda es la revisión 1. Si después se liquida
+otro lote de ese día, por ejemplo uno que abrió un terminal tras el cierre, sale la revisión 2, y así. Cada uno lleva el
+acumulado del día (`total_batches`, `total_amount`, `net_amount`) y lo que agrega (`delta_batches`, `delta_amount`,
+`delta_net_amount`). El consumidor debe descartar una revisión repetida, o anterior a la última que procesó, por
+`(merchant_id, settlement_date, currency, revision)`.
+
+Las revisiones emitidas quedan en `settlement_completions`, en la misma transacción. **Una moneda que no cambió no se
+repite:** antes, liquidar tarde un lote en USD volvía a publicar el resumen en ARS con los mismos totales. Los días
+liquidados antes de `000016` tienen una revisión 1 con el acumulado actual, sin el neto: la revisión siguiente calcula
+su diferencia de neto con el MDR actual.
 
 ### 5.9 Qué pasa cuando falla cada paso
 
@@ -599,6 +613,7 @@ Responde con nombres en PascalCase, porque el struct no tiene tags JSON:
   "TotalCount": 42,
   "TotalAmount": 1250000,
   "Discrepancies": 1,
+  "ReconciledWith": "TERMINAL",
   "ClosedAt": "2026-11-05T20:00:04Z",
   "SubmittedAt": "",
   "SettledAt": ""
@@ -636,8 +651,19 @@ cuenta en `posnet_settlement_admin_missing_reason_total{action}`, y el arranque 
 { "operator_id": "soporte-juan", "reason": "Terminal fuera de servicio, ticket 123" }
 ```
 
-Responde `{"status": "closed"}`. El lote queda en `CLOSED` con los **totales del backend**, sin discrepancias y
-**sin conciliar**, porque no hay totales del terminal. Después:
+Responde `{"status": "closed"}`. **Sin totales del terminal,** el lote queda en `CLOSED` con los totales del backend,
+sin discrepancias y **sin conciliar** (`reconciled_with` `BACKEND`); se cuenta en
+`posnet_settlement_unreconciled_closes_total{source="force_close"}`.
+
+**Si el operador conoce los totales del terminal,** por ejemplo del ticket de cierre, los puede enviar, siempre juntos:
+
+```json
+{ "operator_id": "soporte-juan", "reason": "Terminal sin red, ticket 123", "terminal_count": 42, "terminal_amount": 1250000 }
+```
+
+Se concilia como en el cierre del terminal, contra este lote solo: si coinciden, queda `CLOSED`; si no, `DISPUTED`, con
+las discrepancias, y una venta tardía lo puede completar. `reconciled_with` es `TERMINAL`. Con uno solo de los dos, o
+`terminal_count` negativo, responde `400`. Después, en los dos casos:
 
 - Encola `batch-closed` en la misma transacción, salvo que el lote esté vacío. Un lote vacío queda
   [`VOID`](#lotes-vacíos), y la auditoría lo dice en `to_state`.
@@ -860,6 +886,7 @@ Payload de `batch-closed`:
 | `total_count`, `total_amount`, `currency` | Totales del backend. `total_amount` incluye los ajustes; `total_count`, no |
 | `adjustment_count`, `adjustment_amount` | Ajustes del lote: correcciones de lotes ya enviados. `adjustment_amount` tiene signo: positivo devuelve al comercio. Se omiten si no hay |
 | `discrepancies` | Permite distinguir un cierre con diferencias |
+| `reconciled_with` | Contra qué se concilió: `TERMINAL`, `BACKEND` (sin totales del terminal: no se comparó) o `NONE` (sin ellos, retenido en `DISPUTED` para un operador). Con `NONE`, `discrepancies` es 0 aunque el lote no se envíe |
 | `closed_at` | RFC3339 UTC |
 
 Payload de `settlement.completed`:
@@ -870,6 +897,8 @@ Payload de `settlement.completed`:
 | `total_batches`, `currency` | Lotes liquidados en esa moneda |
 | `total_amount`, `net_amount`, `mdr_percent` | Bruto, neto y comisión aplicada; el MDR no se guarda por lote. `total_amount` incluye los ajustes |
 | `adjustment_amount` | Suma, con signo, de los ajustes incluidos en `total_amount`. Se omite si no hay |
+| `revision` | 1 en el primer resumen del día y moneda; uno más por cada lote liquidado después (ver [§5.8](#58-liquidación)) |
+| `delta_batches`, `delta_amount`, `delta_net_amount` | Lo que agrega esta revisión. En la revisión 1, igual al acumulado |
 | `completed_at` | RFC3339 UTC |
 
 ## 9. Persistencia
@@ -891,6 +920,7 @@ hace nada, [`migrations/settlement/`](../../migrations/settlement/) se aplica a 
 | `merchant_timezones` | Zona de negocio de los comercios que no usan la general | PK `merchant_id` |
 | `maintenance_runs` | Tareas de mantenimiento ya ejecutadas en el entorno, como la recuperación de reversas | PK `name` |
 | `batch_submissions` | Envíos al procesador: intentos, confirmación y los totales enviados (ver [Envío al procesador](#envío-al-procesador)) | PK y FK `batch_id` |
+| `settlement_completions` | Revisiones de `settlement.completed` emitidas (ver [§5.8](#58-liquidación)) | PK `(merchant_id, settlement_date, currency, revision)` |
 
 | Índice | Para qué sirve |
 |---|---|
@@ -903,7 +933,7 @@ Con 2.000 lotes y 400.000 transacciones, cargar un lote pasó de recorrer toda l
 
 ### Aplicar la migración
 
-**Una base existente necesita `000001`, de `000003` a `000009` y de `000011` a `000015` antes de desplegar esta
+**Una base existente necesita `000001`, de `000003` a `000009` y de `000011` a `000016` antes de desplegar esta
 versión del servicio, y `000010` después de `000007`.**
 `01-init.sql` solo corre sobre una base vacía, y `pgutil.Migrate` no hace nada:
 
@@ -923,9 +953,10 @@ psql "$POSTGRES_DSN" -f migrations/settlement/000012_pending_terminal_closes.up.
 psql "$POSTGRES_DSN" -f migrations/settlement/000013_submission_totals.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000014_void_empty_batches.up.sql
 psql "$POSTGRES_DSN" -f migrations/settlement/000015_audit_append_only.up.sql
+psql "$POSTGRES_DSN" -f migrations/settlement/000016_settlement_completions.up.sql
 ```
 
-Son idempotentes y, salvo `000010`, `000011`, `000013` y `000014`, no tocan los datos. Se probaron sobre una base con
+Son idempotentes y, salvo `000010`, `000011`, `000013`, `000014` y `000016`, no tocan los datos. Se probaron sobre una base con
 el schema anterior: el resultado coincide con el de una base nueva. `000013` a `000015` se probaron además ida, vuelta y
 otra vez ida, sobre Postgres 16.
 
@@ -951,7 +982,9 @@ lote con ventas falla y se reintenta** hasta agotar las entregas y pasar a la DL
 los actuales de su lote: un lote que ya cambió antes no se detecta. **Sin `000014`, los lotes vacíos que ya estaban en
 `CLOSED` siguen ahí;** los nuevos pasan a `VOID` igual. Conviene aplicarla antes del despliegue, para que el servicio
 anterior no vea un estado que no conoce. `000014` no toca los lotes vacíos que el procesador ya aceptó: esos se
-resuelven con `resubmit`. **Sin `000015`, la auditoría se puede modificar,** como antes.
+resuelven con `resubmit`. **Sin `000015`, la auditoría se puede modificar,** como antes. **Sin `000016`, `/readyz`
+responde `503` y falla cada `settle` que complete un día,** porque no puede numerar el resumen; el lote sigue
+`SUBMITTED` y se puede repetir. `000016` completa la revisión 1 de los días ya liquidados del todo.
 
 `000002` crea los índices con `CONCURRENTLY`, sin bloquear las escrituras, y por eso no puede correr dentro de
 una transacción: no usar `psql -1`. Si se interrumpe, puede dejar un índice inválido: hay que borrarlo y volver
@@ -973,7 +1006,8 @@ que no use la tabla, y se pierden las confirmaciones de los envíos tras un cier
 se cierran sin conciliar. `000013_submission_totals.down.sql` exige lo mismo: un lote cuyos totales cambian después de
 enviarse vuelve a reusar la confirmación anterior. `000014_void_empty_batches.down.sql` exige volver antes a una versión
 que no conozca `VOID`, y devuelve esos lotes a `CLOSED`; la auditoría de `000014` queda. `000015_audit_append_only.down.sql`
-no hace falta para volver a una versión anterior.
+no hace falta para volver a una versión anterior. `000016_settlement_completions.down.sql` exige volver antes a una
+versión que no use la tabla: los resúmenes vuelven a salir sin revisión.
 
 ### Auditoría de operadores
 
@@ -1044,6 +1078,7 @@ el pool de Postgres.
 | `posnet_settlement_dead_letters` | Gauge | — | Eventos en la DLQ. Consulta NATS en cada scrape |
 | `posnet_settlement_late_sales_total` | Counter | `result` | Ventas agregadas a su lote en disputa después del cierre: `released`, `held` o `disputed` |
 | `posnet_settlement_late_reversals_total` | Counter | `result` | Lo mismo, para las reversas |
+| `posnet_settlement_unreconciled_closes_total` | Counter | `source`, `outcome` | Lotes con transacciones cerrados sin compararlos con el terminal: `source` es `auto_close` o `force_close`, y `outcome`, `closed` (se envía) o `held` (retenido por `SETTLEMENT_AUTO_CLOSE_POLICY=hold`). Las series nacen en 0 |
 | `posnet_settlement_admin_missing_reason_total` | Counter | `action` | `force-close`, `resubmit` o `settle` pedidos sin [`reason`](#motivo-de-las-operaciones): `FORCE_CLOSE`, `RESUBMIT` o `SETTLE`. Las series nacen en 0 |
 
 También se exponen métricas del pool de Postgres y de mensajes NATS, incluida
@@ -1128,6 +1163,7 @@ conciliar, y `no settlement processor configured` los lotes que quedaron sin env
 | `SETTLEMENT_TLS_EXTERNAL` | `false` | Sí; declara que un proxy termina TLS |
 | `SETTLEMENT_SUBMIT_RETRIES` | `3` | Sí; reintentos de un envío al procesador que falla, además del primero. Negativo cuenta como `0`. Ver [Envío al procesador](#envío-al-procesador) |
 | `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | Sí; plazo de cada intento. `0` no pone plazo |
+| `SETTLEMENT_AUTO_CLOSE_POLICY` | `submit` | Sí; qué hace el cierre automático con un lote sin totales del terminal: `submit` lo envía, `hold` lo deja en `DISPUTED` para un operador ([§5.6](#56-cierre-automático)). Con otro valor, el servicio no arranca |
 | `SETTLEMENT_REQUIRE_REASON` | `false` | Sí; con `true`, `force-close`, `resubmit` y `settle` exigen [`reason`](#motivo-de-las-operaciones). Con otro valor que `true` o `false`, el servicio no arranca |
 | `MIGRATIONS_DIR` | `migrations/settlement` | **No**: `Migrate` no hace nada |
 
@@ -1212,9 +1248,9 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 | No hay procesador real | `mock` marca `SUBMITTED` sin enviar nada. Falta el adaptador y el archivo de remesa, que requieren la especificación del procesador. Los reintentos y el plazo ya se aplican, pero sus valores por defecto superan el `WriteTimeout` de la API y el `AckWait` del cierre: hay que ajustarlos con el adaptador | `st_mock_processor.go`, `st_retrying_processor.go` |
 | La confirmación de liquidación es manual | Un operador debe llamar a `settle`, sin una referencia del procesador | `SettleBatch` |
 | Nadie consume `settlement.completed` | El comercio no recibe el neto liquidado: Notification no se suscribe | `nt_nats_subscriber.go` |
-| Evento adicional por lotes tardíos | Un lote abierto después de la liquidación diaria genera otro evento con el total acumulado | `enqueueCompletedIfDone` |
-| El cierre automático concilia solo tras un cierre sin lote | Si el terminal nunca pidió el cierre del día, el lote se envía con los totales del backend, sin comparar con el terminal | `CloseStaleBatches` |
-| `force-close` no concilia | El operador asume que los totales del backend son correctos | `ForceClose` |
+| Un día puede tener varios resúmenes | Un lote liquidado después del resumen diario da otra revisión de `settlement.completed`. Ya llevan `revision` y su diferencia, pero el consumidor tiene que deduplicarlas, y todavía no hay ninguno | `enqueueCompletedIfDone` |
+| El cierre automático envía sin conciliar por defecto | Si el terminal nunca pidió el cierre del día, el lote se envía con los totales del backend. Ahora se ve (`reconciled_with`, `posnet_settlement_unreconciled_closes_total`), y `SETTLEMENT_AUTO_CLOSE_POLICY=hold` lo retiene, pero el default es `submit`. La solución de fondo es que los terminales siempre pidan el cierre | `CloseStaleBatches` |
+| `force-close` sin totales no concilia | Si el operador no envía los totales del terminal, asume que los del backend son correctos. Queda visible en `reconciled_with` y en la métrica | `ForceClose` |
 | Un envío sin resultado conocido se repite | Si el procesador falla, demora o se corta después de aceptar, el intento queda sin confirmación y el siguiente lo envía otra vez. No duplica solo si el procesador respeta `batch_id` como clave de idempotencia, lo que depende de su especificación | `sendToProcessor` |
 | Un lote enviado con otros totales no tiene salida por la API | Si una revisión lo retuvo mientras se enviaba y después cambiaron sus totales, queda `CLOSED` con la alerta `LoteConTotalesCambiados`. Ya no se liquida con totales que el procesador no conoce, pero resolverlo, reemplazando la remesa o con un ajuste, depende de la especificación del procesador y se hace a mano | `sendToProcessor` |
 | `resolve-dispute` no notifica | Si los totales cambian, Notification solo conoce los del primer cierre | `ResolveDispute` |

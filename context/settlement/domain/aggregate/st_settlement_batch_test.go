@@ -686,3 +686,45 @@ func TestVoid(t *testing.T) {
 		t.Errorf("Void() error = %v, want ErrTransactionsNotLoaded", err)
 	}
 }
+
+// ─── HoldUnreconciled ─────────────────────────────────────────────────────────
+
+func TestHoldUnreconciled(t *testing.T) {
+	b := newOpenBatch(t)
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	if err := b.CloseWithBackendTotals(); err != nil {
+		t.Fatalf("CloseWithBackendTotals() error = %v", err)
+	}
+	if err := b.HoldUnreconciled(); err != nil {
+		t.Fatalf("HoldUnreconciled() error = %v", err)
+	}
+	if b.State() != valueobject.BatchStateDisputed || b.ReconciledWith() != aggregate.ReconciledWithNone {
+		t.Fatalf("state = %s, reconciled with %q, want DISPUTED and NONE", b.State(), b.ReconciledWith())
+	}
+	// Retenido así, Release no lo libera: lo decide un operador.
+	if released, changed, err := b.Release(); released || changed || err != nil {
+		t.Errorf("Release() = %v, %v, %v, want no change", released, changed, err)
+	}
+	if err := b.ResolveDispute(); err != nil || b.ReconciledWith() != aggregate.ReconciledWithBackend {
+		t.Errorf("ResolveDispute() = %v, reconciled with %q, want BACKEND", err, b.ReconciledWith())
+	}
+}
+
+// Solo se retiene un lote cerrado con los totales del backend.
+func TestHoldUnreconciled_RequiresBackendTotals(t *testing.T) {
+	b := newOpenBatch(t)
+	if err := b.AddTransaction(domain.NewTransactionID(), 1000, valueobject.BatchTxPurchase); err != nil {
+		t.Fatalf("AddTransaction() error = %v", err)
+	}
+	if err := b.RequestClose(); err != nil {
+		t.Fatalf("RequestClose() error = %v", err)
+	}
+	if err := b.Close(1, 1000); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := b.HoldUnreconciled(); err == nil {
+		t.Error("HoldUnreconciled() error = nil for a batch reconciled against the terminal")
+	}
+}

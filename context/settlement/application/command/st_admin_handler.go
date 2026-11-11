@@ -39,8 +39,16 @@ type AdminHandler struct {
 
 	submissions repository.BatchSubmissions // opcional; nil = no registra los envíos y un reenvío puede duplicarlos
 
+	completions repository.SettlementCompletions // opcional; nil = cada resumen del día sale como revisión 1
+
 	metrics       *Metrics // opcional; nil = no cuenta
 	requireReason bool     // force-close, resubmit y settle rechazan un pedido sin reason
+}
+
+// SetSettlementCompletions numera las revisiones de settlement.completed y calcula su diferencia con
+// la anterior.
+func (h *AdminHandler) SetSettlementCompletions(c repository.SettlementCompletions) {
+	h.completions = c
 }
 
 // SetMetrics habilita las métricas de las operaciones de administración.
@@ -153,6 +161,12 @@ func (h *AdminHandler) ForceClose(ctx context.Context, cmd port.ForceCloseComman
 	if err := h.checkReason(ctx, repository.AuditActionForceClose, cmd.Reason); err != nil {
 		return err
 	}
+	if (cmd.TerminalCount == nil) != (cmd.TerminalAmount == nil) {
+		return pkgerrors.NewValidationError("terminal_count and terminal_amount go together")
+	}
+	if cmd.TerminalCount != nil && *cmd.TerminalCount < 0 {
+		return pkgerrors.NewValidationError("terminal_count cannot be negative")
+	}
 
 	batch, err := h.batchRepo.FindByID(ctx, cmd.BatchID)
 	if err != nil {
@@ -171,7 +185,21 @@ func (h *AdminHandler) ForceClose(ctx context.Context, cmd port.ForceCloseComman
 		Action: repository.AuditActionForceClose, OperatorID: cmd.OperatorID, Reason: cmd.Reason,
 		FromState: batch.State().String(), PreviousDiscrepancies: batch.Discrepancies(),
 	}
-	if err := batch.CloseWithBackendTotals(); err != nil {
+	// Con los totales del terminal se concilia como en su cierre: si no coinciden, queda DISPUTED.
+	// Sin ellos, no hay contra qué: se cierra con los del backend.
+	if cmd.TerminalCount != nil {
+		if err := batch.RequestClose(); err != nil {
+			return fmt.Errorf("ForceClose: close: %w", err)
+		}
+		if err := batch.Close(*cmd.TerminalCount, *cmd.TerminalAmount); err != nil {
+			return fmt.Errorf("ForceClose: close: %w", err)
+		}
+		if batch.Discrepancies() > 0 {
+			if err := batch.MarkDisputed("terminal count/amount mismatch"); err != nil {
+				return fmt.Errorf("ForceClose: %w", err)
+			}
+		}
+	} else if err := batch.CloseWithBackendTotals(); err != nil {
 		return fmt.Errorf("ForceClose: close: %w", err)
 	}
 	// Sin transacciones no hay nada que enviar: queda VOID, como en los otros cierres.
@@ -189,10 +217,16 @@ func (h *AdminHandler) ForceClose(ctx context.Context, cmd port.ForceCloseComman
 		return fmt.Errorf("ForceClose: save: %w", err)
 	}
 
+	if cmd.TerminalCount == nil && !batch.IsEmpty() {
+		h.metrics.RecordUnreconciledClose(ctx, unreconciledForceClose, unreconciledClosed)
+	}
 	observability.FromContext(ctx).Warn("batch force-closed by operator",
 		slog.String("batch_id", batch.ID()),
 		slog.String("operator_id", cmd.OperatorID),
 		slog.String("reason", cmd.Reason),
+		slog.String("state", batch.State().String()),
+		slog.String("reconciled_with", batch.ReconciledWith()),
+		slog.Int("discrepancies", batch.Discrepancies()),
 		slog.Int("tx_count", len(batch.Transactions())),
 		slog.Int64("total_amount", batch.Summary().TotalAmount().Cents()),
 	)
@@ -482,15 +516,53 @@ func (h *AdminHandler) enqueueCompletedIfDone(ctx context.Context, tx pgx.Tx, se
 
 	for _, c := range currencies {
 		t := byCurrency[c]
-		subject, eventID, payload, err := h.publisher.BuildSettlementCompleted(ctx,
-			settled.MerchantID().String(), settled.BatchDate().Format("2006-01-02"),
-			t.batches, t.gross, t.adjustments, netAmount(t.gross, h.mdrPercent), c, h.mdrPercent,
-		)
+		completion := service.SettlementCompletion{
+			MerchantID: settled.MerchantID().String(), SettlementDate: settled.BatchDate().Format("2006-01-02"),
+			Currency: c, MDRPercent: h.mdrPercent, Revision: 1,
+			TotalBatches: t.batches, TotalAmount: t.gross, AdjustmentAmount: t.adjustments,
+			NetAmount: netAmount(t.gross, h.mdrPercent),
+		}
+		completion.DeltaBatches, completion.DeltaAmount, completion.DeltaNetAmount = completion.TotalBatches, completion.TotalAmount, completion.NetAmount
+
+		var previous *repository.DailyCompletion
+		if h.completions != nil {
+			if previous, err = h.completions.LastCompletionTx(ctx, tx, settled.MerchantID(), settled.BatchDate(), c); err != nil {
+				return fmt.Errorf("find previous SettlementCompleted: %w", err)
+			}
+		}
+		if previous != nil {
+			// La condición de arriba abarca todas las monedas: la liquidación tardía de una no cambia
+			// las demás, que ya se informaron.
+			if previous.TotalBatches == t.batches && previous.TotalAmount == t.gross && previous.AdjustmentAmount == t.adjustments {
+				continue
+			}
+			// Una fila de 000016 no guardó el neto: se calcula con el MDR actual, como entonces.
+			previousNet := netAmount(previous.TotalAmount, h.mdrPercent)
+			if previous.NetAmount != nil {
+				previousNet = *previous.NetAmount
+			}
+			completion.Revision = previous.Revision + 1
+			completion.DeltaBatches = t.batches - previous.TotalBatches
+			completion.DeltaAmount = t.gross - previous.TotalAmount
+			completion.DeltaNetAmount = completion.NetAmount - previousNet
+		}
+
+		subject, eventID, payload, err := h.publisher.BuildSettlementCompleted(ctx, completion)
 		if err != nil {
 			return fmt.Errorf("build SettlementCompleted: %w", err)
 		}
 		if err := h.outbox.InsertTx(ctx, tx, subject, eventID, payload); err != nil {
 			return err
+		}
+		if h.completions != nil {
+			net := completion.NetAmount
+			if err := h.completions.InsertCompletionTx(ctx, tx, repository.DailyCompletion{
+				MerchantID: settled.MerchantID(), Date: settled.BatchDate(), Currency: c, Revision: completion.Revision,
+				TotalBatches: t.batches, TotalAmount: t.gross, AdjustmentAmount: t.adjustments,
+				NetAmount: &net, EventID: eventID,
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

@@ -156,6 +156,7 @@ var requiredTables = []string{
 	"settlement.maintenance_runs",
 	"settlement.batch_submissions",
 	"settlement.pending_terminal_closes",
+	"settlement.settlement_completions",
 }
 
 // requiredColumns son las columnas agregadas por migraciones sobre tablas existentes, como
@@ -593,6 +594,44 @@ func (r *SettlementBatchRepo) ConfirmSubmission(ctx context.Context, batchID, co
 	return nil
 }
 
+// LastCompletionTx devuelve la última revisión de settlement.completed del comercio, día y moneda.
+func (r *SettlementBatchRepo) LastCompletionTx(ctx context.Context, tx pgx.Tx, merchantID domain.MerchantID, date time.Time, currency string) (*repository.DailyCompletion, error) {
+	const q = `
+		SELECT revision, total_batches, total_amount, adjustment_amount, net_amount, COALESCE(event_id, '')
+		FROM settlement.settlement_completions
+		WHERE merchant_id = $1 AND settlement_date = $2::date AND currency = $3
+		ORDER BY revision DESC
+		LIMIT 1
+	`
+	c := repository.DailyCompletion{MerchantID: merchantID, Date: date, Currency: currency}
+	err := tx.QueryRow(ctx, q, merchantID.String(), date.Format("2006-01-02"), currency).Scan(
+		&c.Revision, &c.TotalBatches, &c.TotalAmount, &c.AdjustmentAmount, &c.NetAmount, &c.EventID,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("LastCompletionTx: %w", err)
+	}
+	return &c, nil
+}
+
+// InsertCompletionTx guarda una revisión de settlement.completed. La clave primaria rechaza una
+// revisión repetida: dos liquidaciones no pueden numerar la misma.
+func (r *SettlementBatchRepo) InsertCompletionTx(ctx context.Context, tx pgx.Tx, c repository.DailyCompletion) error {
+	const q = `
+		INSERT INTO settlement.settlement_completions
+			(merchant_id, settlement_date, currency, revision, total_batches, total_amount,
+			 adjustment_amount, net_amount, event_id)
+		VALUES ($1, $2::date, $3, $4, $5, $6, $7, $8, NULLIF($9, ''))
+	`
+	if _, err := tx.Exec(ctx, q, c.MerchantID.String(), c.Date.Format("2006-01-02"), c.Currency, c.Revision,
+		c.TotalBatches, c.TotalAmount, c.AdjustmentAmount, c.NetAmount, c.EventID); err != nil {
+		return fmt.Errorf("InsertCompletionTx: %w", err)
+	}
+	return nil
+}
+
 // CountTerminalDayBatches cuenta los lotes del terminal en esa fecha y moneda.
 func (r *SettlementBatchRepo) CountTerminalDayBatches(ctx context.Context, terminalID domain.TerminalID, date time.Time, currency string) (int, error) {
 	const q = `
@@ -612,6 +651,7 @@ func (r *SettlementBatchRepo) FindReleasableHeldBatchIDs(ctx context.Context) ([
 	const q = `
 		SELECT b.id::text FROM settlement.settlement_batches b
 		WHERE b.state = 'DISPUTED' AND b.discrepancies = 0 AND b.reconciled_with IS NOT NULL
+		  AND b.reconciled_with <> 'NONE'
 		  AND EXISTS (SELECT 1 FROM settlement.reversal_reviews r WHERE r.batch_id = b.id)
 		  AND NOT EXISTS (SELECT 1 FROM settlement.reversal_reviews r WHERE r.batch_id = b.id AND r.resolved_at IS NULL)
 		ORDER BY b.batch_date ASC

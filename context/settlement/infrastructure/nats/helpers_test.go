@@ -10,6 +10,7 @@ import (
 
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
+	"github.com/juantevez/go-posnet/context/settlement/domain/service"
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
@@ -122,7 +123,7 @@ func (f *fakeDomainPublisher) BuildBatchClosed(context.Context, *aggregate.Settl
 	return "subject", "event-id", []byte("{}"), nil
 }
 
-func (f *fakeDomainPublisher) BuildSettlementCompleted(context.Context, string, string, int, int64, int64, int64, string, float64) (string, string, []byte, error) {
+func (f *fakeDomainPublisher) BuildSettlementCompleted(context.Context, service.SettlementCompletion) (string, string, []byte, error) {
 	return "subject", "event-id", []byte("{}"), nil
 }
 

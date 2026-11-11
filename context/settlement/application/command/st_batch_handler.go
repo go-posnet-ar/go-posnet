@@ -26,23 +26,30 @@ import (
 
 // BatchHandler orquesta el ciclo de vida de los batches de liquidación.
 type BatchHandler struct {
-	batchRepo   repository.SettlementBatchRepository
-	publisher   service.EventPublisher
-	processor   service.SettlementProcessor
-	outbox      *outbox.Store
-	idempotency *natsutil.IdempotencyStore
-	pool        pgutil.PgxPool
-	metrics     *Metrics // opcional; nil = sin instrumentación (tests)
-	location    *time.Location
-	reviews     repository.ReversalReviewLog     // opcional; nil = no valida las reversas
-	timezones   repository.MerchantTimezones     // opcional; nil = una sola zona para todos
-	maxCloseAge int                              // días; 0 = no limita la antigüedad de batch_date
-	closeGrace  time.Duration                    // plazo tras la medianoche del comercio para el cierre automático
-	reopens     repository.BatchReopens          // opcional; nil = acepta cualquier día dentro de maxCloseAge
-	audit       repository.BatchAuditLog         // opcional; nil = la liberación de un lote no se audita
-	days        repository.TerminalDayBatches    // opcional; nil = sin ventas tardías ni motivo de un cierre sin lote
-	submissions repository.BatchSubmissions      // opcional; nil = no registra los envíos y un reenvío puede duplicarlos
-	pending     repository.PendingTerminalCloses // opcional; nil = los totales de un cierre sin lote solo van al log
+	batchRepo        repository.SettlementBatchRepository
+	publisher        service.EventPublisher
+	processor        service.SettlementProcessor
+	outbox           *outbox.Store
+	idempotency      *natsutil.IdempotencyStore
+	pool             pgutil.PgxPool
+	metrics          *Metrics // opcional; nil = sin instrumentación (tests)
+	location         *time.Location
+	reviews          repository.ReversalReviewLog     // opcional; nil = no valida las reversas
+	timezones        repository.MerchantTimezones     // opcional; nil = una sola zona para todos
+	maxCloseAge      int                              // días; 0 = no limita la antigüedad de batch_date
+	closeGrace       time.Duration                    // plazo tras la medianoche del comercio para el cierre automático
+	reopens          repository.BatchReopens          // opcional; nil = acepta cualquier día dentro de maxCloseAge
+	audit            repository.BatchAuditLog         // opcional; nil = la liberación de un lote no se audita
+	days             repository.TerminalDayBatches    // opcional; nil = sin ventas tardías ni motivo de un cierre sin lote
+	submissions      repository.BatchSubmissions      // opcional; nil = no registra los envíos y un reenvío puede duplicarlos
+	pending          repository.PendingTerminalCloses // opcional; nil = los totales de un cierre sin lote solo van al log
+	holdUnreconciled bool                             // el cierre automático retiene, en vez de enviar, los lotes sin totales del terminal
+}
+
+// HoldUnreconciledAutoCloses hace que el cierre automático deje en DISPUTED, sin enviar, los lotes
+// que cierra sin totales del terminal (SETTLEMENT_AUTO_CLOSE_POLICY=hold).
+func (h *BatchHandler) HoldUnreconciledAutoCloses(hold bool) {
+	h.holdUnreconciled = hold
 }
 
 // SetPendingTerminalCloses guarda los totales de un cierre sin lote, para que el cierre automático
@@ -843,6 +850,9 @@ func (h *BatchHandler) ReleaseHeldBatch(ctx context.Context, batchID string) err
 	switch {
 	case batch == nil:
 		return nil
+	case !released && batch.ReconciledWith() == aggregate.ReconciledWithNone:
+		log.Warn("batch has no open reviews but was auto-closed without terminal totals and held — resolve it with resolve-dispute or reopen")
+		return nil
 	case !released && batch.ReconciledWith() == "":
 		log.Warn("batch has no open reviews but was closed before its reconciliation was recorded — resolve it with resolve-dispute or reopen")
 		return nil
@@ -1109,6 +1119,7 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 	} else if err := batch.CloseWithBackendTotals(); err != nil {
 		return false, fmt.Errorf("close batch: %w", err)
 	}
+	unreconciled := pending == nil
 	switch {
 	case batch.Discrepancies() > 0:
 		if err := batch.MarkDisputed("terminal count/amount mismatch"); err != nil {
@@ -1121,6 +1132,14 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 	}
 	if err := voidIfEmpty(batch); err != nil {
 		return false, err
+	}
+	// Sin totales del terminal no hay con qué conciliar: con la política hold, lo decide un operador.
+	held := false
+	if unreconciled && h.holdUnreconciled && !batch.IsEmpty() {
+		if err := batch.HoldUnreconciled(); err != nil {
+			return false, fmt.Errorf("hold unreconciled batch: %w", err)
+		}
+		held = true
 	}
 
 	eventID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("settlement-auto-close:"+batchID+":"+runDate)).String()
@@ -1163,17 +1182,23 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 			slog.Int64("terminal_amount", pending.TerminalAmount),
 			slog.Int("discrepancies", batch.Discrepancies()),
 		)
-	} else {
-		log.Warn("batch closed automatically without terminal totals",
+	} else if !batch.IsEmpty() {
+		outcome, msg := unreconciledClosed, "batch closed automatically without terminal totals"
+		if held {
+			outcome, msg = unreconciledHeld, "batch closed automatically without terminal totals — held in DISPUTED for an operator (SETTLEMENT_AUTO_CLOSE_POLICY=hold)"
+		}
+		h.metrics.RecordUnreconciledClose(ctx, unreconciledAutoClose, outcome)
+		log.Warn(msg,
 			slog.String("batch_date", batch.BatchDate().Format("2006-01-02")),
 			slog.Int("tx_count", len(batch.Transactions())),
 		)
 	}
 
 	if batch.State() == valueobject.BatchStateDisputed {
-		if batch.Discrepancies() > 0 {
+		switch {
+		case batch.Discrepancies() > 0:
 			log.Warn("batch has discrepancies — marked as disputed", slog.Int("discrepancies", batch.Discrepancies()))
-		} else {
+		case !held:
 			log.Warn("batch held — reversals under review")
 		}
 		return true, nil

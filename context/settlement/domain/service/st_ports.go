@@ -22,9 +22,33 @@ type EventPublisher interface {
 	// BuildBatchClosed serializa el evento BatchClosed. Consumido por: Notification BC.
 	BuildBatchClosed(ctx context.Context, batch *aggregate.SettlementBatch) (subject, eventID string, payload []byte, err error)
 
-	// BuildSettlementCompleted serializa el resumen de liquidación diaria. totalAmount incluye
-	// los ajustes; adjustmentAmount es su suma, con signo.
-	BuildSettlementCompleted(ctx context.Context, merchantID, settlementDate string, totalBatches int, totalAmount, adjustmentAmount, netAmount int64, currency string, mdrPercent float64) (subject, eventID string, payload []byte, err error)
+	// BuildSettlementCompleted serializa el resumen de liquidación diaria.
+	BuildSettlementCompleted(ctx context.Context, c SettlementCompletion) (subject, eventID string, payload []byte, err error)
+}
+
+// SettlementCompletion es una revisión del resumen de liquidación de un comercio, un día y una
+// moneda. La primera sale cuando se liquidan todos los lotes del día; cada lote que se liquida
+// después da otra, con el acumulado y la diferencia con la anterior.
+type SettlementCompletion struct {
+	MerchantID     string
+	SettlementDate string // YYYY-MM-DD
+	Currency       string
+	MDRPercent     float64
+
+	// Revision es 1 en el primer resumen del día y crece en cada uno siguiente.
+	Revision int
+
+	// Acumulado del día, con todas las revisiones. TotalAmount incluye los ajustes, y
+	// AdjustmentAmount es su suma, con signo.
+	TotalBatches     int
+	TotalAmount      int64
+	AdjustmentAmount int64
+	NetAmount        int64
+
+	// Lo que agrega esta revisión respecto de la anterior. En la primera, igual al acumulado.
+	DeltaBatches   int
+	DeltaAmount    int64
+	DeltaNetAmount int64
 }
 
 // SettlementProcessor es el puerto de salida hacia el procesador externo

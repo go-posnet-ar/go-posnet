@@ -201,3 +201,20 @@ CREATE TABLE IF NOT EXISTS settlement.pending_terminal_closes (
     received_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (terminal_id, batch_date, currency)
 );
+
+-- ─── settlement_completions (revisiones de settlement.completed) ──────────────────
+-- Migración 000016. Una fila por resumen emitido: numera el siguiente y calcula su diferencia.
+
+CREATE TABLE IF NOT EXISTS settlement.settlement_completions (
+    merchant_id       UUID        NOT NULL,
+    settlement_date   DATE        NOT NULL,
+    currency          CHAR(3)     NOT NULL,
+    revision          INT         NOT NULL,
+    total_batches     INT         NOT NULL,
+    total_amount      BIGINT      NOT NULL,
+    adjustment_amount BIGINT      NOT NULL,
+    net_amount        BIGINT,
+    event_id          TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (merchant_id, settlement_date, currency, revision)
+);

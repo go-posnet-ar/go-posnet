@@ -92,6 +92,10 @@ type SettlementConfig struct {
 	// vencimiento. Se relee sin reiniciar. Sin esto ni AdminAPIKey, la API queda deshabilitada.
 	AdminTokensFile string
 
+	// AutoClosePolicy decide qué hace el cierre automático con un lote que cierra sin totales del
+	// terminal: AutoCloseSubmit lo envía, AutoCloseHold lo deja en DISPUTED para un operador.
+	AutoClosePolicy string
+
 	// RequireReason exige reason en force-close, resubmit y settle. Sin esto, un pedido sin
 	// reason se acepta y se cuenta en posnet_settlement_admin_missing_reason_total: es la etapa
 	// de transición para que quienes usan la API lo empiecen a enviar.
@@ -117,6 +121,12 @@ const (
 	ProcessorNone = "none"
 	// ProcessorMock simula el envío y los lotes pasan a SUBMITTED. Solo para desarrollo.
 	ProcessorMock = "mock"
+
+	// AutoCloseSubmit envía los lotes que el job cierra sin totales del terminal. Es el
+	// comportamiento anterior.
+	AutoCloseSubmit = "submit"
+	// AutoCloseHold los deja en DISPUTED, sin enviar, hasta que un operador los revise.
+	AutoCloseHold = "hold"
 )
 
 // Load carga la configuración desde variables de entorno.
@@ -158,6 +168,8 @@ func Load() (*Config, error) {
 			SubmitRetries: envInt("SETTLEMENT_SUBMIT_RETRIES", 3),
 			SubmitTimeout: envDuration("SETTLEMENT_SUBMIT_TIMEOUT", 30*time.Second),
 			Processor:     envStr("SETTLEMENT_PROCESSOR", ProcessorNone),
+
+			AutoClosePolicy: envStr("SETTLEMENT_AUTO_CLOSE_POLICY", AutoCloseSubmit),
 
 			BusinessTimezone: envStr("SETTLEMENT_BUSINESS_TIMEZONE", "America/Argentina/Buenos_Aires"),
 			CloseMaxAgeDays:  envInt("SETTLEMENT_CLOSE_MAX_AGE_DAYS", 7),
@@ -203,6 +215,12 @@ func (c *Config) validate() error {
 	}
 	if c.Settlement.CloseMaxAgeDays < 0 {
 		return fmt.Errorf("config: SETTLEMENT_CLOSE_MAX_AGE_DAYS %d cannot be negative", c.Settlement.CloseMaxAgeDays)
+	}
+	switch c.Settlement.AutoClosePolicy {
+	case "", AutoCloseSubmit, AutoCloseHold: // Vacío es submit, como en Load
+	default:
+		return fmt.Errorf("config: SETTLEMENT_AUTO_CLOSE_POLICY %q must be %q or %q",
+			c.Settlement.AutoClosePolicy, AutoCloseSubmit, AutoCloseHold)
 	}
 	switch c.Settlement.Processor {
 	case "", ProcessorNone, ProcessorMock:

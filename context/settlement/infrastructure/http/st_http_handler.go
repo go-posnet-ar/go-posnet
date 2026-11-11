@@ -186,8 +186,10 @@ func (h *Handler) handleForceClose(w http.ResponseWriter, r *http.Request) {
 	defer span.End()
 
 	var body struct {
-		OperatorID string `json:"operator_id"`
-		Reason     string `json:"reason"`
+		OperatorID     string `json:"operator_id"`
+		Reason         string `json:"reason"`
+		TerminalCount  *int   `json:"terminal_count"`
+		TerminalAmount *int64 `json:"terminal_amount"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeJSON(w, http.StatusBadRequest, errResp("INVALID_BODY", "invalid request body"))
@@ -203,6 +205,9 @@ func (h *Handler) handleForceClose(w http.ResponseWriter, r *http.Request) {
 		BatchID:    r.PathValue("id"),
 		OperatorID: op,
 		Reason:     body.Reason,
+
+		TerminalCount:  body.TerminalCount,
+		TerminalAmount: body.TerminalAmount,
 	}
 
 	if err := h.adminHandler.ForceClose(ctx, cmd); err != nil {

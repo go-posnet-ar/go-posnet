@@ -42,6 +42,12 @@ type ForceCloseCommand struct {
 	BatchID    string
 	OperatorID string // Para auditoría
 	Reason     string // Opcional, salvo con SETTLEMENT_REQUIRE_REASON=true
+
+	// TerminalCount y TerminalAmount son los totales del terminal, si el operador los conoce: van
+	// juntos. Con ellos se concilia como en el cierre del terminal; sin ellos, se cierra con los
+	// del backend.
+	TerminalCount  *int
+	TerminalAmount *int64
 }
 
 // ResubmitBatchCommand reintenta el envío al procesador de un batch CLOSED.
@@ -109,9 +115,12 @@ type BatchResult struct {
 	AdjustmentCount  int
 	AdjustmentAmount int64
 	Discrepancies    int
-	ClosedAt         string
-	SubmittedAt      string
-	SettledAt        string
+	// ReconciledWith es contra qué se concilió: TERMINAL, BACKEND (sin totales del terminal) o
+	// NONE (retenido sin conciliar). Vacío en un lote OPEN.
+	ReconciledWith string
+	ClosedAt       string
+	SubmittedAt    string
+	SettledAt      string
 }
 
 // AuditEntryResult es un registro de la auditoría de un lote.

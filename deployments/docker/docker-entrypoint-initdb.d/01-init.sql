@@ -343,6 +343,20 @@ CREATE TABLE IF NOT EXISTS settlement.batch_submissions (
 );
 -- Totales de un cierre del terminal sin ningún lote del día: el cierre automático concilia contra
 -- ellos el lote que formen las ventas que lleguen después.
+-- Revisiones de settlement.completed (000016): numeran el resumen siguiente y su diferencia.
+CREATE TABLE IF NOT EXISTS settlement.settlement_completions (
+    merchant_id       UUID        NOT NULL,
+    settlement_date   DATE        NOT NULL,
+    currency          CHAR(3)     NOT NULL,
+    revision          INT         NOT NULL,
+    total_batches     INT         NOT NULL,
+    total_amount      BIGINT      NOT NULL,
+    adjustment_amount BIGINT      NOT NULL,
+    net_amount        BIGINT,
+    event_id          TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (merchant_id, settlement_date, currency, revision)
+);
 CREATE TABLE IF NOT EXISTS settlement.pending_terminal_closes (
     terminal_id     UUID        NOT NULL,
     batch_date      DATE        NOT NULL,

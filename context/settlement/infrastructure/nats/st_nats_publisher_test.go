@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/juantevez/go-posnet/context/settlement/domain/service"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	"github.com/juantevez/go-posnet/pkg/events"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
@@ -65,6 +66,9 @@ func TestBuildBatchClosed_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unwrap() error = %v", err)
 	}
+	if payload.ReconciledWith != "TERMINAL" {
+		t.Errorf("ReconciledWith = %q, want TERMINAL", payload.ReconciledWith)
+	}
 	if payload.BatchID != b.ID() {
 		t.Errorf("BatchID = %q, want %q", payload.BatchID, b.ID())
 	}
@@ -110,7 +114,11 @@ func TestBuildSettlementCompleted_Success(t *testing.T) {
 	merchantID := "merchant-1"
 
 	before := time.Now().UTC().Add(-time.Second)
-	subject, eventID, data, err := p.BuildSettlementCompleted(context.Background(), merchantID, "2026-01-15", 4, 100000, -400, 97500, "ARS", 2.5)
+	subject, eventID, data, err := p.BuildSettlementCompleted(context.Background(), service.SettlementCompletion{
+		MerchantID: merchantID, SettlementDate: "2026-01-15", Currency: "ARS", MDRPercent: 2.5, Revision: 2,
+		TotalBatches: 4, TotalAmount: 100000, AdjustmentAmount: -400, NetAmount: 97500,
+		DeltaBatches: 1, DeltaAmount: 30000, DeltaNetAmount: 29250,
+	})
 	if err != nil {
 		t.Fatalf("BuildSettlementCompleted() error = %v", err)
 	}
@@ -161,6 +169,10 @@ func TestBuildSettlementCompleted_Success(t *testing.T) {
 	}
 	if payload.MDRPercent != 2.5 {
 		t.Errorf("MDRPercent = %v, want 2.5", payload.MDRPercent)
+	}
+	if payload.Revision != 2 || payload.DeltaBatches != 1 || payload.DeltaAmount != 30000 || payload.DeltaNetAmount != 29250 {
+		t.Errorf("revision and deltas = %d, %d, %d, %d, want 2, 1, 30000, 29250",
+			payload.Revision, payload.DeltaBatches, payload.DeltaAmount, payload.DeltaNetAmount)
 	}
 
 	completedAt, err := time.Parse(time.RFC3339, payload.CompletedAt)

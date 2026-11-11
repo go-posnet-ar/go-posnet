@@ -1804,3 +1804,48 @@ func TestListBatchAudit(t *testing.T) {
 		t.Errorf("entry = %+v", got[0])
 	}
 }
+
+func TestLastCompletionTx(t *testing.T) {
+	merchantID := domain.NewMerchantID()
+	date := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	t.Run("found", func(t *testing.T) {
+		pool := newMockPool(t)
+		pool.ExpectBegin()
+		pool.ExpectQuery("FROM settlement.settlement_completions").
+			WithArgs(merchantID.String(), "2026-11-05", "ARS").
+			WillReturnRows(pgxmock.NewRows([]string{"revision", "total_batches", "total_amount", "adjustment_amount", "net_amount", "event_id"}).
+				AddRow(2, 3, int64(1500), int64(-100), (*int64)(nil), ""))
+		got, err := postgres.NewSettlementBatchRepo(pool).LastCompletionTx(context.Background(), beginTx(t, pool), merchantID, date, "ARS")
+		if err != nil || got == nil || got.Revision != 2 || got.TotalAmount != 1500 || got.NetAmount != nil {
+			t.Errorf("LastCompletionTx() = %+v, %v", got, err)
+		}
+	})
+	t.Run("none", func(t *testing.T) {
+		pool := newMockPool(t)
+		pool.ExpectBegin()
+		pool.ExpectQuery("FROM settlement.settlement_completions").
+			WithArgs(merchantID.String(), "2026-11-05", "ARS").
+			WillReturnRows(pgxmock.NewRows([]string{"revision", "total_batches", "total_amount", "adjustment_amount", "net_amount", "event_id"}))
+		got, err := postgres.NewSettlementBatchRepo(pool).LastCompletionTx(context.Background(), beginTx(t, pool), merchantID, date, "ARS")
+		if err != nil || got != nil {
+			t.Errorf("LastCompletionTx() = %+v, %v, want nil, nil", got, err)
+		}
+	})
+}
+
+func TestInsertCompletionTx(t *testing.T) {
+	merchantID := domain.NewMerchantID()
+	net := int64(1460)
+	pool := newMockPool(t)
+	pool.ExpectBegin()
+	pool.ExpectExec("INSERT INTO settlement.settlement_completions").
+		WithArgs(merchantID.String(), "2026-11-05", "ARS", 2, 3, int64(1500), int64(-100), &net, "evt-1").
+		WillReturnResult(pgxmock.NewResult("INSERT", 1))
+	err := postgres.NewSettlementBatchRepo(pool).InsertCompletionTx(context.Background(), beginTx(t, pool), repository.DailyCompletion{
+		MerchantID: merchantID, Date: time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC), Currency: "ARS", Revision: 2,
+		TotalBatches: 3, TotalAmount: 1500, AdjustmentAmount: -100, NetAmount: &net, EventID: "evt-1",
+	})
+	if err != nil {
+		t.Fatalf("InsertCompletionTx() error = %v", err)
+	}
+}

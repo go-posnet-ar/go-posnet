@@ -64,13 +64,14 @@ func (h *BatchQueryHandler) GetBatch(ctx context.Context, batchID string) (*port
 	}
 
 	result := &port.BatchResult{
-		ID:            batch.ID(),
-		TerminalID:    batch.TerminalID().String(),
-		MerchantID:    batch.MerchantID().String(),
-		BatchDate:     batch.BatchDate().Format("2006-01-02"),
-		State:         batch.State().String(),
-		Currency:      batch.Currency(),
-		Discrepancies: batch.Discrepancies(),
+		ID:             batch.ID(),
+		TerminalID:     batch.TerminalID().String(),
+		MerchantID:     batch.MerchantID().String(),
+		BatchDate:      batch.BatchDate().Format("2006-01-02"),
+		State:          batch.State().String(),
+		Currency:       batch.Currency(),
+		Discrepancies:  batch.Discrepancies(),
+		ReconciledWith: batch.ReconciledWith(),
 	}
 
 	if s := batch.Summary(); s != nil {
@@ -118,13 +119,14 @@ func (h *BatchQueryHandler) ListBatchesByMerchant(
 	results := make([]*port.BatchResult, 0, len(batches))
 	for _, b := range batches {
 		r := &port.BatchResult{
-			ID:            b.ID(),
-			TerminalID:    b.TerminalID().String(),
-			MerchantID:    b.MerchantID().String(),
-			BatchDate:     b.BatchDate().Format("2006-01-02"),
-			State:         b.State().String(),
-			Currency:      b.Currency(),
-			Discrepancies: b.Discrepancies(),
+			ID:             b.ID(),
+			TerminalID:     b.TerminalID().String(),
+			MerchantID:     b.MerchantID().String(),
+			BatchDate:      b.BatchDate().Format("2006-01-02"),
+			State:          b.State().String(),
+			Currency:       b.Currency(),
+			Discrepancies:  b.Discrepancies(),
+			ReconciledWith: b.ReconciledWith(),
 		}
 		if s := b.Summary(); s != nil {
 			r.TotalCount = s.TotalCount()

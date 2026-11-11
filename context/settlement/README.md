@@ -101,6 +101,7 @@ config/
 | `SETTLEMENT_SUBMIT_RETRIES` | `3` | Reintentos de envío al procesador |
 | `SETTLEMENT_SUBMIT_TIMEOUT` | `30s` | Plazo de cada intento de envío; `0` no pone plazo |
 | `SETTLEMENT_REQUIRE_REASON` | `false` | Con `true`, `force-close`, `resubmit` y `settle` exigen `reason` |
+| `SETTLEMENT_AUTO_CLOSE_POLICY` | `submit` | Cierre automático sin totales del terminal: `submit` envía, `hold` deja en `DISPUTED` |
 
 ## Correr localmente
 

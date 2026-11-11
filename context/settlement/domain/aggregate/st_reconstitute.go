@@ -26,7 +26,7 @@ type ReconstituteParams struct {
 	SubmittedAt   *time.Time
 	SettledAt     *time.Time
 
-	ReconciledWith string // ReconciledWithTerminal, ReconciledWithBackend o vacío
+	ReconciledWith string // ReconciledWithTerminal, ReconciledWithBackend, ReconciledWithNone o vacío
 	TerminalCount  *int
 	TerminalAmount *int64
 

@@ -669,3 +669,26 @@ func TestAdminOperations_RequireReason(t *testing.T) {
 		})
 	}
 }
+
+// Los totales del terminal del body llegan al comando: si no coinciden, el lote queda DISPUTED.
+func TestHandleForceClose_TerminalTotals(t *testing.T) {
+	cases := []struct {
+		name, body string
+		want       int
+		wantState  string
+	}{
+		{"no coinciden", `{"operator_id":"op-1","terminal_count":5,"terminal_amount":1}`, http.StatusOK, "DISPUTED"},
+		{"solo uno", `{"operator_id":"op-1","terminal_count":5}`, http.StatusBadRequest, "OPEN"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newBatch(t)
+			mux := newTestMux(newTestHandler(&fakeBatchRepo{findByIDResult: b}, &fakePool{}))
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/batches/"+b.ID()+"/force-close", strings.NewReader(tc.body)))
+			if rec.Code != tc.want || b.State().String() != tc.wantState {
+				t.Errorf("status = %d, state = %s, want %d, %s, body = %s", rec.Code, b.State(), tc.want, tc.wantState, rec.Body)
+			}
+		})
+	}
+}

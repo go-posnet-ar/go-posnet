@@ -23,4 +23,9 @@ type BatchClosedPayload struct {
 	// TotalCount; su monto, con signo, ya está en TotalAmount. Positivo devuelve al comercio.
 	AdjustmentCount  int   `json:"adjustment_count,omitempty"`
 	AdjustmentAmount int64 `json:"adjustment_amount,omitempty"`
+
+	// ReconciledWith es contra qué se concilió el cierre: TERMINAL (los totales del terminal),
+	// BACKEND (cerrado sin ellos, por el job o un operador: no se comparó con nada) o NONE
+	// (cerrado sin ellos y retenido en disputa para un operador).
+	ReconciledWith string `json:"reconciled_with,omitempty"`
 }

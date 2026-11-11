@@ -105,7 +105,17 @@ BEGIN;
 **Síntoma:** `GET /batches/{id}` devuelve `"State": "DISPUTED"`. En logs: `batch has discrepancies —
 marked as disputed`, `batch held — reversals under review` o `resubmit blocked — batch moved to DISPUTED`.
 
-**Si `Discrepancies` es 0, el lote está retenido por una reversa en revisión:** ir al
+**Si `Discrepancies` es 0 y `ReconciledWith` es `NONE`, lo retuvo el cierre automático** con
+`SETTLEMENT_AUTO_CLOSE_POLICY=hold`: el terminal nunca pidió el cierre, y no hay totales con qué compararlo (log
+`held in DISPUTED for an operator`). No se libera solo. Revisá las ventas del lote con el comercio o con
+`pn_authorization.transactions`, y:
+
+| Decisión | Operación |
+|---|---|
+| Los totales del backend son correctos | `resolve-dispute`, y después `resubmit` |
+| El terminal puede volver a cerrar con sus totales | `reopen`, y que el terminal cierre ese `batch_date` |
+
+**Si `Discrepancies` es 0 y `ReconciledWith` no es `NONE`, el lote está retenido por una reversa en revisión:** ir al
 [Escenario H](#escenario-h--reversas-en-revisión).
 
 **Causa:** la cantidad o el monto del terminal no coinciden con el backend. Las más comunes:
@@ -347,7 +357,9 @@ cierra.
 de negocio anteriores una vez pasada la **medianoche de su comercio más `SETTLEMENT_BATCH_CLOSE_GRACE`** (30 min por
 defecto), con los totales del backend, **sin conciliar con el terminal**,
 encola `batch-closed` y los envía al procesador. Log: `batch closed automatically without terminal
-totals`.
+totals`, y `posnet_settlement_unreconciled_closes_total{source="auto_close"}`. Con
+`SETTLEMENT_AUTO_CLOSE_POLICY=hold` no los envía: quedan `DISPUTED`, con `ReconciledWith` `NONE`
+([Escenario A](#escenario-a--lote-en-disputed)).
 
 **Diagnóstico:**
 
@@ -373,7 +385,8 @@ docker logs posnet-settlement 2>&1 | grep -E 'automatic batch close'
 | `automatic batch close failed` | Error de cierre: el job reintenta cada minuto |
 | Se reabrió hoy con `reopen` | El job ya lo marcó en la corrida de hoy: lo cierra al día siguiente |
 
-**Si no querés esperar:** `POST /batches/{id}/force-close` (ver abajo). Después hay que enviarlo con `resubmit`.
+**Si no querés esperar:** `POST /batches/{id}/force-close` (ver abajo), con los totales del terminal si los tenés.
+Después hay que enviarlo con `resubmit`.
 
 ---
 
@@ -583,7 +596,7 @@ envió de verdad. Con un procesador real:
 | `GET /batches/{id}` | Cualquiera | Estado y totales. Un lote `OPEN` muestra totales en 0. Los campos están en PascalCase (`State`, `TotalCount`) |
 | `GET /batches/{id}/audit` | Cualquiera | Quién hizo qué sobre el lote, del registro más viejo al más nuevo |
 | `GET /merchants/{merchant_id}/batches?date=YYYY-MM-DD` | Cualquiera | Lotes del comercio, que pueden ser varios por terminal; `date` es obligatorio |
-| `POST /batches/{id}/force-close` | Solo `OPEN`; otros, `400` | Pasa a `CLOSED`, o a `VOID` si no tiene transacciones |
+| `POST /batches/{id}/force-close` | Solo `OPEN`; otros, `400` | Pasa a `CLOSED`, o a `VOID` si no tiene transacciones. Con `terminal_count` y `terminal_amount`, concilia: `DISPUTED` si no coinciden |
 | `POST /batches/{id}/resubmit` | Solo `CLOSED`; otros, `400` | Pasa a `SUBMITTED`, o a `DISPUTED` si tiene discrepancias o una reversa en revisión. Sin procesador, `503`. Ya enviado con otros totales, `409` ([Escenario J](#escenario-j--lote-enviado-con-otros-totales)) |
 | `POST /batches/{id}/reopen` | Solo `DISPUTED`; otros, `400` | Pasa a `OPEN` |
 | `POST /batches/{id}/resolve-dispute` | Solo `DISPUTED`, sin reversas en revisión; otros, `400` | Pasa a `CLOSED`, con los totales del backend |
@@ -621,7 +634,17 @@ curl -s http://<host>:8084/batches/<batch_id>/audit -H "$AUTH" | jq
 
 **Sobre `force-close`:**
 
-- Cierra con los totales del backend, **sin conciliar**: asumís que son correctos.
+- **Si tenés los totales del terminal** (del ticket de cierre o del comercio), mandálos: concilia como el cierre del
+  terminal y, si no coinciden, el lote queda `DISPUTED`:
+
+  ```bash
+  curl -X POST http://<host>:8084/batches/<batch_id>/force-close -H "$AUTH" \
+    -d '{"operator_id":"<tu_usuario>","reason":"<ticket>","terminal_count":42,"terminal_amount":1250000}'
+  ```
+
+  `terminal_count` cuenta compras y reversas, y `terminal_amount` es el neto en centavos, solo de este lote.
+- Sin ellos, cierra con los totales del backend, **sin conciliar**: asumís que son correctos. Queda
+  `ReconciledWith` `BACKEND`.
 - Encola `batch-closed`, salvo que el lote esté vacío. Un lote vacío queda `VOID`: no hay nada que enviar.
 - No envía el lote: hay que hacer `resubmit`.
 - Las ventas posteriores del terminal abren un lote nuevo, que hay que volver a cerrar.

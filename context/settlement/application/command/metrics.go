@@ -30,6 +30,7 @@ import (
 //	posnet_settlement_dead_letters → posnet_settlement_dead_letters
 //	posnet_settlement_late_sales → posnet_settlement_late_sales_total{result}
 //	posnet_settlement_admin_missing_reason → posnet_settlement_admin_missing_reason_total{action}
+//	posnet_settlement_unreconciled_closes → posnet_settlement_unreconciled_closes_total{source,outcome}
 //
 // El label "bc" lo inyecta Prometheus como target label (prometheus.yml).
 type Metrics struct {
@@ -42,7 +43,16 @@ type Metrics struct {
 	lateSales     metric.Int64Counter
 	lateReversals metric.Int64Counter
 	missingReason metric.Int64Counter
+	unreconciled  metric.Int64Counter
 }
+
+// Valores de los labels de posnet_settlement_unreconciled_closes_total.
+const (
+	unreconciledAutoClose  = "auto_close"  // El job, sin totales del terminal
+	unreconciledForceClose = "force_close" // Un operador, sin totales del terminal
+	unreconciledClosed     = "closed"      // Quedó CLOSED: se envía
+	unreconciledHeld       = "held"        // Quedó DISPUTED por SETTLEMENT_AUTO_CLOSE_POLICY=hold
+)
 
 // Valores del label reason de posnet_settlement_batch_close_rejected_total.
 const (
@@ -148,6 +158,13 @@ func NewMetrics() (*Metrics, error) {
 		return nil, err
 	}
 
+	unreconciled, err := m.Int64Counter("posnet_settlement_unreconciled_closes",
+		metric.WithDescription("Lotes cerrados con los totales del backend, sin compararlos con los del terminal, por source (auto_close o force_close) y outcome (closed o held)."),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	// Las series nacen en 0: increase() no ve el primer incremento de una serie nueva, y una alerta
 	// sobre el primer rechazo no se dispararía.
 	ctx := context.Background()
@@ -166,7 +183,12 @@ func NewMetrics() (*Metrics, error) {
 		missingReason.Add(ctx, 0, metric.WithAttributes(attribute.String("action", action)))
 	}
 
+	for _, a := range [][2]string{{unreconciledAutoClose, unreconciledClosed}, {unreconciledAutoClose, unreconciledHeld}, {unreconciledForceClose, unreconciledClosed}} {
+		unreconciled.Add(ctx, 0, metric.WithAttributes(attribute.String("source", a[0]), attribute.String("outcome", a[1])))
+	}
+
 	return &Metrics{
+		unreconciled:  unreconciled,
 		missingReason: missingReason,
 		authApproved:  authApproved,
 		reversals:     reversals,
@@ -201,6 +223,14 @@ func (m *Metrics) RecordSubmission(ctx context.Context, result string) {
 		return
 	}
 	m.submissions.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
+}
+
+// RecordUnreconciledClose cuenta un lote cerrado sin compararlo con el terminal. Nil-safe.
+func (m *Metrics) RecordUnreconciledClose(ctx context.Context, source, outcome string) {
+	if m == nil {
+		return
+	}
+	m.unreconciled.Add(ctx, 1, metric.WithAttributes(attribute.String("source", source), attribute.String("outcome", outcome)))
 }
 
 // RecordMissingReason cuenta una operación de administración pedida sin reason. Nil-safe.

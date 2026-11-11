@@ -21,4 +21,14 @@ type SettlementCompletedPayload struct {
 	// AdjustmentAmount es la suma, con signo, de los ajustes que ya están en TotalAmount:
 	// correcciones de lotes de días anteriores. Positivo devuelve al comercio.
 	AdjustmentAmount int64 `json:"adjustment_amount,omitempty"`
+
+	// Revision numera los resúmenes del mismo comercio, día y moneda: 1 cuando se liquidan todos
+	// sus lotes, y uno más por cada lote que se liquida después. TotalBatches, TotalAmount y
+	// NetAmount son siempre el acumulado del día; los Delta*, lo que agrega esta revisión. El
+	// consumidor descarta una revisión repetida por (merchant_id, settlement_date, currency,
+	// revision), y una anterior a la última que procesó.
+	Revision       int   `json:"revision"`
+	DeltaBatches   int   `json:"delta_batches"`
+	DeltaAmount    int64 `json:"delta_amount"`
+	DeltaNetAmount int64 `json:"delta_net_amount"`
 }

@@ -220,7 +220,30 @@ func (b *SettlementBatch) ResolveDispute() error {
 const (
 	ReconciledWithTerminal = "TERMINAL" // Los totales que informó el terminal
 	ReconciledWithBackend  = "BACKEND"  // Sin terminal: el job, force-close o resolve-dispute
+	// ReconciledWithNone es un lote que el job cerró sin totales del terminal y retuvo, con
+	// SETTLEMENT_AUTO_CLOSE_POLICY=hold: no se concilió con nada. No se libera solo: lo resuelve
+	// un operador con resolve-dispute, que acepta los totales del backend, o reopen.
+	ReconciledWithNone = "NONE"
 )
+
+// HoldUnreconciled retiene un lote que el job cerró con los totales del backend, para que lo
+// revise un operador. Pasa a DISPUTED, si no lo estaba ya por una revisión, y queda sin
+// referencia de conciliación: Release no lo libera.
+func (b *SettlementBatch) HoldUnreconciled() error {
+	if b.reconciledWith != ReconciledWithBackend {
+		return fmt.Errorf("settlement_batch %s: only a batch closed with backend totals can be held, it was reconciled with %q", b.id, b.reconciledWith)
+	}
+	if b.state == valueobject.BatchStateClosed {
+		if err := b.transition(valueobject.BatchStateDisputed); err != nil {
+			return err
+		}
+	}
+	if b.state != valueobject.BatchStateDisputed {
+		return fmt.Errorf("settlement_batch %s: cannot hold a batch in state %s", b.id, b.state)
+	}
+	b.reconciledWith = ReconciledWithNone
+	return nil
+}
 
 // Release vuelve a conciliar un lote DISPUTED con sus transacciones actuales. Se usa cuando se
 // cierra su última revisión de reversa, que pudo cambiar los totales.
@@ -228,11 +251,12 @@ const (
 //   - Conciliado contra el terminal: compara con los totales que informó. Si coinciden, pasa a
 //     CLOSED; si no, sigue DISPUTED con las discrepancias recalculadas.
 //   - Conciliado contra el backend: no hay con qué comparar, y pasa a CLOSED.
-//   - Sin referencia, de antes de que se guardara: no hace nada. Lo resuelve un operador.
+//   - Sin referencia, de antes de que se guardara, o retenido sin conciliar (NONE): no hace nada.
+//     Lo resuelve un operador.
 //
 // changed indica que el lote cambió y hay que guardarlo.
 func (b *SettlementBatch) Release() (released, changed bool, err error) {
-	if b.state != valueobject.BatchStateDisputed || b.reconciledWith == "" {
+	if b.state != valueobject.BatchStateDisputed || b.reconciledWith == "" || b.reconciledWith == ReconciledWithNone {
 		return false, false, nil
 	}
 	summary, count, amount, err := b.calculateSummary()

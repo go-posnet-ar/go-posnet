@@ -8,6 +8,7 @@ import (
 
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
 	"github.com/juantevez/go-posnet/context/settlement/domain/repository"
+	"github.com/juantevez/go-posnet/context/settlement/domain/service"
 	"github.com/juantevez/go-posnet/pkg/domain"
 )
 
@@ -115,6 +116,7 @@ type fakePublisher struct {
 
 	buildCompletedErr error
 	completed         []completedEvent
+	completions       []service.SettlementCompletion // Con la revisión y las diferencias
 }
 
 type completedEvent struct {
@@ -130,8 +132,9 @@ func (f *fakePublisher) BuildBatchClosed(context.Context, *aggregate.SettlementB
 	return "posnet.settlement.batch-closed.v1", "event-closed", []byte("{}"), f.buildBatchClosedErr
 }
 
-func (f *fakePublisher) BuildSettlementCompleted(_ context.Context, merchantID, date string, batches int, gross, adj, net int64, currency string, mdr float64) (string, string, []byte, error) {
-	f.completed = append(f.completed, completedEvent{merchantID, date, batches, gross, adj, net, currency, mdr})
+func (f *fakePublisher) BuildSettlementCompleted(_ context.Context, c service.SettlementCompletion) (string, string, []byte, error) {
+	f.completed = append(f.completed, completedEvent{c.MerchantID, c.SettlementDate, c.TotalBatches, c.TotalAmount, c.AdjustmentAmount, c.NetAmount, c.Currency, c.MDRPercent})
+	f.completions = append(f.completions, c)
 	return "posnet.settlement.completed.v1", "event-completed", []byte("{}"), f.buildCompletedErr
 }
 

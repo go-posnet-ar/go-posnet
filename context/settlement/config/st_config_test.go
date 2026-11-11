@@ -18,7 +18,7 @@ var optionalEnvKeys = []string{
 	"OTEL_SERVICE_NAME", "OTEL_SERVICE_VERSION", "OTEL_EXPORTER_OTLP_ENDPOINT", "ENVIRONMENT",
 	"SETTLEMENT_MDR_PERCENT", "SETTLEMENT_BATCH_CLOSE_HOUR", "SETTLEMENT_BATCH_CLOSE_GRACE",
 	"SETTLEMENT_SUBMIT_RETRIES", "SETTLEMENT_SUBMIT_TIMEOUT", "SETTLEMENT_PROCESSOR", "SETTLEMENT_BUSINESS_TIMEZONE", "SETTLEMENT_ADMIN_API_KEY",
-	"SETTLEMENT_REQUIRE_REASON",
+	"SETTLEMENT_REQUIRE_REASON", "SETTLEMENT_AUTO_CLOSE_POLICY",
 }
 
 func clearOptionalEnv(t *testing.T) {
@@ -549,6 +549,35 @@ func TestLoad_RequireReason(t *testing.T) {
 			}
 			if cfg.Settlement.RequireReason != tc.want {
 				t.Errorf("RequireReason = %v, want %v", cfg.Settlement.RequireReason, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoad_AutoClosePolicy(t *testing.T) {
+	tests := []struct {
+		value, want string
+		wantErr     bool
+	}{
+		{"", AutoCloseSubmit, false},
+		{"submit", AutoCloseSubmit, false},
+		{"hold", AutoCloseHold, false},
+		{"retain", "", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.value, func(t *testing.T) {
+			clearOptionalEnv(t)
+			setRequiredEnv(t)
+			t.Setenv("SETTLEMENT_AUTO_CLOSE_POLICY", tc.value)
+			cfg, err := Load()
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "SETTLEMENT_AUTO_CLOSE_POLICY") {
+					t.Fatalf("Load() error = %v, want it to name SETTLEMENT_AUTO_CLOSE_POLICY", err)
+				}
+				return
+			}
+			if err != nil || cfg.Settlement.AutoClosePolicy != tc.want {
+				t.Errorf("Load() = %q, %v, want %q", cfg.Settlement.AutoClosePolicy, err, tc.want)
 			}
 		})
 	}

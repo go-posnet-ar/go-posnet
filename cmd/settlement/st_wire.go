@@ -126,6 +126,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	batchHandler.SetTerminalDayBatches(batchRepo)
 	batchHandler.SetBatchSubmissions(batchRepo)
 	batchHandler.SetPendingTerminalCloses(batchRepo)
+	batchHandler.HoldUnreconciledAutoCloses(cfg.Settlement.AutoClosePolicy == config.AutoCloseHold)
 	businessLocation, err := time.LoadLocation(cfg.Settlement.BusinessTimezone)
 	if err != nil {
 		return nil, fmt.Errorf("wire: load business timezone: %w", err)
@@ -136,6 +137,7 @@ func wire(ctx context.Context, cfg *config.Config) (*app, error) {
 	}
 	adminHandler := command.NewAdminHandler(batchRepo, processor)
 	adminHandler.SetMetrics(settlementMetrics)
+	adminHandler.SetSettlementCompletions(batchRepo)
 	adminHandler.RequireReason(cfg.Settlement.RequireReason)
 	if !cfg.Settlement.RequireReason {
 		slog.Warn("force-close, resubmit and settle accept requests without a reason — set SETTLEMENT_REQUIRE_REASON=true once clients send it")

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/juantevez/go-posnet/context/settlement/domain/aggregate"
+	"github.com/juantevez/go-posnet/context/settlement/domain/service"
 	"github.com/juantevez/go-posnet/pkg/events"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
 )
@@ -40,6 +41,7 @@ func (p *EventPublisher) BuildBatchClosed(ctx context.Context, b *aggregate.Sett
 
 		AdjustmentCount:  b.Summary().AdjustmentCount(),
 		AdjustmentAmount: b.Summary().AdjustmentAmount(),
+		ReconciledWith:   b.ReconciledWith(),
 	}
 
 	eventID, data, err := p.pub.Build(ctx,
@@ -56,25 +58,24 @@ func (p *EventPublisher) BuildBatchClosed(ctx context.Context, b *aggregate.Sett
 }
 
 // BuildSettlementCompleted serializa el resumen de liquidación diaria sin publicarlo.
-func (p *EventPublisher) BuildSettlementCompleted(
-	ctx context.Context,
-	merchantID, settlementDate string,
-	totalBatches int,
-	totalAmount, adjustmentAmount, netAmount int64,
-	currency string,
-	mdrPercent float64,
-) (string, string, []byte, error) {
+func (p *EventPublisher) BuildSettlementCompleted(ctx context.Context, c service.SettlementCompletion) (string, string, []byte, error) {
+	merchantID := c.MerchantID
 	payload := events.SettlementCompletedPayload{
-		MerchantID:     merchantID,
-		SettlementDate: settlementDate,
-		TotalBatches:   totalBatches,
-		TotalAmount:    totalAmount,
-		Currency:       currency,
+		MerchantID:     c.MerchantID,
+		SettlementDate: c.SettlementDate,
+		TotalBatches:   c.TotalBatches,
+		TotalAmount:    c.TotalAmount,
+		Currency:       c.Currency,
 
-		AdjustmentAmount: adjustmentAmount,
-		NetAmount:        netAmount,
-		MDRPercent:       mdrPercent,
+		AdjustmentAmount: c.AdjustmentAmount,
+		NetAmount:        c.NetAmount,
+		MDRPercent:       c.MDRPercent,
 		CompletedAt:      time.Now().UTC().Format(time.RFC3339),
+
+		Revision:       c.Revision,
+		DeltaBatches:   c.DeltaBatches,
+		DeltaAmount:    c.DeltaAmount,
+		DeltaNetAmount: c.DeltaNetAmount,
 	}
 
 	eventID, data, err := p.pub.Build(ctx,

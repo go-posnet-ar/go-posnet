@@ -68,6 +68,29 @@ type MerchantDayBatch struct {
 	AdjustmentAmount int64
 }
 
+// DailyCompletion es una revisión de settlement.completed ya emitida: lo que se le informó al
+// comercio para ese día y moneda.
+type DailyCompletion struct {
+	MerchantID       domain.MerchantID
+	Date             time.Time
+	Currency         string
+	Revision         int
+	TotalBatches     int
+	TotalAmount      int64
+	AdjustmentAmount int64
+	NetAmount        *int64 // Nil en las filas que completó 000016: el MDR de entonces no se guardaba
+	EventID          string // Vacío en las filas que completó 000016
+}
+
+// SettlementCompletions guarda las revisiones de settlement.completed emitidas, para numerar la
+// siguiente y calcular su diferencia. Se usa dentro del advisory lock de MerchantDayBatchesTx.
+type SettlementCompletions interface {
+	// LastCompletionTx devuelve la última revisión del comercio, día y moneda, o nil.
+	LastCompletionTx(ctx context.Context, tx pgx.Tx, merchantID domain.MerchantID, date time.Time, currency string) (*DailyCompletion, error)
+	// InsertCompletionTx guarda una revisión nueva.
+	InsertCompletionTx(ctx context.Context, tx pgx.Tx, c DailyCompletion) error
+}
+
 // Acciones de operador que quedan en la auditoría.
 const (
 	AuditActionForceClose      = "FORCE_CLOSE"
