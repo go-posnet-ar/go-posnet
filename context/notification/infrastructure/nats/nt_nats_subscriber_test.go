@@ -68,10 +68,10 @@ func TestSubscribe_RegistersAllConsumers(t *testing.T) {
 	if err := s.Subscribe(); err != nil {
 		t.Fatalf("Subscribe() error = %v", err)
 	}
-	if len(js.subscribeCalls) != 3 {
-		t.Fatalf("QueueSubscribe calls = %d, want 3", len(js.subscribeCalls))
+	if len(js.subscribeCalls) != 4 {
+		t.Fatalf("QueueSubscribe calls = %d, want 4", len(js.subscribeCalls))
 	}
-	wantSubjects := []string{events.SubjectAuthApproved, events.SubjectAuthRejected, events.SubjectBatchClosed}
+	wantSubjects := []string{events.SubjectAuthApproved, events.SubjectAuthRejected, events.SubjectBatchClosed, events.SubjectSettlementCompleted}
 	for i, want := range wantSubjects {
 		if js.subscribeCalls[i].subject != want {
 			t.Errorf("call[%d].subject = %q, want %q", i, js.subscribeCalls[i].subject, want)
@@ -335,6 +335,32 @@ func TestHandleBatchClosed_Success(t *testing.T) {
 	waitForSaves(t, repo.saveSignal, 2)
 	if repo.savedCount() != 2 {
 		t.Errorf("saved count = %d, want 2", repo.savedCount())
+	}
+}
+
+func TestHandleSettlementCompleted_Success(t *testing.T) {
+	pool := newMockPool(t)
+	expectClaimed(pool, 1)
+
+	repo := &fakeNotificationRepo{saveSignal: make(chan struct{}, 10)}
+	webhook := &fakeWebhookDispatcher{httpStatus: 200}
+	h := command.NewNotifyHandler(repo, &fakeTerminalNotifier{}, webhook, &fakeDomainPublisher{}, natsutil.NewIdempotencyStore(nil, idempotencySchema), pool)
+	s := NewSubscriber(&fakeJetStream{}, h)
+
+	payload := events.SettlementCompletedPayload{
+		MerchantID: domain.NewMerchantID().String(), SettlementDate: "2026-01-01", Currency: "ARS",
+		TotalBatches: 2, TotalAmount: 15000, NetAmount: 14625, MDRPercent: 2.5, CompletedAt: "2026-01-02T10:00:00Z",
+		Revision: 2, DeltaBatches: 1, DeltaAmount: 5000, DeltaNetAmount: 4875,
+	}
+	s.handleSettlementCompleted(newEnvelopeMsg(t, events.SubjectSettlementCompleted, payload.MerchantID, payload))
+
+	waitForSaves(t, repo.saveSignal, 2)
+	if repo.savedCount() != 2 {
+		t.Fatalf("saved count = %d, want 2", repo.savedCount())
+	}
+	settlement := repo.lastSaved().Receipt().Settlement
+	if settlement == nil || settlement.Revision != 2 || settlement.DeltaNetAmount != 4875 || repo.lastSaved().Receipt().AmountCents != 14625 {
+		t.Errorf("receipt = %+v, settlement = %+v", repo.lastSaved().Receipt(), settlement)
 	}
 }
 

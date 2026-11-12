@@ -18,6 +18,7 @@ import (
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
+	"github.com/juantevez/go-posnet/pkg/events"
 	"github.com/juantevez/go-posnet/pkg/natsutil"
 	"github.com/juantevez/go-posnet/pkg/observability"
 	"github.com/juantevez/go-posnet/pkg/outbox"
@@ -402,6 +403,11 @@ func (h *BatchHandler) addLate(ctx context.Context, tx pgx.Tx, l lateTx) (*lateS
 			}
 		}
 	}
+	if released {
+		if err := enqueueRevisedBatch(ctx, tx, h.publisher, h.outbox, batch, events.BatchCloseRelease); err != nil {
+			return nil, err
+		}
+	}
 	return &lateSale{batch: batch, txType: l.txType, previous: previous, released: released}, nil
 }
 
@@ -680,7 +686,7 @@ func (h *BatchHandler) ProcessBatchClose(ctx context.Context, cmd port.ProcessBa
 					return err
 				}
 			}
-			return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch)
+			return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch, events.BatchCloseTerminal)
 		})
 	})
 	if err != nil {
@@ -828,15 +834,20 @@ func (h *BatchHandler) ReleaseHeldBatch(ctx context.Context, batchID string) err
 			if err := h.batchRepo.SaveTx(ctx, tx, loaded); err != nil {
 				return err
 			}
-			if !rel || h.audit == nil {
+			if !rel {
 				return nil
 			}
-			return h.audit.InsertAuditTx(ctx, tx, repository.BatchAuditEntry{
-				BatchID: batchID, Action: repository.AuditActionAutoRelease, OperatorID: "system",
-				Reason:    "last reversal review closed and the batch reconciles against " + loaded.ReconciledWith(),
-				FromState: valueobject.BatchStateDisputed.String(), ToState: loaded.State().String(),
-				PreviousDiscrepancies: previous,
-			})
+			if h.audit != nil {
+				if err := h.audit.InsertAuditTx(ctx, tx, repository.BatchAuditEntry{
+					BatchID: batchID, Action: repository.AuditActionAutoRelease, OperatorID: "system",
+					Reason:    "last reversal review closed and the batch reconciles against " + loaded.ReconciledWith(),
+					FromState: valueobject.BatchStateDisputed.String(), ToState: loaded.State().String(),
+					PreviousDiscrepancies: previous,
+				}); err != nil {
+					return err
+				}
+			}
+			return enqueueRevisedBatch(ctx, tx, h.publisher, h.outbox, loaded, events.BatchCloseRelease)
 		})
 		if err != nil {
 			return err
@@ -938,12 +949,22 @@ func (h *BatchHandler) pendingTerminalTotals(ctx context.Context, batch *aggrega
 }
 
 // enqueueBatchClosed guarda el evento BatchClosed en el outbox, dentro de tx.
-func enqueueBatchClosed(ctx context.Context, tx pgx.Tx, publisher service.EventPublisher, store *outbox.Store, batch *aggregate.SettlementBatch) error {
-	subject, eventID, payload, err := publisher.BuildBatchClosed(ctx, batch)
+func enqueueBatchClosed(ctx context.Context, tx pgx.Tx, publisher service.EventPublisher, store *outbox.Store, batch *aggregate.SettlementBatch, trigger string) error {
+	subject, eventID, payload, err := publisher.BuildBatchClosed(ctx, batch, trigger)
 	if err != nil {
 		return fmt.Errorf("build BatchClosed: %w", err)
 	}
 	return store.InsertTx(ctx, tx, subject, eventID, payload)
+}
+
+// enqueueRevisedBatch vuelve a informar un lote en disputa que pasó a CLOSED con sus totales
+// recalculados: Notification solo conocía los del primer cierre. Un lote que quedó VOID no tiene
+// nada que informar, como en el cierre automático.
+func enqueueRevisedBatch(ctx context.Context, tx pgx.Tx, publisher service.EventPublisher, store *outbox.Store, batch *aggregate.SettlementBatch, trigger string) error {
+	if publisher == nil || store == nil || batch.State() != valueobject.BatchStateClosed || batch.IsEmpty() {
+		return nil
+	}
+	return enqueueBatchClosed(ctx, tx, publisher, store, batch, trigger)
 }
 
 // Reintentos ante un conflicto de versión. Son internos porque las entregas de NATS
@@ -1165,7 +1186,7 @@ func (h *BatchHandler) autoCloseBatch(ctx context.Context, batchID, runDate stri
 		if len(batch.Transactions()) == 0 {
 			return nil
 		}
-		return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch)
+		return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch, events.BatchCloseAuto)
 	})
 	if err != nil {
 		return false, fmt.Errorf("persist batch: %w", err)

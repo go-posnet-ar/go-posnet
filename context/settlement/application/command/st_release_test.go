@@ -40,6 +40,14 @@ func expectReleaseTx(pool pgxmock.PgxPoolIface) {
 	pool.ExpectRollback()
 }
 
+// expectReleasedTx es la liberación de un lote con transacciones: vuelve a informar sus totales.
+func expectReleasedTx(pool pgxmock.PgxPoolIface) {
+	pool.ExpectBeginTx(pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	expectOutboxInsert(pool)
+	pool.ExpectCommit()
+	pool.ExpectRollback()
+}
+
 func TestReleaseHeldBatch(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -61,7 +69,10 @@ func TestReleaseHeldBatch(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := newMockPool(t)
-			if tc.wantTx {
+			switch {
+			case tc.wantSubmit:
+				expectReleasedTx(pool)
+			case tc.wantTx:
 				expectReleaseTx(pool)
 			}
 			repo := &fakeBatchRepo{findByIDResult: tc.batch}
@@ -94,7 +105,7 @@ func TestRegisterApproval_ReleasesTheBatchItWasHolding(t *testing.T) {
 	repo := &fakeBatchRepo{findOrCreateResult: purchaseBatch, findByIDResult: held}
 	pool := newMockPool(t)
 	expectClaimed(pool, 1)
-	expectReleaseTx(pool)
+	expectReleasedTx(pool)
 	reviews := &fakeReviews{reconcileResult: repository.ReviewReconciliation{Resolved: true, BatchID: "b-1"}}
 	h := newHandler(pool, repo, &fakePublisher{}, &fakeProcessor{confirmationID: "conf-1"})
 	h.SetReversalReviews(reviews)
@@ -302,7 +313,7 @@ func TestResolveReversalReview_CorrectsAnAcceptedReviewOnceItsBatchWasSent(t *te
 func TestReleaseHeldBatches_RetriesEachBatch(t *testing.T) {
 	held := heldBatch(t, valueobject.BatchStateDisputed, aggregate.ReconciledWithTerminal, 1, 1000)
 	pool := newMockPool(t)
-	expectReleaseTx(pool)
+	expectReleasedTx(pool)
 	repo := &fakeBatchRepo{findByIDResult: held}
 	processor := &fakeProcessor{confirmationID: "conf-1"}
 	h := newHandler(pool, repo, &fakePublisher{}, processor)
@@ -345,7 +356,7 @@ func TestReleaseHeldBatches_ListError(t *testing.T) {
 func TestReleaseHeldBatch_SentWithOtherTotalsStaysClosed(t *testing.T) {
 	held := heldBatch(t, valueobject.BatchStateDisputed, aggregate.ReconciledWithBackend, 0, 0)
 	pool := newMockPool(t)
-	expectReleaseTx(pool)
+	expectReleasedTx(pool)
 	repo := &fakeBatchRepo{findByIDResult: held}
 	processor := &fakeProcessor{confirmationID: "conf-2"}
 	h := newHandler(pool, repo, &fakePublisher{}, processor)

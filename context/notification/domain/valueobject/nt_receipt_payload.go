@@ -10,7 +10,7 @@ type ReceiptPayload struct {
 	MerchantName    string
 	MerchantAddress string
 	TerminalCode    string
-	Result          string // "APPROVED" | "REJECTED" | "REVERSED"
+	Result          string // "APPROVED" | "REJECTED" | "REVERSED" | "BATCH_CLOSED" | "BATCH_REVISED" | "SETTLEMENT_COMPLETED"
 	AuthCode        string // Solo si Result == "APPROVED"
 	RejectionCode   string // Solo si Result == "REJECTED"
 	RejectionReason string // Solo si Result == "REJECTED"
@@ -20,6 +20,46 @@ type ReceiptPayload struct {
 	CardNetwork     string
 	EntryMode       string
 	TransactionAt   string // RFC3339 UTC
+
+	// Batch es el detalle de un cierre de lote (BATCH_CLOSED o BATCH_REVISED). Nil en los demás.
+	Batch *BatchReceipt `json:",omitempty"`
+	// Settlement es el detalle de una liquidación diaria (SETTLEMENT_COMPLETED). Nil en los demás.
+	Settlement *SettlementReceipt `json:",omitempty"`
+}
+
+// Resultados de los comprobantes que no son de una transacción.
+const (
+	ResultBatchClosed  = "BATCH_CLOSED"
+	ResultBatchRevised = "BATCH_REVISED" // Un lote en disputa volvió a CLOSED con otros totales
+	// ResultSettlementCompleted es el resumen de liquidación diaria de un comercio, en una moneda.
+	ResultSettlementCompleted = "SETTLEMENT_COMPLETED"
+)
+
+// BatchReceipt detalla un cierre de lote. AmountCents del comprobante es el total, con los ajustes.
+type BatchReceipt struct {
+	BatchDate        string // YYYY-MM-DD
+	TerminalID       string
+	TotalCount       int // Compras y reversas; los ajustes no cuentan
+	Discrepancies    int // 0 si coincide con el terminal
+	AdjustmentCount  int
+	AdjustmentAmount int64 // Con signo: positivo devuelve al comercio
+	ReconciledWith   string
+	Trigger          string // Por qué se emitió: ver events.BatchClose*
+}
+
+// SettlementReceipt detalla una revisión del resumen de liquidación diaria. AmountCents del
+// comprobante es el neto acumulado del día.
+type SettlementReceipt struct {
+	SettlementDate   string // YYYY-MM-DD
+	Revision         int    // 1 en el primer resumen; uno más por cada lote liquidado después
+	TotalBatches     int
+	GrossAmount      int64 // Acumulado, con los ajustes
+	AdjustmentAmount int64
+	NetAmount        int64
+	MDRPercent       float64
+	DeltaBatches     int // Lo que agrega esta revisión
+	DeltaAmount      int64
+	DeltaNetAmount   int64
 }
 
 // NewReceiptPayload crea un ReceiptPayload validando los campos requeridos.

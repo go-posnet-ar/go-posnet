@@ -18,6 +18,7 @@ import (
 	"github.com/juantevez/go-posnet/context/settlement/domain/valueobject"
 	"github.com/juantevez/go-posnet/pkg/domain"
 	pkgerrors "github.com/juantevez/go-posnet/pkg/errors"
+	"github.com/juantevez/go-posnet/pkg/events"
 	"github.com/juantevez/go-posnet/pkg/observability"
 	"github.com/juantevez/go-posnet/pkg/outbox"
 	"github.com/juantevez/go-posnet/pkg/pgutil"
@@ -211,7 +212,7 @@ func (h *AdminHandler) ForceClose(ctx context.Context, cmd port.ForceCloseComman
 		if len(batch.Transactions()) == 0 {
 			return nil
 		}
-		return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch)
+		return enqueueBatchClosed(ctx, tx, h.publisher, h.outbox, batch, events.BatchCloseForce)
 	})
 	if err != nil {
 		return fmt.Errorf("ForceClose: save: %w", err)
@@ -406,7 +407,15 @@ func (h *AdminHandler) ResolveDispute(ctx context.Context, cmd port.ResolveDispu
 	if err := batch.ResolveDispute(); err != nil {
 		return fmt.Errorf("ResolveDispute: %w", err)
 	}
-	if err := h.persist(ctx, batch, entry, nil); err != nil {
+	// Sin transacciones no hay nada que enviar: queda VOID, como en los cierres.
+	if err := voidIfEmpty(batch); err != nil {
+		return fmt.Errorf("ResolveDispute: %w", err)
+	}
+	// Los totales pueden haber cambiado desde el cierre: se vuelven a informar, en el mismo guardado.
+	err = h.persist(ctx, batch, entry, func(tx pgx.Tx) error {
+		return enqueueRevisedBatch(ctx, tx, h.publisher, h.outbox, batch, events.BatchCloseResolveDispute)
+	})
+	if err != nil {
 		return fmt.Errorf("ResolveDispute: save: %w", err)
 	}
 

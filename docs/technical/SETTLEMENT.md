@@ -27,7 +27,7 @@ lotes, o al cerrarlos y liquidarlos.
 | Cierre automático | Implementado | Lotes de días de negocio anteriores, sin conciliación |
 | Resolución de disputas | Implementado | `reopen` y `resolve-dispute` |
 | Liquidación y comisión (MDR) | Implementado | Confirmación manual con `settle` |
-| Publicación de `batch-closed` y `settlement.completed` | Implementado | Por outbox, con reintentos. Nadie consume `settlement.completed` |
+| Publicación de `batch-closed` y `settlement.completed` | Implementado | Por outbox, con reintentos. Notification avisa los dos al comercio |
 | Consulta de lotes | Implementado | HTTP, sin autenticación |
 | Envío al procesador | **Simulado** | `none` no envía; `mock` acepta sin enviar nada |
 | Cierre forzado por soporte | Implementado | Con los totales del backend, sin conciliación |
@@ -228,7 +228,9 @@ Un lote retenido solo por revisiones cerró sin discrepancias: lo que informó e
 del cierre, y las acciones sobre las revisiones cambian las transacciones, no esos totales. `000010` los copia en los
 lotes de antes de `000007`, aunque el lote lo haya cerrado el job: es la comparación más estricta.
 
-La liberación queda en la auditoría como `AUTO_RELEASE`, con `operator_id` `system`. Corre después de cerrar la
+La liberación queda en la auditoría como `AUTO_RELEASE`, con `operator_id` `system`, y **encola otro `batch-closed`**,
+con `trigger` `release`, en la misma transacción: Notification solo conocía los totales del primer cierre (ver
+[Publicados](#publicados)). Corre después de cerrar la
 revisión, en su propia transacción: si falla, la revisión ya está cerrada y el lote sigue `DISPUTED`, con un log
 `could not release the held batch`. **Se reintenta al arrancar y cada 5 minutos,** para los lotes `DISPUTED` sin
 discrepancias, con la referencia guardada y sin revisiones abiertas (log `retrying the release of a held batch`). Corre
@@ -395,8 +397,9 @@ llega ningún pedido, lo cierra el job automático al día siguiente, sin concil
 **`reopen` falla si ya hay otro lote `OPEN`** de ese terminal, día y moneda, porque solo puede haber uno. En
 ese caso, usar `resolve-dispute`.
 
-Después de `resolve-dispute`, hay que enviar el lote con `resubmit`. Ninguna de las dos operaciones publica
-un nuevo evento: si los totales cambian, Notification no se entera.
+Después de `resolve-dispute`, hay que enviar el lote con `resubmit`. **`resolve-dispute` vuelve a informar el lote:**
+encola otro `batch-closed`, con `trigger` `resolve_dispute` y los totales recalculados, en la misma transacción. Un lote
+sin transacciones queda [`VOID`](#lotes-vacíos), sin evento. `reopen` no publica nada: el cierre siguiente lo hace.
 
 ### 5.8 Liquidación
 
@@ -867,7 +870,7 @@ el log `dead letter could not be published`, salta `EventoSettlementPerdido`, y 
 | Subject | Stream | ¿Se publica? | Consumidor |
 |---|---|---|---|
 | `posnet.settlement.batch-closed.v1` | `POSNET_SETTLEMENT` | Sí, por outbox | Notification |
-| `posnet.settlement.completed.v1` | `POSNET_SETTLEMENT` | Sí, por outbox | Ninguno: Notification no lo consume |
+| `posnet.settlement.completed.v1` | `POSNET_SETTLEMENT` | Sí, por outbox | Notification |
 
 Los eventos se guardan en `settlement.outbox`, en la misma transacción que el lote. Un Relay revisa la tabla
 cada segundo, publica hasta 50 eventos por ciclo y borra los enviados. Puede correr en varias instancias:
@@ -876,6 +879,20 @@ cada fila la toma una sola, con `FOR UPDATE SKIP LOCKED`.
 **La entrega es al menos una vez.** Si el Relay publica y no llega a borrar la fila, reenvía el evento con el
 mismo `Nats-Msg-Id`: JetStream lo descarta dentro de su ventana de deduplicación, de 2 minutos por defecto.
 Pasada esa ventana, llega duplicado, y el consumidor debe descartarlo por `event_id`, como hace Notification.
+
+**Un lote puede tener más de un `batch-closed`.** El primero sale al cerrarlo. Si queda en disputa y después vuelve a
+`CLOSED` con sus totales recalculados, sale otro, con un `event_id` nuevo:
+
+| `trigger` | Cuándo |
+|---|---|
+| `terminal_close` | El terminal pidió el cierre |
+| `auto_close` | El cierre automático, pasado el día |
+| `force_close` | Un operador, con `force-close` |
+| `resolve_dispute` | Un operador aceptó los totales del backend de un lote en disputa |
+| `release` | Un lote en disputa volvió a conciliar solo: se cerró su última revisión de reversa o llegó una transacción tardía |
+
+Los dos últimos son revisiones de un cierre anterior. Para un mismo lote, vale el de `closed_at` mayor. Un evento sin
+`trigger` es anterior a este campo, y siempre era un cierre.
 
 Payload de `batch-closed`:
 
@@ -887,6 +904,7 @@ Payload de `batch-closed`:
 | `adjustment_count`, `adjustment_amount` | Ajustes del lote: correcciones de lotes ya enviados. `adjustment_amount` tiene signo: positivo devuelve al comercio. Se omiten si no hay |
 | `discrepancies` | Permite distinguir un cierre con diferencias |
 | `reconciled_with` | Contra qué se concilió: `TERMINAL`, `BACKEND` (sin totales del terminal: no se comparó) o `NONE` (sin ellos, retenido en `DISPUTED` para un operador). Con `NONE`, `discrepancies` es 0 aunque el lote no se envíe |
+| `trigger` | Por qué se emitió: ver la tabla de arriba |
 | `closed_at` | RFC3339 UTC |
 
 Payload de `settlement.completed`:
@@ -1238,7 +1256,6 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| Notification no muestra los ajustes | `batch-closed` y `settlement.completed` los informan aparte, pero Notification todavía no lee esos campos: el comercio ve el total sin la explicación | `nt_nats_subscriber.go` |
 | Sin especificación del procesador | Un ajuste viaja dentro del total del lote siguiente. El adaptador tiene el desglose en el lote (`Summary().AdjustmentAmount()` y las transacciones `ADJUSTMENT`), pero hasta conocer el formato no se sabe si hay que informarlos aparte | `ADJUSTMENT` |
 
 ### Ciclo de vida del lote
@@ -1247,13 +1264,12 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 |---|---|---|
 | No hay procesador real | `mock` marca `SUBMITTED` sin enviar nada. Falta el adaptador y el archivo de remesa, que requieren la especificación del procesador. Los reintentos y el plazo ya se aplican, pero sus valores por defecto superan el `WriteTimeout` de la API y el `AckWait` del cierre: hay que ajustarlos con el adaptador | `st_mock_processor.go`, `st_retrying_processor.go` |
 | La confirmación de liquidación es manual | Un operador debe llamar a `settle`, sin una referencia del procesador | `SettleBatch` |
-| Nadie consume `settlement.completed` | El comercio no recibe el neto liquidado: Notification no se suscribe | `nt_nats_subscriber.go` |
-| Un día puede tener varios resúmenes | Un lote liquidado después del resumen diario da otra revisión de `settlement.completed`. Ya llevan `revision` y su diferencia, pero el consumidor tiene que deduplicarlas, y todavía no hay ninguno | `enqueueCompletedIfDone` |
+| Un día puede tener varios resúmenes | Un lote liquidado después del resumen diario da otra revisión de `settlement.completed`, y el comercio recibe un webhook por cada una. Notification no repite una revisión, pero una vieja que llegue después de una nueva se envía igual: el comercio tiene que quedarse con la de `Revision` mayor | `enqueueCompletedIfDone`, `NotifySettlementCompleted` |
 | El cierre automático envía sin conciliar por defecto | Si el terminal nunca pidió el cierre del día, el lote se envía con los totales del backend. Ahora se ve (`reconciled_with`, `posnet_settlement_unreconciled_closes_total`), y `SETTLEMENT_AUTO_CLOSE_POLICY=hold` lo retiene, pero el default es `submit`. La solución de fondo es que los terminales siempre pidan el cierre | `CloseStaleBatches` |
 | `force-close` sin totales no concilia | Si el operador no envía los totales del terminal, asume que los del backend son correctos. Queda visible en `reconciled_with` y en la métrica | `ForceClose` |
 | Un envío sin resultado conocido se repite | Si el procesador falla, demora o se corta después de aceptar, el intento queda sin confirmación y el siguiente lo envía otra vez. No duplica solo si el procesador respeta `batch_id` como clave de idempotencia, lo que depende de su especificación | `sendToProcessor` |
 | Un lote enviado con otros totales no tiene salida por la API | Si una revisión lo retuvo mientras se enviaba y después cambiaron sus totales, queda `CLOSED` con la alerta `LoteConTotalesCambiados`. Ya no se liquida con totales que el procesador no conoce, pero resolverlo, reemplazando la remesa o con un ajuste, depende de la especificación del procesador y se hace a mano | `sendToProcessor` |
-| `resolve-dispute` no notifica | Si los totales cambian, Notification solo conoce los del primer cierre | `ResolveDispute` |
+| Las revisiones de un cierre no se ordenan solas | `resolve-dispute` y la liberación vuelven a publicar `batch-closed`, pero NATS puede entregar una revisión antes que el cierre si este se reintenta. El comercio tiene que quedarse con el de `closed_at` mayor | `enqueueRevisedBatch` |
 | La auditoría solo está protegida contra la aplicación | El trigger de `000015` rechaza cambios, pero el dueño de la tabla lo puede desactivar, y Docker Compose conecta el servicio con ese rol. Tampoco hay una cadena de hashes que revele un cambio hecho así | `batch_audit_log` |
 | El motivo de `force-close`, `resubmit` y `settle` es opcional | Hasta activar `SETTLEMENT_REQUIRE_REASON=true` en cada entorno, la auditoría puede quedar sin `reason`. `posnet_settlement_admin_missing_reason_total` muestra cuándo se puede activar | `checkReason` |
 

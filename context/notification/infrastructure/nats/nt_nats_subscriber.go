@@ -30,7 +30,7 @@ func NewSubscriber(js natsclient.JetStreamContext, handler *command.NotifyHandle
 	}
 }
 
-// Subscribe registra los 3 consumers del BC Notification.
+// Subscribe registra los consumers del BC Notification.
 func (s *Subscriber) Subscribe() error {
 	consumers := []struct {
 		subject  string
@@ -54,6 +54,12 @@ func (s *Subscriber) Subscribe() error {
 			subject:  events.SubjectBatchClosed,
 			durable:  "notify-batch-closed",
 			handler:  s.handleBatchClosed,
+			maxDeliv: 3,
+		},
+		{
+			subject:  events.SubjectSettlementCompleted,
+			durable:  "notify-settlement-completed",
+			handler:  s.handleSettlementCompleted,
 			maxDeliv: 3,
 		},
 	}
@@ -200,9 +206,61 @@ func (s *Subscriber) handleBatchClosed(msg *natsclient.Msg) {
 		Currency:      payload.Currency,
 		Discrepancies: payload.Discrepancies,
 		ClosedAt:      payload.ClosedAt,
+
+		AdjustmentCount:  payload.AdjustmentCount,
+		AdjustmentAmount: payload.AdjustmentAmount,
+		ReconciledWith:   payload.ReconciledWith,
+		Trigger:          payload.Trigger,
+		Revision:         payload.IsRevision(),
 	}
 
 	if err := s.handler.NotifyBatchClosed(ctx, cmd); err != nil {
+		s.nak(ctx, msg, err, envelope.EventID)
+		return
+	}
+	_ = msg.Ack()
+}
+
+func (s *Subscriber) handleSettlementCompleted(msg *natsclient.Msg) {
+	ctx := observability.ExtractTraceContext(context.Background(), msg)
+	ctx, span := observability.StartSpan(ctx, "subscriber.handleSettlementCompleted")
+	defer span.End()
+
+	envelope, err := events.UnmarshalEnvelope(msg.Data)
+	if err != nil {
+		s.log.ErrorContext(ctx, "failed to unmarshal envelope", slog.String("error", err.Error()))
+		_ = msg.Term()
+		return
+	}
+
+	payload, err := events.Unwrap[events.SettlementCompletedPayload](envelope)
+	if err != nil {
+		s.log.ErrorContext(ctx, "failed to unwrap SettlementCompleted",
+			slog.String("event_id", envelope.EventID),
+			slog.String("error", err.Error()),
+		)
+		_ = msg.Term()
+		return
+	}
+
+	cmd := port.NotifySettlementCompletedCommand{
+		EventID:          envelope.EventID,
+		MerchantID:       payload.MerchantID,
+		SettlementDate:   payload.SettlementDate,
+		Currency:         payload.Currency,
+		Revision:         payload.Revision,
+		TotalBatches:     payload.TotalBatches,
+		TotalAmount:      payload.TotalAmount,
+		AdjustmentAmount: payload.AdjustmentAmount,
+		NetAmount:        payload.NetAmount,
+		MDRPercent:       payload.MDRPercent,
+		DeltaBatches:     payload.DeltaBatches,
+		DeltaAmount:      payload.DeltaAmount,
+		DeltaNetAmount:   payload.DeltaNetAmount,
+		CompletedAt:      payload.CompletedAt,
+	}
+
+	if err := s.handler.NotifySettlementCompleted(ctx, cmd); err != nil {
 		s.nak(ctx, msg, err, envelope.EventID)
 		return
 	}

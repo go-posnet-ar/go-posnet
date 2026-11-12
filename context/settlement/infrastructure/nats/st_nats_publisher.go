@@ -23,7 +23,7 @@ func NewEventPublisher(pub *natsutil.Publisher) *EventPublisher {
 
 // BuildBatchClosed serializa el evento BatchClosed sin publicarlo.
 // Consumido por: Notification BC.
-func (p *EventPublisher) BuildBatchClosed(ctx context.Context, b *aggregate.SettlementBatch) (string, string, []byte, error) {
+func (p *EventPublisher) BuildBatchClosed(ctx context.Context, b *aggregate.SettlementBatch, trigger string) (string, string, []byte, error) {
 	if b.Summary() == nil {
 		return "", "", nil, fmt.Errorf("st publisher: cannot build BatchClosed — summary is nil")
 	}
@@ -42,6 +42,7 @@ func (p *EventPublisher) BuildBatchClosed(ctx context.Context, b *aggregate.Sett
 		AdjustmentCount:  b.Summary().AdjustmentCount(),
 		AdjustmentAmount: b.Summary().AdjustmentAmount(),
 		ReconciledWith:   b.ReconciledWith(),
+		Trigger:          trigger,
 	}
 
 	eventID, data, err := p.pub.Build(ctx,

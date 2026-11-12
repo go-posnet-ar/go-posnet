@@ -839,7 +839,12 @@ func TestAudit_ReopenAndResolveKeepReason(t *testing.T) {
 			previous := b.Discrepancies()
 			repo := &fakeBatchRepo{findByIDResult: b}
 			h, pool := newEventAdmin(t, repo, &fakePublisher{}, 2.5)
-			expectEventTx(pool, 0)
+			// resolve-dispute vuelve a informar los totales: encola un BatchClosed.
+			events := 0
+			if tc.wantState == "CLOSED" {
+				events = 1
+			}
+			expectEventTx(pool, events)
 
 			if err := tc.run(h, b.ID()); err != nil {
 				t.Fatalf("operation error = %v", err)

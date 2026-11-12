@@ -180,6 +180,7 @@ nombres desactualizados y `EnsureConsumers` no se invoca.
 | `notify-auth-approved` | `POSNET_AUTH` | `posnet.auth.approved.v1` | 3 |
 | `notify-auth-rejected` | `POSNET_AUTH` | `posnet.auth.rejected.v1` | 3 |
 | `notify-batch-closed` | `POSNET_SETTLEMENT` | `posnet.settlement.batch-closed.v1` | 3 |
+| `notify-settlement-completed` | `POSNET_SETTLEMENT` | `posnet.settlement.completed.v1` | 3 |
 
 Cómo leer los valores:
 

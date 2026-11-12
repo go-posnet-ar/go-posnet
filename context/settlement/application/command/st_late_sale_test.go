@@ -76,7 +76,12 @@ func TestRegisterApproval_LateSaleCompletesItsDisputedBatch(t *testing.T) {
 			open := newOpenBatch(t, late.TerminalID(), late.MerchantID())
 			repo := &fakeBatchRepo{findByIDResult: late, findOrCreateResult: open}
 			pool := newMockPool(t)
-			expectClaimed(pool, 1)
+			// Liberado, vuelve a informar sus totales en la misma transacción.
+			if tc.wantSubmit {
+				expectClaimedWithEvent(pool)
+			} else {
+				expectClaimed(pool, 1)
+			}
 			processor := &fakeProcessor{confirmationID: "conf-1"}
 			h := newHandler(pool, repo, &fakePublisher{}, processor)
 			h.SetAuditLog(repo)
@@ -288,7 +293,11 @@ func TestRegisterReversal_LateReversalCompletesItsDisputedBatch(t *testing.T) {
 			open := newOpenBatch(t, late.TerminalID(), late.MerchantID())
 			repo := &fakeBatchRepo{findByIDResult: late, findOrCreateResult: open}
 			pool := newMockPool(t)
-			expectClaimed(pool, 1)
+			if tc.wantState == valueobject.BatchStateSubmitted {
+				expectClaimedWithEvent(pool)
+			} else {
+				expectClaimed(pool, 1)
+			}
 			processor := &fakeProcessor{confirmationID: "conf-1"}
 			h := newHandler(pool, repo, &fakePublisher{}, processor)
 			h.SetAuditLog(repo)

@@ -82,6 +82,30 @@ type NotifyBatchClosedCommand struct {
 	Currency      string
 	Discrepancies int
 	ClosedAt      string // RFC3339 UTC
+
+	AdjustmentCount  int
+	AdjustmentAmount int64
+	ReconciledWith   string
+	Trigger          string // events.BatchClose*: un cierre o una revisión
+	Revision         bool   // Corrige un cierre anterior del mismo lote
+}
+
+// NotifySettlementCompletedCommand contiene los datos del evento SettlementCompleted.
+type NotifySettlementCompletedCommand struct {
+	EventID          string
+	MerchantID       string
+	SettlementDate   string // YYYY-MM-DD
+	Currency         string
+	Revision         int
+	TotalBatches     int
+	TotalAmount      int64
+	AdjustmentAmount int64
+	NetAmount        int64
+	MDRPercent       float64
+	DeltaBatches     int
+	DeltaAmount      int64
+	DeltaNetAmount   int64
+	CompletedAt      string // RFC3339 UTC
 }
 
 // ─── Results ─────────────────────────────────────────────────────────────────

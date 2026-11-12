@@ -29,6 +29,9 @@ type fakeNotificationRepo struct {
 
 	findResult *aggregate.Notification
 	findErr    error
+
+	byTransaction    []*aggregate.Notification // Lo que devuelve FindByTransactionID
+	byTransactionErr error
 }
 
 var _ repository.NotificationRepository = (*fakeNotificationRepo)(nil)
@@ -71,7 +74,7 @@ func (f *fakeNotificationRepo) FindByID(context.Context, string) (*aggregate.Not
 }
 
 func (f *fakeNotificationRepo) FindByTransactionID(context.Context, domain.TransactionID) ([]*aggregate.Notification, error) {
-	return nil, nil
+	return f.byTransaction, f.byTransactionErr
 }
 
 func (f *fakeNotificationRepo) FindPendingRetries(context.Context, int) ([]*aggregate.Notification, error) {

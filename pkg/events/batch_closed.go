@@ -5,9 +5,10 @@ package events
 // Publicado por: Settlement
 // Consumido por: Notification
 //
-// Se emite cuando Settlement termina de procesar el cierre de lote
-// de un terminal. Incluye los totales finales y la cantidad de
-// discrepancias detectadas entre el resumen del terminal y el backend.
+// Se emite cuando Settlement cierra un lote, y otra vez cada vez que un lote en disputa vuelve a
+// CLOSED con sus totales recalculados: Trigger dice por qué. Incluye los totales y la cantidad de
+// discrepancias detectadas entre el resumen del terminal y el backend. Para un mismo lote, el más
+// reciente es el de ClosedAt mayor.
 type BatchClosedPayload struct {
 	BatchID       string `json:"batch_id"`
 	TerminalID    string `json:"terminal_id"`
@@ -28,4 +29,27 @@ type BatchClosedPayload struct {
 	// BACKEND (cerrado sin ellos, por el job o un operador: no se comparó con nada) o NONE
 	// (cerrado sin ellos y retenido en disputa para un operador).
 	ReconciledWith string `json:"reconciled_with,omitempty"`
+
+	// Trigger es lo que emitió el evento: un cierre (BatchCloseTerminal, BatchCloseAuto,
+	// BatchCloseForce) o una revisión de un lote en disputa que volvió a CLOSED
+	// (BatchCloseResolveDispute, BatchCloseRelease). Vacío en los eventos anteriores a este campo,
+	// que siempre eran cierres.
+	Trigger string `json:"trigger,omitempty"`
+}
+
+// Valores de BatchClosedPayload.Trigger.
+const (
+	BatchCloseTerminal = "terminal_close" // El terminal pidió el cierre
+	BatchCloseAuto     = "auto_close"     // El cierre automático, pasado el día
+	BatchCloseForce    = "force_close"    // Un operador, con force-close
+	// BatchCloseResolveDispute: un operador aceptó los totales del backend de un lote en disputa.
+	BatchCloseResolveDispute = "resolve_dispute"
+	// BatchCloseRelease: un lote en disputa volvió a conciliar solo, al cerrarse su última
+	// revisión de reversa o al llegar una transacción tardía.
+	BatchCloseRelease = "release"
+)
+
+// IsRevision indica que el evento corrige un cierre anterior del mismo lote.
+func (p BatchClosedPayload) IsRevision() bool {
+	return p.Trigger == BatchCloseResolveDispute || p.Trigger == BatchCloseRelease
 }

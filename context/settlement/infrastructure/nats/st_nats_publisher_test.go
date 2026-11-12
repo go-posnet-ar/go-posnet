@@ -23,7 +23,7 @@ func TestBuildBatchClosed_NilSummary(t *testing.T) {
 	p := newTestPublisher(js)
 	b := newOpenBatch(t) // OPEN — Summary() es nil
 
-	_, _, _, err := p.BuildBatchClosed(context.Background(), b)
+	_, _, _, err := p.BuildBatchClosed(context.Background(), b, events.BatchCloseTerminal)
 	if err == nil || !strings.Contains(err.Error(), "summary is nil") {
 		t.Fatalf("error = %v, want it to mention summary is nil", err)
 	}
@@ -41,7 +41,7 @@ func TestBuildBatchClosed_Success(t *testing.T) {
 	}
 
 	before := time.Now().UTC().Add(-time.Second)
-	subject, eventID, data, err := p.BuildBatchClosed(context.Background(), b)
+	subject, eventID, data, err := p.BuildBatchClosed(context.Background(), b, events.BatchCloseTerminal)
 	if err != nil {
 		t.Fatalf("BuildBatchClosed() error = %v", err)
 	}
@@ -65,6 +65,9 @@ func TestBuildBatchClosed_Success(t *testing.T) {
 	payload, err := events.Unwrap[events.BatchClosedPayload](envelope)
 	if err != nil {
 		t.Fatalf("Unwrap() error = %v", err)
+	}
+	if payload.Trigger != events.BatchCloseTerminal || payload.IsRevision() {
+		t.Errorf("Trigger = %q, revision %v, want terminal_close and not a revision", payload.Trigger, payload.IsRevision())
 	}
 	if payload.ReconciledWith != "TERMINAL" {
 		t.Errorf("ReconciledWith = %q, want TERMINAL", payload.ReconciledWith)
@@ -198,7 +201,7 @@ func TestBuildBatchClosed_BreaksOutAdjustments(t *testing.T) {
 		t.Fatalf("Close() error = %v", err)
 	}
 
-	_, _, data, err := p.BuildBatchClosed(context.Background(), b)
+	_, _, data, err := p.BuildBatchClosed(context.Background(), b, events.BatchCloseTerminal)
 	if err != nil {
 		t.Fatalf("BuildBatchClosed() error = %v", err)
 	}

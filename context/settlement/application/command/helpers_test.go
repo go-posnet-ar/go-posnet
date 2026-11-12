@@ -113,6 +113,7 @@ func (f *fakeBatchRepo) ClosedTotalsForTerminalDay(context.Context, domain.Termi
 type fakePublisher struct {
 	buildBatchClosedErr   error
 	buildBatchClosedCalls int
+	triggers              []string // El trigger de cada BatchClosed
 
 	buildCompletedErr error
 	completed         []completedEvent
@@ -127,8 +128,9 @@ type completedEvent struct {
 	mdr              float64
 }
 
-func (f *fakePublisher) BuildBatchClosed(context.Context, *aggregate.SettlementBatch) (string, string, []byte, error) {
+func (f *fakePublisher) BuildBatchClosed(_ context.Context, _ *aggregate.SettlementBatch, trigger string) (string, string, []byte, error) {
 	f.buildBatchClosedCalls++
+	f.triggers = append(f.triggers, trigger)
 	return "posnet.settlement.batch-closed.v1", "event-closed", []byte("{}"), f.buildBatchClosedErr
 }
 

@@ -19,8 +19,9 @@ var ErrSubmissionRejected = errors.New("settlement processor rejected the batch"
 // EventPublisher arma los eventos del BC. No los publica: el handler los guarda en el
 // outbox, en la misma transacción que el batch, y el Relay los envía a JetStream.
 type EventPublisher interface {
-	// BuildBatchClosed serializa el evento BatchClosed. Consumido por: Notification BC.
-	BuildBatchClosed(ctx context.Context, batch *aggregate.SettlementBatch) (subject, eventID string, payload []byte, err error)
+	// BuildBatchClosed serializa el evento BatchClosed. Consumido por: Notification BC. trigger es
+	// uno de los events.BatchClose*: por qué se emite.
+	BuildBatchClosed(ctx context.Context, batch *aggregate.SettlementBatch, trigger string) (subject, eventID string, payload []byte, err error)
 
 	// BuildSettlementCompleted serializa el resumen de liquidación diaria.
 	BuildSettlementCompleted(ctx context.Context, c SettlementCompletion) (subject, eventID string, payload []byte, err error)

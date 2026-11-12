@@ -404,8 +404,10 @@ curl -X POST http://<host>:8084/batches/<batch_id>/settle -H "$AUTH" -d '{"opera
 Responde `200` y pasa a `SETTLED`, que es un estado final. Sobre otro estado responde `400`.
 
 Al liquidar el último lote con transacciones del comercio en esa fecha, se encola
-`settlement.completed`, con el bruto, el neto y el MDR. **Hoy ningún servicio lo consume,** así que el
-comercio no recibe ese aviso.
+`settlement.completed`, con el bruto, el neto y el MDR, y Notification se lo avisa al comercio por webhook
+(`SETTLEMENT_COMPLETED`). Un lote del mismo día liquidado después da otra revisión, con su diferencia. Para ver qué se
+avisó, buscá la revisión en `settlement.settlement_completions` (su `event_id`) y, en los logs de Notification,
+`settlement notification created` con ese `event_id`.
 
 ```sql
 -- Lotes del comercio y fecha que faltan liquidar

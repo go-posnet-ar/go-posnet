@@ -1,6 +1,6 @@
 # Notification — Documentación técnica
 
-> Revisado contra el commit `8acbfdf` (2026-11-05). Este documento describe lo que el código hace
+> Revisado contra el commit `8acbfdf` (2026-11-05); cierre de lote y liquidación diaria, el 2026-11-11. Este documento describe lo que el código hace
 > hoy. Si algo difiere del [README del contexto](../../context/notification/README.md) o de los
 > comentarios del código, vale lo que está acá.
 
@@ -21,7 +21,7 @@ haya llegado**, y tres fallas afectan a la operación:
 
 | Capacidad | Estado | Detalle |
 |---|---|---|
-| Registro de notificaciones | Implementado | Aprobación, rechazo y cierre de lote |
+| Registro de notificaciones | Implementado | Aprobación, rechazo, cierre de lote, su revisión y liquidación diaria |
 | Reintentos con espera creciente | Implementado | Solo desde `RETRYING` |
 | Envío de webhooks | **Parcial** | Una sola URL global, sin firma |
 | Comprobante al terminal | **Parcial** | Llama a Terminal Gateway, que no lo entrega |
@@ -41,6 +41,7 @@ Las consecuencias de estos pendientes están en [§11](#11-brechas-conocidas).
 Authorization ── auth.approved ───►┌──────────────┐── gRPC SendReceipt ──► Terminal Gateway ┄┄► Terminal
 Authorization ── auth.rejected ───►│ Notification │                        (no entrega)
 Settlement ── settlement.batch-closed ►│          │── HTTP POST ──────────► Endpoint de webhook
+Settlement ── settlement.completed ──►│          │
                                    └──────┬───────┘
                                           │ notification.dispatched
                                           ▼
@@ -57,7 +58,8 @@ Settlement ── settlement.batch-closed ►│          │── HTTP POST �
 |---|---|---|
 | `auth.approved` | Sí | Sí |
 | `auth.rejected` | Sí | No |
-| `settlement.batch-closed` | No | Sí |
+| `settlement.batch-closed` | No | Sí: `BATCH_CLOSED`, o `BATCH_REVISED` si corrige un cierre anterior |
+| `settlement.completed` | No | Sí: `SETTLEMENT_COMPLETED`, una por revisión |
 
 ## 3. Estructura del código
 
@@ -139,21 +141,44 @@ hasta un minuto más. Una notificación llega a `DEAD` al cabo de unos 73 minuto
 
 Lo que el comprobante incluye depende del evento:
 
-| Campo | Aprobación | Rechazo | Cierre de lote |
-|---|---|---|---|
-| `TransactionID` | Sí | Sí | Guarda el `batch_id` |
-| `Result` | `APPROVED` | `REJECTED` | `BATCH_CLOSED` |
-| `AmountCents`, `Currency` | Sí | Sí | Sí |
-| `TransactionAt` | Sí | Sí | Sí |
-| `CardLast4`, `CardNetwork`, `EntryMode` | Sí | Sí | No |
-| `AuthCode` | Sí | — | — |
-| `RejectionCode`, `RejectionReason` | — | Sí | — |
-| `TerminalCode` | Guarda el UUID del terminal | Guarda el UUID del terminal | No |
-| `MerchantName`, `MerchantAddress` | Vacíos | Vacíos | Vacíos |
+| Campo | Aprobación | Rechazo | Cierre de lote | Liquidación diaria |
+|---|---|---|---|---|
+| `TransactionID` | Sí | Sí | Guarda el `batch_id` | Un ID sintético por revisión (ver abajo) |
+| `Result` | `APPROVED` | `REJECTED` | `BATCH_CLOSED` o `BATCH_REVISED` | `SETTLEMENT_COMPLETED` |
+| `AmountCents`, `Currency` | Sí | Sí | Total del lote, con los ajustes | Neto acumulado del día |
+| `TransactionAt` | Sí | Sí | `closed_at` | `completed_at` |
+| `CardLast4`, `CardNetwork`, `EntryMode` | Sí | Sí | No | No |
+| `AuthCode` | Sí | — | — | — |
+| `RejectionCode`, `RejectionReason` | — | Sí | — | — |
+| `TerminalCode` | Guarda el UUID del terminal | Guarda el UUID del terminal | Guarda el UUID del terminal | No |
+| `MerchantName`, `MerchantAddress` | Vacíos | Vacíos | Vacíos | Vacíos |
+| `Batch` | — | — | Detalle del lote | — |
+| `Settlement` | — | — | — | Detalle de la liquidación |
 
-**El webhook de cierre de lote no informa las discrepancias**, ni la cantidad de transacciones, ni la
-fecha, ni el terminal, aunque el evento de Settlement traiga esos datos. El comercio no puede distinguir
-un cierre correcto de uno con diferencias.
+`Batch` y `Settlement` se omiten cuando no corresponden:
+
+| `Batch` | Contenido |
+|---|---|
+| `BatchDate`, `TerminalID` | Día de negocio y terminal |
+| `TotalCount` | Compras y reversas; los ajustes no cuentan |
+| `Discrepancies` | 0 si coincidió con el terminal |
+| `AdjustmentCount`, `AdjustmentAmount` | Correcciones de lotes ya enviados que liquida este, con signo |
+| `ReconciledWith` | `TERMINAL`, `BACKEND` (no se comparó con el terminal) o `NONE` (retenido sin conciliar) |
+| `Trigger` | `terminal_close`, `auto_close`, `force_close`, `resolve_dispute` o `release` |
+
+**`BATCH_REVISED` corrige un cierre anterior del mismo lote:** Settlement lo publica cuando un lote en disputa vuelve a
+`CLOSED`, con `resolve-dispute` o solo. Para un mismo lote, vale el de `TransactionAt` mayor.
+
+| `Settlement` | Contenido |
+|---|---|
+| `SettlementDate` | Día de negocio liquidado |
+| `Revision` | 1 en el primer resumen; uno más por cada lote del día liquidado después |
+| `TotalBatches`, `GrossAmount`, `AdjustmentAmount`, `NetAmount`, `MDRPercent` | Acumulado del día en esa moneda |
+| `DeltaBatches`, `DeltaAmount`, `DeltaNetAmount` | Lo que agrega esta revisión; en la 1, el acumulado |
+
+**El ID sintético de la liquidación** es un UUID determinístico por comercio, día, moneda y revisión. Una revisión que
+ya tiene notificación no se vuelve a crear, aunque llegue con otro `event_id`. Una revisión vieja que llegue después
+de una nueva sí se envía: el comercio tiene que quedarse con la de `Revision` mayor.
 
 ## 5. Flujos
 
@@ -353,11 +378,12 @@ Son durables con queue group del mismo nombre, hasta 3 entregas, política `Deli
 | `notify-auth-approved` | `posnet.auth.approved.v1` | `POSNET_AUTH` | `NotifyApproval` |
 | `notify-auth-rejected` | `posnet.auth.rejected.v1` | `POSNET_AUTH` | `NotifyRejection` |
 | `notify-batch-closed` | `posnet.settlement.batch-closed.v1` | `POSNET_SETTLEMENT` | `NotifyBatchClosed` |
+| `notify-settlement-completed` | `posnet.settlement.completed.v1` | `POSNET_SETTLEMENT` | `NotifySettlementCompleted` |
 
 `pkg/natsutil/consumers.go` menciona `notify-auth-consumer` y `notify-settlement-consumer`, que **no
 existen**: al diagnosticar, usar los nombres de esta tabla.
 
-No se consumen `auth.reversal-completed` ni `settlement.completed`. Del evento de rechazo se ignoran
+No se consume `auth.reversal-completed`. Del evento de rechazo se ignoran
 `capture_card`, `source` e `is_retryable`.
 
 | Situación | Acción | Efecto |
@@ -559,12 +585,11 @@ Están agrupadas por tema y ordenadas por impacto dentro de cada grupo.
 
 | Brecha | Consecuencia | Dónde |
 |---|---|---|
-| El cierre de lote omite discrepancias, cantidad, fecha y terminal | El comercio recibe un monto, pero no puede saber si el lote cerró con diferencias | `NotifyBatchClosed` |
 | No se generan comprobantes de reversa | El contrato de `reversal-completed` lo prevé, pero no hay suscripción: ni terminal ni comercio se enteran | `nt_nats_subscriber.go` |
 | `capture_card` se ignora | `pkg/domain/card_capture.go` prevé escalar la alerta, pero no ocurre, y el comprobante no lo indica | `NotifyRejection` |
 | Los rechazos no generan webhook | Es una decisión explícita del código; el comercio no recibe un aviso automático | `NotifyRejection` |
 | Comprobante incompleto | `MerchantName` y `MerchantAddress` están vacíos, `TerminalCode` guarda un UUID, y el cliente gRPC omite `transaction_at` | `NotifyApproval`, `nt_grpc_client.go` |
-| No hay aviso por `settlement.completed` | Settlement lo publica, pero Notification no se suscribe | `nt_nats_subscriber.go` |
+| Revisiones fuera de orden | Una revisión de un cierre o de una liquidación que llega después de otra más nueva se envía igual: el comercio tiene que ordenarlas por `TransactionAt` o `Revision` | `NotifyBatchClosed`, `NotifySettlementCompleted` |
 
 ### Operación y datos
 

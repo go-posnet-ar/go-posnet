@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/juantevez/go-posnet/context/notification/application/port"
 	"github.com/juantevez/go-posnet/context/notification/domain/aggregate"
@@ -201,13 +202,24 @@ func (h *NotifyHandler) NotifyBatchClosed(ctx context.Context, cmd port.NotifyBa
 	// Usar un TransactionID sintético para el batch (basado en BatchID)
 	batchTxID, _ := domain.ParseTransactionID(cmd.BatchID)
 
-	// El receipt para batch close tiene un formato especial
+	// El receipt para batch close tiene un formato especial. Un lote en disputa que vuelve a CLOSED
+	// con sus totales recalculados se informa otra vez, como revisión del cierre.
+	result := valueobject.ResultBatchClosed
+	if cmd.Revision {
+		result = valueobject.ResultBatchRevised
+	}
 	receipt := valueobject.ReceiptPayload{
 		TransactionID: cmd.BatchID,
-		Result:        "BATCH_CLOSED",
+		TerminalCode:  cmd.TerminalID,
+		Result:        result,
 		AmountCents:   cmd.TotalAmount,
 		Currency:      cmd.Currency,
 		TransactionAt: cmd.ClosedAt,
+		Batch: &valueobject.BatchReceipt{
+			BatchDate: cmd.BatchDate, TerminalID: cmd.TerminalID, TotalCount: cmd.TotalCount,
+			Discrepancies: cmd.Discrepancies, AdjustmentCount: cmd.AdjustmentCount, AdjustmentAmount: cmd.AdjustmentAmount,
+			ReconciledWith: cmd.ReconciledWith, Trigger: cmd.Trigger,
+		},
 	}
 
 	webhookNotif, err := aggregate.NewNotification(batchTxID, merchantID, valueobject.ChannelWebhook, receipt)
@@ -233,6 +245,101 @@ func (h *NotifyHandler) NotifyBatchClosed(ctx context.Context, cmd port.NotifyBa
 
 	if dispatched {
 		go h.dispatch(context.Background(), webhookNotif)
+	}
+	return nil
+}
+
+// settlementNamespace genera el ID sintético de cada revisión del resumen de liquidación.
+var settlementNamespace = uuid.MustParse("6f1b3c8e-2d4a-5e7f-9a0b-1c2d3e4f5a6b")
+
+// settlementNotificationID es el ID sintético de una revisión del resumen de un comercio, día y
+// moneda: el mismo para la misma revisión, para no notificarla dos veces aunque llegue con otro
+// event_id.
+func settlementNotificationID(cmd port.NotifySettlementCompletedCommand) (domain.TransactionID, error) {
+	id := uuid.NewSHA1(settlementNamespace, []byte(fmt.Sprintf("settlement-completed:%s:%s:%s:%d",
+		cmd.MerchantID, cmd.SettlementDate, cmd.Currency, cmd.Revision)))
+	return domain.ParseTransactionID(id.String())
+}
+
+// NotifySettlementCompleted avisa al comercio, por webhook, una revisión de su liquidación diaria:
+// el neto acumulado del día y lo que agregó.
+//
+// Una revisión que ya tiene notificación no se repite. Una anterior a otra ya enviada se envía
+// igual: el comprobante lleva Revision, y el comercio se queda con la mayor.
+func (h *NotifyHandler) NotifySettlementCompleted(ctx context.Context, cmd port.NotifySettlementCompletedCommand) error {
+	ctx, span := observability.StartSpan(ctx, "command.NotifySettlementCompleted")
+	defer span.End()
+
+	log := observability.FromContext(ctx).With(
+		slog.String("event_id", cmd.EventID),
+		slog.String("merchant_id", cmd.MerchantID),
+		slog.String("settlement_date", cmd.SettlementDate),
+		slog.String("currency", cmd.Currency),
+		slog.Int("revision", cmd.Revision),
+	)
+
+	merchantID, err := domain.ParseMerchantID(cmd.MerchantID)
+	if err != nil {
+		return pkgerrors.NewValidationError("invalid merchant_id")
+	}
+	if cmd.SettlementDate == "" || cmd.Currency == "" {
+		return pkgerrors.NewValidationError("settlement_date and currency are required")
+	}
+	// Un evento anterior a las revisiones no la trae: era siempre un resumen nuevo.
+	if cmd.Revision <= 0 {
+		cmd.Revision = 1
+		cmd.DeltaBatches, cmd.DeltaAmount, cmd.DeltaNetAmount = cmd.TotalBatches, cmd.TotalAmount, cmd.NetAmount
+	}
+	syntheticID, err := settlementNotificationID(cmd)
+	if err != nil {
+		return fmt.Errorf("NotifySettlementCompleted: synthetic id: %w", err)
+	}
+	existing, err := h.notifRepo.FindByTransactionID(ctx, syntheticID)
+	if err != nil {
+		return fmt.Errorf("NotifySettlementCompleted: find previous notification: %w", err)
+	}
+	if len(existing) > 0 {
+		log.Info("settlement revision already notified — skipping")
+		return nil
+	}
+
+	receipt := valueobject.ReceiptPayload{
+		TransactionID: syntheticID.String(),
+		Result:        valueobject.ResultSettlementCompleted,
+		AmountCents:   cmd.NetAmount,
+		Currency:      cmd.Currency,
+		TransactionAt: cmd.CompletedAt,
+		Settlement: &valueobject.SettlementReceipt{
+			SettlementDate: cmd.SettlementDate, Revision: cmd.Revision, TotalBatches: cmd.TotalBatches,
+			GrossAmount: cmd.TotalAmount, AdjustmentAmount: cmd.AdjustmentAmount, NetAmount: cmd.NetAmount,
+			MDRPercent: cmd.MDRPercent, DeltaBatches: cmd.DeltaBatches, DeltaAmount: cmd.DeltaAmount,
+			DeltaNetAmount: cmd.DeltaNetAmount,
+		},
+	}
+	webhookNotif, err := aggregate.NewNotification(syntheticID, merchantID, valueobject.ChannelWebhook, receipt)
+	if err != nil {
+		return fmt.Errorf("NotifySettlementCompleted: create notification: %w", err)
+	}
+
+	var dispatched bool
+	err = pgutil.WithReadCommitted(ctx, h.pool, func(tx pgx.Tx) error {
+		inserted, err := h.idempotency.TryMarkAsProcessed(ctx, tx, cmd.EventID)
+		if err != nil {
+			return err
+		}
+		if !inserted {
+			return nil
+		}
+		dispatched = true
+		return h.notifRepo.Save(ctx, webhookNotif)
+	})
+	if err != nil {
+		return fmt.Errorf("NotifySettlementCompleted: persist: %w", err)
+	}
+
+	if dispatched {
+		go h.dispatch(context.Background(), webhookNotif)
+		log.Info("settlement notification created and dispatching", slog.String("notification_id", webhookNotif.ID()))
 	}
 	return nil
 }

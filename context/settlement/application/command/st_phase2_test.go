@@ -202,8 +202,9 @@ func TestReleaseHeldBatch_HeldUnreconciledStaysDisputed(t *testing.T) {
 func TestResolveDispute_ReleasesAHeldUnreconciledBatch(t *testing.T) {
 	held := heldBatch(t, valueobject.BatchStateDisputed, aggregate.ReconciledWithNone, 0, 0)
 	repo := &fakeBatchRepo{findByIDResult: held}
-	h, pool := newEventAdmin(t, repo, &fakePublisher{}, 2.5)
-	expectEventTx(pool, 0)
+	publisher := &fakePublisher{}
+	h, pool := newEventAdmin(t, repo, publisher, 2.5)
+	expectEventTx(pool, 1)
 
 	err := h.ResolveDispute(context.Background(), port.ResolveDisputeCommand{BatchID: "b-1", OperatorID: "op-1", Reason: "revisado con el comercio"})
 	if err != nil {
@@ -211,6 +212,10 @@ func TestResolveDispute_ReleasesAHeldUnreconciledBatch(t *testing.T) {
 	}
 	if held.State() != valueobject.BatchStateClosed || held.ReconciledWith() != aggregate.ReconciledWithBackend {
 		t.Errorf("state = %s, reconciled with %q, want CLOSED and BACKEND", held.State(), held.ReconciledWith())
+	}
+	// Los totales se vuelven a informar, como una revisión del cierre.
+	if len(publisher.triggers) != 1 || publisher.triggers[0] != "resolve_dispute" {
+		t.Errorf("triggers = %v, want [resolve_dispute]", publisher.triggers)
 	}
 }
 
@@ -278,5 +283,43 @@ func TestForceClose_WithoutTerminalTotalsUsesBackend(t *testing.T) {
 	}
 	if b.State() != valueobject.BatchStateClosed || b.ReconciledWith() != aggregate.ReconciledWithBackend {
 		t.Errorf("state = %s, reconciled with %q, want CLOSED and BACKEND", b.State(), b.ReconciledWith())
+	}
+}
+
+// ─── #9: los lotes que salen de DISPUTED se vuelven a informar ───────────────
+
+func TestReleaseHeldBatch_ReportsTheRevisedTotals(t *testing.T) {
+	held := heldBatch(t, valueobject.BatchStateDisputed, aggregate.ReconciledWithBackend, 0, 0)
+	pool := newMockPool(t)
+	expectReleasedTx(pool)
+	publisher := &fakePublisher{}
+	h := newHandler(pool, &fakeBatchRepo{findByIDResult: held}, publisher, &fakeProcessor{confirmationID: "conf-1"})
+	h.SetReversalReviews(&fakeReviews{})
+
+	if err := h.ReleaseHeldBatch(context.Background(), "b-1"); err != nil {
+		t.Fatalf("ReleaseHeldBatch() error = %v", err)
+	}
+	if len(publisher.triggers) != 1 || publisher.triggers[0] != "release" {
+		t.Errorf("triggers = %v, want [release]", publisher.triggers)
+	}
+}
+
+// Un lote en disputa sin transacciones queda VOID al resolverlo, sin evento: no hay nada que informar.
+func TestResolveDispute_EmptyBatchIsVoidedSilently(t *testing.T) {
+	empty := aggregate.Reconstitute(aggregate.ReconstituteParams{
+		ID: "b-1", TerminalID: domain.NewTerminalID(), MerchantID: domain.NewMerchantID(),
+		BatchDate: time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC), State: valueobject.BatchStateDisputed, Currency: "ARS",
+		CreatedAt: time.Now(), ReconciledWith: aggregate.ReconciledWithTerminal,
+	})
+	publisher := &fakePublisher{}
+	h, pool := newEventAdmin(t, &fakeBatchRepo{findByIDResult: empty}, publisher, 2.5)
+	expectEventTx(pool, 0)
+
+	err := h.ResolveDispute(context.Background(), port.ResolveDisputeCommand{BatchID: "b-1", OperatorID: "op-1", Reason: "vacío"})
+	if err != nil {
+		t.Fatalf("ResolveDispute() error = %v", err)
+	}
+	if empty.State() != valueobject.BatchStateVoid || len(publisher.triggers) != 0 {
+		t.Errorf("state = %s, triggers = %v, want VOID and none", empty.State(), publisher.triggers)
 	}
 }

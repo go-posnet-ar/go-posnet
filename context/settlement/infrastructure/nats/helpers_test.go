@@ -119,7 +119,7 @@ func (f *fakeBatchRepo) ClosedTotalsForTerminalDay(context.Context, domain.Termi
 // que es lo que se está testeando en st_nats_publisher_test.go.
 type fakeDomainPublisher struct{}
 
-func (f *fakeDomainPublisher) BuildBatchClosed(context.Context, *aggregate.SettlementBatch) (string, string, []byte, error) {
+func (f *fakeDomainPublisher) BuildBatchClosed(context.Context, *aggregate.SettlementBatch, string) (string, string, []byte, error) {
 	return "subject", "event-id", []byte("{}"), nil
 }
 

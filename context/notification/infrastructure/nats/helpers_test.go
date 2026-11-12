@@ -84,6 +84,15 @@ func (f *fakeNotificationRepo) savedCount() int {
 	return len(f.savedNotifs)
 }
 
+func (f *fakeNotificationRepo) lastSaved() *aggregate.Notification {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.savedNotifs) == 0 {
+		return nil
+	}
+	return f.savedNotifs[len(f.savedNotifs)-1]
+}
+
 func (f *fakeNotificationRepo) FindByID(context.Context, string) (*aggregate.Notification, error) {
 	return f.findResult, f.findErr
 }
