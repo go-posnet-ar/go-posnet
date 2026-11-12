@@ -176,7 +176,7 @@ func (a *app) start(ctx context.Context) error {
 		return fmt.Errorf("start: subscribe NATS consumers: %w", err)
 	}
 	slog.Info("NATS consumers active",
-		slog.String("consumers", "notify-auth-approved, notify-auth-rejected, notify-batch-closed"),
+		slog.String("consumers", "notify-auth-approved, notify-auth-rejected, notify-batch-closed, notify-settlement-completed"),
 	)
 
 	// gRPC server — placeholder
